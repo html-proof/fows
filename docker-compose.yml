@@ -1,0 +1,14 @@
+services:
+  backend:
+    build: .
+    container_name: music-hub-backend
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    volumes:
+      - ./serviceAccountKey.json:/app/serviceAccountKey.json:ro
+    environment:
+      - NODE_ENV=production
+      - GOOGLE_APPLICATION_CREDENTIALS=./serviceAccountKey.json
+    restart: unless-stopped
