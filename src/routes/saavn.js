@@ -7,12 +7,25 @@ const router = Router();
 // Example: /api/search?query=Imagine+Dragons
 router.get('/search', async (req, res) => {
     try {
-        const { query, page } = req.query;
+        const { query } = req.query;
         if (!query) {
             return res.status(400).json({ error: 'Query parameter "query" is required' });
         }
-        const data = await searchSongs(query, page || 1);
-        res.json(data);
+
+        // Fetch songs, albums, and artists in parallel
+        const [songsData, albumsData, artistsData] = await Promise.allSettled([
+            searchSongsOnly(query, 1),
+            searchAlbums(query),
+            searchArtists(query)
+        ]);
+
+        const response = {
+            songs: songsData.status === 'fulfilled' ? songsData.value.data.results : [],
+            albums: albumsData.status === 'fulfilled' ? albumsData.value.data.results : [],
+            artists: artistsData.status === 'fulfilled' ? artistsData.value.data.results : []
+        };
+
+        res.json(response);
     } catch (error) {
         console.error('Search API error:', error.message);
         res.status(500).json({ error: 'Internal server error' });
