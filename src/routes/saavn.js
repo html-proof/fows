@@ -20,9 +20,12 @@ router.get('/search', async (req, res) => {
         ]);
 
         const response = {
-            songs: songsData.status === 'fulfilled' ? songsData.value.data.results : [],
-            albums: albumsData.status === 'fulfilled' ? albumsData.value.data.results : [],
-            artists: artistsData.status === 'fulfilled' ? artistsData.value.data.results : []
+            success: true,
+            data: {
+                songs: songsData.status === 'fulfilled' ? songsData.value.data.results : [],
+                albums: albumsData.status === 'fulfilled' ? albumsData.value.data.results : [],
+                artists: artistsData.status === 'fulfilled' ? artistsData.value.data.results : []
+            }
         };
 
         res.json(response);
