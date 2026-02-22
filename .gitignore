@@ -5,6 +5,5 @@ music-16f5c-firebase-adminsdk-*.json
 dist/
 build/
 .next/
-# music_hub/ # Not sure if user wants to ignore the mobile app or not.
-# Better to focus on what's definitely sensitive.
+music_hub/
 
