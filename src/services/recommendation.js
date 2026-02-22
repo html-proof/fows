@@ -73,7 +73,7 @@ export async function generateRecommendations(userPrefs, uid) {
     const favoriteArtistIds = new Set(favoriteArtists.map(a => (a.id || a).toString()));
 
     // Fetch songs from Saavn for each seed (in parallel, limited)
-    const queries = Array.from(seedQueries).slice(0, 10);
+    const queries = Array.from(seedQueries).slice(0, 15);
     const results = await Promise.allSettled(
         queries.map(q => searchSongsOnly(q).catch(() => ({ data: { results: [] } })))
     );
@@ -141,9 +141,9 @@ export async function generateRecommendations(userPrefs, uid) {
         const notInLang = ranked.filter(r => !langSet.has((r.song.language || '').toLowerCase()));
 
         // Prioritize songs in preferred languages, pad with others
-        filtered = [...inLang, ...notInLang].slice(0, 30);
+        filtered = [...inLang, ...notInLang].slice(0, 100);
     } else {
-        filtered = ranked.slice(0, 30);
+        filtered = ranked.slice(0, 100);
     }
 
     return filtered.map(({ song, score }) => ({

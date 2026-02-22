@@ -2,27 +2,17 @@ import { request } from 'undici';
 
 const BASE_URL = 'https://saavn.sumit.co';
 
-/**
- * Search for songs on Saavn API.
- * @param {string} query - Search query
- * @returns {Promise<object>} Search results
- */
-export async function searchSongs(query) {
+export async function searchSongs(query, page = 1) {
     const { statusCode, body } = await request(
-        `${BASE_URL}/api/search?query=${encodeURIComponent(query)}`
+        `${BASE_URL}/api/search?query=${encodeURIComponent(query)}&page=${page}`
     );
     if (statusCode !== 200) throw new Error(`Saavn search failed with status ${statusCode}`);
     return body.json();
 }
 
-/**
- * Search specifically for songs.
- * @param {string} query - Search query
- * @returns {Promise<object>} Song search results
- */
-export async function searchSongsOnly(query) {
+export async function searchSongsOnly(query, page = 1) {
     const { statusCode, body } = await request(
-        `${BASE_URL}/api/search/songs?query=${encodeURIComponent(query)}`
+        `${BASE_URL}/api/search/songs?query=${encodeURIComponent(query)}&page=${page}`
     );
     if (statusCode !== 200) throw new Error(`Saavn song search failed with status ${statusCode}`);
     return body.json();

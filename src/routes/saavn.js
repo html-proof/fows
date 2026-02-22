@@ -7,11 +7,11 @@ const router = Router();
 // Example: /api/search?query=Imagine+Dragons
 router.get('/search', async (req, res) => {
     try {
-        const query = req.query.query;
+        const { query, page } = req.query;
         if (!query) {
             return res.status(400).json({ error: 'Query parameter "query" is required' });
         }
-        const data = await searchSongs(query);
+        const data = await searchSongs(query, page || 1);
         res.json(data);
     } catch (error) {
         console.error('Search API error:', error.message);

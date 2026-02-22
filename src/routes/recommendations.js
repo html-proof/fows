@@ -21,7 +21,7 @@ const router = Router();
  */
 router.get('/', authenticateUser, async (req, res) => {
     try {
-        const limit = Math.min(parseInt(req.query.limit, 10) || 20, 50);
+        const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
 
         // Get user preferences
         const prefs = await getUserPreferences(req.user.uid);
