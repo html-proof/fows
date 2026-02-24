@@ -11,7 +11,7 @@ import {
 const router = Router();
 
 // Search API (public)
-// Example: /api/search?query=Imagine+Dragons
+// Example: /api/search?query=Imagine+Dragons&page=2
 router.get('/search', async (req, res) => {
     try {
         const { query } = req.query;
@@ -19,23 +19,37 @@ router.get('/search', async (req, res) => {
             return res.status(400).json({ error: 'Query parameter "query" is required' });
         }
 
-        // Fetch songs, albums, and artists in parallel
+        const parsedPage = parseInt(req.query.page, 10);
+        const page = Number.isNaN(parsedPage) ? 1 : Math.max(parsedPage, 1);
+
+        // For page > 1, only fetch songs. This powers "load more" efficiently.
+        if (page > 1) {
+            const songsData = await searchSongsOnly(query, page);
+            return res.json({
+                success: true,
+                data: {
+                    songs: songsData?.data?.results ?? [],
+                    albums: [],
+                    artists: [],
+                },
+            });
+        }
+
+        // First page returns songs + albums + artists
         const [songsData, albumsData, artistsData] = await Promise.allSettled([
             searchSongsOnly(query, 1),
             searchAlbums(query),
-            searchArtists(query)
+            searchArtists(query),
         ]);
 
-        const response = {
+        res.json({
             success: true,
             data: {
-                songs: songsData.status === 'fulfilled' ? songsData.value.data.results : [],
-                albums: albumsData.status === 'fulfilled' ? albumsData.value.data.results : [],
-                artists: artistsData.status === 'fulfilled' ? artistsData.value.data.results : []
-            }
-        };
-
-        res.json(response);
+                songs: songsData.status === 'fulfilled' ? songsData.value?.data?.results ?? [] : [],
+                albums: albumsData.status === 'fulfilled' ? albumsData.value?.data?.results ?? [] : [],
+                artists: artistsData.status === 'fulfilled' ? artistsData.value?.data?.results ?? [] : [],
+            },
+        });
     } catch (error) {
         console.error('Search API error:', error.message);
         res.status(500).json({ error: 'Internal server error' });
