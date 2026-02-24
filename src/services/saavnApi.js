@@ -182,11 +182,7 @@ function normalizeFallbackSong(raw) {
     }));
 
     const mediaUrl = (raw.media_url ?? raw.url ?? '').toString().trim();
-    const previewUrl = (raw.media_preview_url ?? '').toString().trim();
     const downloadUrl = [];
-    if (previewUrl) {
-        downloadUrl.push({ quality: '96kbps', url: previewUrl });
-    }
     if (mediaUrl) {
         downloadUrl.push({ quality: '320kbps', url: mediaUrl });
     }
