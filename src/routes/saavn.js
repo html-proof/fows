@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import {
     searchSongsOnly,
-    searchSongsOnlyFallback,
+    searchSongsSmart,
     searchArtists,
     getArtistsByLanguage,
     getSongById,
@@ -38,23 +38,14 @@ router.get('/search', async (req, res) => {
 
         // First page returns songs + albums + artists
         const [songsData, albumsData, artistsData] = await Promise.allSettled([
-            searchSongsOnly(query, 1),
+            searchSongsSmart(query),
             searchAlbums(query),
             searchArtists(query),
         ]);
 
-        let songs = songsData.status === 'fulfilled'
-            ? songsData.value?.data?.results ?? []
+        const songs = songsData.status === 'fulfilled'
+            ? songsData.value ?? []
             : [];
-
-        // Fallback for hard-to-find titles not indexed by the primary provider.
-        if (songs.length === 0) {
-            try {
-                songs = await searchSongsOnlyFallback(query);
-            } catch (error) {
-                console.warn('Fallback song search failed:', error.message);
-            }
-        }
 
         res.json({
             success: true,

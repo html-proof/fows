@@ -2,6 +2,39 @@ import { request } from 'undici';
 
 const BASE_URL = 'https://saavn.sumit.co';
 const FALLBACK_BASE_URL = 'https://saavnapi-nine.vercel.app';
+const MAX_SMART_RESULTS = 40;
+const SMART_SEARCH_MIN_RESULTS = 8;
+const LANGUAGE_HINTS = new Set([
+    'hindi',
+    'malayalam',
+    'tamil',
+    'telugu',
+    'kannada',
+    'english',
+    'punjabi',
+    'marathi',
+    'bengali',
+    'gujarati',
+    'odia',
+    'assamese',
+    'urdu',
+]);
+const QUERY_NOISE_WORDS = new Set([
+    ...LANGUAGE_HINTS,
+    'song',
+    'songs',
+    'movie',
+    'film',
+    'album',
+    'lyrics',
+    'video',
+    'official',
+    'audio',
+    'music',
+    'theme',
+    'bgm',
+    'ost',
+]);
 
 export async function searchSongs(query, page = 1) {
     const { statusCode, body } = await request(
@@ -40,6 +73,79 @@ export async function searchSongsOnlyFallback(query) {
     return payload
         .map(normalizeFallbackSong)
         .filter(song => song && song.id && song.name);
+}
+
+/**
+ * Smart song search for scale:
+ * - queries primary and fallback providers
+ * - retries with normalized variants (language/noise stripped)
+ * - ranks and deduplicates results
+ *
+ * @param {string} query
+ * @returns {Promise<object[]>}
+ */
+export async function searchSongsSmart(query) {
+    const normalizedQuery = normalizeQuery(query);
+    if (!normalizedQuery) return [];
+
+    const variants = buildSearchQueryVariants(normalizedQuery);
+    const languageHint = extractLanguageHint(normalizedQuery);
+    const ranked = new Map(); // id -> { song, score }
+
+    for (let i = 0; i < variants.length; i += 1) {
+        const variant = variants[i];
+        const [songsOnlyResult, searchResult, fallbackResult] =
+            await Promise.allSettled([
+                searchSongsOnly(variant, 1),
+                searchSongs(variant, 1),
+                searchSongsOnlyFallback(variant),
+            ]);
+
+        const primarySongs = songsOnlyResult.status === 'fulfilled'
+            ? (songsOnlyResult.value?.data?.results ?? [])
+            : [];
+        const broadSongs = searchResult.status === 'fulfilled'
+            ? (searchResult.value?.data?.results ?? [])
+            : [];
+        const fallbackSongs = fallbackResult.status === 'fulfilled'
+            ? fallbackResult.value
+            : [];
+
+        addRankedSongs({
+            ranked,
+            songs: primarySongs,
+            query: normalizedQuery,
+            variantIndex: i,
+            sourceWeight: 15,
+            languageHint,
+        });
+        addRankedSongs({
+            ranked,
+            songs: broadSongs,
+            query: normalizedQuery,
+            variantIndex: i,
+            sourceWeight: 8,
+            languageHint,
+        });
+        addRankedSongs({
+            ranked,
+            songs: fallbackSongs,
+            query: normalizedQuery,
+            variantIndex: i,
+            sourceWeight: 5,
+            languageHint,
+        });
+
+        // Stop early once we have enough strong candidates.
+        if (ranked.size >= SMART_SEARCH_MIN_RESULTS && i >= 1) {
+            break;
+        }
+    }
+
+    return Array.from(ranked.values())
+        .sort((a, b) => b.score - a.score)
+        .slice(0, MAX_SMART_RESULTS)
+        .map(entry => entry.song);
 }
 
 /**
@@ -152,6 +258,7 @@ export default {
     searchSongs,
     searchSongsOnly,
     searchSongsOnlyFallback,
+    searchSongsSmart,
     getSongById,
     getAlbumById,
     searchAlbums,
@@ -223,4 +330,149 @@ function normalizeFallbackSong(raw) {
         image,
         downloadUrl,
     };
+}
+
+function addRankedSongs({
+    ranked,
+    songs,
+    query,
+    variantIndex,
+    sourceWeight,
+    languageHint,
+}) {
+    const safeSongs = Array.isArray(songs) ? songs : [];
+    for (const rawSong of safeSongs) {
+        const song = normalizePrimarySong(rawSong);
+        if (!song || !song.id) continue;
+
+        const score = scoreSongMatch({
+            song,
+            query,
+            variantIndex,
+            sourceWeight,
+            languageHint,
+        });
+        if (score < 0) continue;
+
+        const existing = ranked.get(song.id);
+        if (!existing || score > existing.score) {
+            ranked.set(song.id, { song, score });
+        }
+    }
+}
+
+function normalizePrimarySong(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const id = (raw.id ?? '').toString().trim();
+    const name = (raw.name ?? raw.title ?? '').toString().trim();
+    if (!id || !name) return null;
+    return raw;
+}
+
+function normalizeQuery(query) {
+    return String(query ?? '')
+        .toLowerCase()
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function buildSearchQueryVariants(query) {
+    const variants = [];
+    const push = (value) => {
+        const normalized = normalizeQuery(value);
+        if (!normalized) return;
+        if (variants.includes(normalized)) return;
+        variants.push(normalized);
+    };
+
+    push(query);
+
+    // Remove language/noise words (e.g., "malayalam", "song", "lyrics").
+    const filteredTokens = tokenize(query).filter(token => !QUERY_NOISE_WORDS.has(token));
+    if (filteredTokens.length > 0) {
+        push(filteredTokens.join(' '));
+    }
+
+    // Drop trailing token (often a typo/noise fragment).
+    const tokens = tokenize(query);
+    if (tokens.length > 2) {
+        push(tokens.slice(0, -1).join(' '));
+    }
+
+    // Keep first two terms for broad match.
+    if (tokens.length > 2) {
+        push(tokens.slice(0, 2).join(' '));
+    }
+
+    return variants.slice(0, 4);
+}
+
+function tokenize(value) {
+    return normalizeQuery(value)
+        .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+        .split(/\s+/)
+        .filter(Boolean);
+}
+
+function extractLanguageHint(query) {
+    for (const token of tokenize(query)) {
+        if (LANGUAGE_HINTS.has(token)) return token;
+    }
+    return null;
+}
+
+function scoreSongMatch({
+    song,
+    query,
+    variantIndex,
+    sourceWeight,
+    languageHint,
+}) {
+    const name = normalizeQuery(song.name ?? '');
+    const artists = normalizeQuery(
+        song.primaryArtists ??
+        song.artists?.primary?.map(a => a?.name ?? '').join(' ') ??
+        ''
+    );
+    const album = normalizeQuery(
+        typeof song.album === 'object' ? (song.album?.name ?? '') : (song.album ?? '')
+    );
+    const haystack = `${name} ${artists} ${album}`.trim();
+    const queryTerms = tokenize(query).filter(token => !QUERY_NOISE_WORDS.has(token));
+    const matchedTerms = queryTerms.filter(term => haystack.includes(term));
+
+    let score = 0;
+
+    // Avoid noisy unrelated results for unmatched queries.
+    if (queryTerms.length > 0 && matchedTerms.length === 0 && !name.includes(query)) {
+        return -1;
+    }
+
+    if (name === query) score += 120;
+    if (name.includes(query)) score += 70;
+    if (haystack.includes(query)) score += 30;
+
+    for (const term of queryTerms) {
+        if (name.includes(term)) {
+            score += 18;
+        } else if (artists.includes(term)) {
+            score += 10;
+        } else if (album.includes(term)) {
+            score += 8;
+        }
+    }
+
+    if (languageHint) {
+        const language = normalizeQuery(song.language ?? '');
+        if (language === languageHint) {
+            score += 18;
+        } else {
+            score -= 4;
+        }
+    }
+
+    score += sourceWeight;
+    score -= variantIndex * 12;
+
+    return score;
 }
