@@ -4,6 +4,9 @@ const BASE_URL = 'https://saavn.sumit.co';
 const FALLBACK_BASE_URL = 'https://saavnapi-nine.vercel.app';
 const MAX_SMART_RESULTS = 40;
 const SMART_SEARCH_MIN_RESULTS = 8;
+const SEARCH_CACHE_TTL_MS = 5 * 60 * 1000;
+const SEARCH_CACHE_MAX_ENTRIES = 300;
+const smartSearchCache = new Map();
 const LANGUAGE_HINTS = new Set([
     'hindi',
     'malayalam',
@@ -88,6 +91,9 @@ export async function searchSongsSmart(query) {
     const normalizedQuery = normalizeQuery(query);
     if (!normalizedQuery) return [];
 
+    const cached = getCachedSmartSearch(normalizedQuery);
+    if (cached) return cached;
+
     const variants = buildSearchQueryVariants(normalizedQuery);
     const languageHint = extractLanguageHint(normalizedQuery);
     const ranked = new Map(); // id -> { song, score }
@@ -137,15 +143,17 @@ export async function searchSongsSmart(query) {
         });
 
         // Stop early once we have enough strong candidates.
-        if (ranked.size >= SMART_SEARCH_MIN_RESULTS && i >= 1) {
+        if (ranked.size >= SMART_SEARCH_MIN_RESULTS && i >= 2) {
             break;
         }
     }
 
-    return Array.from(ranked.values())
+    const output = Array.from(ranked.values())
         .sort((a, b) => b.score - a.score)
         .slice(0, MAX_SMART_RESULTS)
         .map(entry => entry.song);
+    setCachedSmartSearch(normalizedQuery, output);
+    return output;
 }
 
 /**
@@ -404,7 +412,29 @@ function buildSearchQueryVariants(query) {
         push(tokens.slice(0, 2).join(' '));
     }
 
-    return variants.slice(0, 4);
+    // Keep first token as broad fallback.
+    if (tokens.length > 0) {
+        push(tokens[0]);
+    }
+
+    // Try removing one token at a time for long queries.
+    if (tokens.length >= 3) {
+        for (let i = 0; i < tokens.length; i += 1) {
+            const trimmed = tokens.filter((_, idx) => idx !== i).join(' ');
+            push(trimmed);
+        }
+    }
+
+    // Typo-tolerant variant: shorten long words by one char.
+    const shortenable = tokens.some(token => token.length >= 6);
+    if (shortenable) {
+        const softened = tokens
+            .map(token => (token.length >= 6 ? token.slice(0, -1) : token))
+            .join(' ');
+        push(softened);
+    }
+
+    return variants.slice(0, 6);
 }
 
 function tokenize(value) {
@@ -438,6 +468,7 @@ function scoreSongMatch({
         typeof song.album === 'object' ? (song.album?.name ?? '') : (song.album ?? '')
     );
     const haystack = `${name} ${artists} ${album}`.trim();
+    const haystackTokens = tokenize(haystack);
     const queryTerms = tokenize(query).filter(token => !QUERY_NOISE_WORDS.has(token));
     const matchedTerms = queryTerms.filter(term => haystack.includes(term));
 
@@ -459,6 +490,8 @@ function scoreSongMatch({
             score += 10;
         } else if (album.includes(term)) {
             score += 8;
+        } else if (hasFuzzyTokenMatch(term, haystackTokens)) {
+            score += 5;
         }
     }
 
@@ -475,4 +508,61 @@ function scoreSongMatch({
     score -= variantIndex * 12;
 
     return score;
+}
+
+function hasFuzzyTokenMatch(queryTerm, targetTokens) {
+    for (const token of targetTokens) {
+        if (!token || token.length < 2) continue;
+        const maxDistance = queryTerm.length >= 7 ? 2 : 1;
+        if (Math.abs(queryTerm.length - token.length) > maxDistance) continue;
+        if (queryTerm[0] !== token[0]) continue;
+        if (levenshteinDistance(queryTerm, token) <= maxDistance) return true;
+    }
+    return false;
+}
+
+function levenshteinDistance(a, b) {
+    if (a === b) return 0;
+    if (!a.length) return b.length;
+    if (!b.length) return a.length;
+
+    const rows = a.length + 1;
+    const cols = b.length + 1;
+    const dp = Array.from({ length: rows }, () => Array(cols).fill(0));
+
+    for (let i = 0; i < rows; i += 1) dp[i][0] = i;
+    for (let j = 0; j < cols; j += 1) dp[0][j] = j;
+
+    for (let i = 1; i < rows; i += 1) {
+        for (let j = 1; j < cols; j += 1) {
+            const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+            dp[i][j] = Math.min(
+                dp[i - 1][j] + 1,
+                dp[i][j - 1] + 1,
+                dp[i - 1][j - 1] + cost
+            );
+        }
+    }
+    return dp[rows - 1][cols - 1];
+}
+
+function getCachedSmartSearch(query) {
+    const item = smartSearchCache.get(query);
+    if (!item) return null;
+    if (Date.now() - item.ts > SEARCH_CACHE_TTL_MS) {
+        smartSearchCache.delete(query);
+        return null;
+    }
+    return item.data;
+}
+
+function setCachedSmartSearch(query, data) {
+    smartSearchCache.set(query, { ts: Date.now(), data });
+    if (smartSearchCache.size <= SEARCH_CACHE_MAX_ENTRIES) return;
+
+    const keys = smartSearchCache.keys();
+    const oldest = keys.next();
+    if (!oldest.done) {
+        smartSearchCache.delete(oldest.value);
+    }
 }
