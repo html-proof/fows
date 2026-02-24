@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import {
     searchSongsOnly,
+    searchSongsOnlyFallback,
     searchArtists,
     getArtistsByLanguage,
     getSongById,
@@ -42,10 +43,23 @@ router.get('/search', async (req, res) => {
             searchArtists(query),
         ]);
 
+        let songs = songsData.status === 'fulfilled'
+            ? songsData.value?.data?.results ?? []
+            : [];
+
+        // Fallback for hard-to-find titles not indexed by the primary provider.
+        if (songs.length === 0) {
+            try {
+                songs = await searchSongsOnlyFallback(query);
+            } catch (error) {
+                console.warn('Fallback song search failed:', error.message);
+            }
+        }
+
         res.json({
             success: true,
             data: {
-                songs: songsData.status === 'fulfilled' ? songsData.value?.data?.results ?? [] : [],
+                songs,
                 albums: albumsData.status === 'fulfilled' ? albumsData.value?.data?.results ?? [] : [],
                 artists: artistsData.status === 'fulfilled' ? artistsData.value?.data?.results ?? [] : [],
             },

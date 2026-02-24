@@ -1,6 +1,7 @@
 import { request } from 'undici';
 
 const BASE_URL = 'https://saavn.sumit.co';
+const FALLBACK_BASE_URL = 'https://saavnapi-nine.vercel.app';
 
 export async function searchSongs(query, page = 1) {
     const { statusCode, body } = await request(
@@ -16,6 +17,29 @@ export async function searchSongsOnly(query, page = 1) {
     );
     if (statusCode !== 200) throw new Error(`Saavn song search failed with status ${statusCode}`);
     return body.json();
+}
+
+/**
+ * Fallback song search using alternate provider.
+ * Response is normalized into the same shape expected by current clients.
+ *
+ * @param {string} query
+ * @returns {Promise<object[]>}
+ */
+export async function searchSongsOnlyFallback(query) {
+    const { statusCode, body } = await request(
+        `${FALLBACK_BASE_URL}/result/?query=${encodeURIComponent(query)}`
+    );
+    if (statusCode !== 200) {
+        throw new Error(`Fallback song search failed with status ${statusCode}`);
+    }
+
+    const payload = await body.json();
+    if (!Array.isArray(payload)) return [];
+
+    return payload
+        .map(normalizeFallbackSong)
+        .filter(song => song && song.id && song.name);
 }
 
 /**
@@ -127,6 +151,7 @@ export async function getArtistsByLanguage(language) {
 export default {
     searchSongs,
     searchSongsOnly,
+    searchSongsOnlyFallback,
     getSongById,
     getAlbumById,
     searchAlbums,
@@ -135,3 +160,71 @@ export default {
     getArtistById,
     getArtistsByLanguage,
 };
+
+function normalizeFallbackSong(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+
+    const id = (raw.id ?? raw.songid ?? '').toString().trim();
+    const name = (raw.song ?? raw.title ?? '').toString().trim();
+    const artistText = (raw.primary_artists ?? raw.singers ?? '').toString();
+    const artistNames = artistText
+        .split(',')
+        .map(name => name.trim())
+        .filter(Boolean);
+
+    const artistsPrimary = artistNames.map((artistName, index) => ({
+        id: `${id}_a${index}`,
+        name: artistName,
+        role: 'primary_artists',
+        image: '',
+        type: 'artist',
+        url: '',
+    }));
+
+    const mediaUrl = (raw.media_url ?? raw.url ?? '').toString().trim();
+    const previewUrl = (raw.media_preview_url ?? '').toString().trim();
+    const downloadUrl = [];
+    if (previewUrl) {
+        downloadUrl.push({ quality: '96kbps', url: previewUrl });
+    }
+    if (mediaUrl) {
+        downloadUrl.push({ quality: '320kbps', url: mediaUrl });
+    }
+
+    const imageUrl = (raw.image ?? raw.image_url ?? '').toString().trim();
+    const image = imageUrl
+        ? [
+            { quality: '50x50', url: imageUrl },
+            { quality: '150x150', url: imageUrl },
+            { quality: '500x500', url: imageUrl },
+        ]
+        : [];
+
+    const albumId = (raw.albumid ?? '').toString().trim();
+    const albumName = (raw.album ?? '').toString().trim();
+    const albumUrl = (raw.album_url ?? '').toString().trim();
+
+    return {
+        id,
+        name,
+        type: 'song',
+        year: (raw.year ?? '').toString(),
+        releaseDate: raw.release_date ?? null,
+        duration: Number.parseInt(raw.duration, 10) || null,
+        language: (raw.language ?? '').toString().toLowerCase(),
+        url: (raw.perma_url ?? '').toString(),
+        album: {
+            id: albumId,
+            name: albumName,
+            url: albumUrl,
+        },
+        primaryArtists: artistText,
+        artists: {
+            primary: artistsPrimary,
+            featured: [],
+            all: artistsPrimary,
+        },
+        image,
+        downloadUrl,
+    };
+}
