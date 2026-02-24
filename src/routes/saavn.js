@@ -1,5 +1,12 @@
 import { Router } from 'express';
-import { searchSongs, getSongById, getAlbumById, searchAlbums } from '../services/saavnApi.js';
+import {
+    searchSongsOnly,
+    searchArtists,
+    getArtistsByLanguage,
+    getSongById,
+    getAlbumById,
+    searchAlbums,
+} from '../services/saavnApi.js';
 
 const router = Router();
 
@@ -81,7 +88,6 @@ router.get('/artists/by-language', async (req, res) => {
         if (!language) {
             return res.status(400).json({ error: 'Query parameter "language" is required' });
         }
-        const { getArtistsByLanguage } = await import('../services/saavnApi.js');
         const data = await getArtistsByLanguage(language);
         res.json({ success: true, count: data.length, data });
     } catch (error) {
