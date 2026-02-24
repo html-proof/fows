@@ -4,9 +4,11 @@ const BASE_URL = 'https://saavn.sumit.co';
 const FALLBACK_BASE_URL = 'https://saavnapi-nine.vercel.app';
 const MAX_SMART_RESULTS = 40;
 const SMART_SEARCH_MIN_RESULTS = 8;
-const SEARCH_CACHE_TTL_MS = 5 * 60 * 1000;
+const SEARCH_CACHE_FRESH_TTL_MS = 2 * 60 * 1000;
+const SEARCH_CACHE_STALE_TTL_MS = 20 * 60 * 1000;
 const SEARCH_CACHE_MAX_ENTRIES = 300;
 const smartSearchCache = new Map();
+const smartSearchInFlight = new Map();
 const LANGUAGE_HINTS = new Set([
     'hindi',
     'malayalam',
@@ -48,6 +50,54 @@ export async function searchSongs(query, page = 1) {
 }
 
 export async function searchSongsOnly(query, page = 1) {
+    const pageNumber = Number.parseInt(page, 10) || 1;
+
+    // Keep paging stable; fallback is used as a recovery path for page > 1.
+    if (pageNumber > 1) {
+        try {
+            return await searchSongsOnlyPrimary(query, pageNumber);
+        } catch (_primaryError) {
+            const fallbackSongs = await searchSongsOnlyFallback(query);
+            return wrapSongsOnlyResponse(fallbackSongs);
+        }
+    }
+
+    const [primaryResult, fallbackResult] = await Promise.allSettled([
+        searchSongsOnlyPrimary(query, pageNumber),
+        searchSongsOnlyFallback(query),
+    ]);
+
+    if (primaryResult.status === 'fulfilled') {
+        const primaryPayload = primaryResult.value;
+        const primarySongs = primaryPayload?.data?.results ?? [];
+        const fallbackSongs = fallbackResult.status === 'fulfilled'
+            ? (fallbackResult.value ?? [])
+            : [];
+
+        if (fallbackSongs.length === 0) {
+            return primaryPayload;
+        }
+
+        const mergedSongs = mergeUniqueSongs(primarySongs, fallbackSongs);
+        return mergeSongsIntoPayload(primaryPayload, mergedSongs);
+    }
+
+    if (fallbackResult.status === 'fulfilled') {
+        return wrapSongsOnlyResponse(fallbackResult.value ?? []);
+    }
+
+    const primaryMsg = primaryResult.status === 'rejected'
+        ? (primaryResult.reason?.message ?? 'unknown')
+        : 'unknown';
+    const fallbackMsg = fallbackResult.status === 'rejected'
+        ? (fallbackResult.reason?.message ?? 'unknown')
+        : 'unknown';
+    throw new Error(
+        `Multi-source song search failed. primary=${primaryMsg}; fallback=${fallbackMsg}`
+    );
+}
+
+async function searchSongsOnlyPrimary(query, page = 1) {
     const { statusCode, body } = await request(
         `${BASE_URL}/api/search/songs?query=${encodeURIComponent(query)}&page=${page}`
     );
@@ -80,20 +130,64 @@ export async function searchSongsOnlyFallback(query) {
 
 /**
  * Smart song search for scale:
+ * - returns fresh cache instantly
+ * - returns stale cache instantly while refreshing in background
+ * - deduplicates in-flight requests per query
  * - queries primary and fallback providers
  * - retries with normalized variants (language/noise stripped)
  * - ranks and deduplicates results
  *
  * @param {string} query
+ * @param {{ waitForFresh?: boolean }} [options]
  * @returns {Promise<object[]>}
  */
-export async function searchSongsSmart(query) {
+export async function searchSongsSmart(query, options = {}) {
     const normalizedQuery = normalizeQuery(query);
     if (!normalizedQuery) return [];
+    const waitForFresh = options?.waitForFresh === true;
 
     const cached = getCachedSmartSearch(normalizedQuery);
-    if (cached) return cached;
+    if (cached) {
+        if (cached.state === 'fresh') {
+            return cached.data;
+        }
 
+        if (!waitForFresh) {
+            triggerBackgroundSmartSearchRefresh(normalizedQuery);
+            return cached.data;
+        }
+    }
+
+    return refreshSmartSearch(normalizedQuery);
+}
+
+async function refreshSmartSearch(normalizedQuery) {
+    const inFlight = smartSearchInFlight.get(normalizedQuery);
+    if (inFlight) return inFlight;
+
+    const promise = (async () => {
+        const output = await computeSmartSearchResults(normalizedQuery);
+        setCachedSmartSearch(normalizedQuery, output);
+        return output;
+    })();
+
+    smartSearchInFlight.set(normalizedQuery, promise);
+    promise.then(
+        () => smartSearchInFlight.delete(normalizedQuery),
+        () => smartSearchInFlight.delete(normalizedQuery)
+    );
+
+    return promise;
+}
+
+function triggerBackgroundSmartSearchRefresh(normalizedQuery) {
+    if (smartSearchInFlight.has(normalizedQuery)) return;
+    refreshSmartSearch(normalizedQuery).catch((error) => {
+        console.error('Background smart search refresh failed:', error?.message ?? error);
+    });
+}
+
+async function computeSmartSearchResults(normalizedQuery) {
     const variants = buildSearchQueryVariants(normalizedQuery);
     const languageHint = extractLanguageHint(normalizedQuery);
     const ranked = new Map(); // id -> { song, score }
@@ -102,7 +196,7 @@ export async function searchSongsSmart(query) {
         const variant = variants[i];
         const [songsOnlyResult, searchResult, fallbackResult] =
             await Promise.allSettled([
-                searchSongsOnly(variant, 1),
+                searchSongsOnlyPrimary(variant, 1),
                 searchSongs(variant, 1),
                 searchSongsOnlyFallback(variant),
             ]);
@@ -152,7 +246,6 @@ export async function searchSongsSmart(query) {
         .sort((a, b) => b.score - a.score)
         .slice(0, MAX_SMART_RESULTS)
         .map(entry => entry.song);
-    setCachedSmartSearch(normalizedQuery, output);
     return output;
 }
 
@@ -546,23 +639,103 @@ function levenshteinDistance(a, b) {
     return dp[rows - 1][cols - 1];
 }
 
+function mergeUniqueSongs(...songLists) {
+    const merged = [];
+    const seen = new Set();
+
+    for (const list of songLists) {
+        const safeList = Array.isArray(list) ? list : [];
+        for (const song of safeList) {
+            if (!song || typeof song !== 'object') continue;
+
+            const idKey = String(song.id ?? '').trim();
+            const nameKey = normalizeQuery(song.name ?? song.title ?? '');
+            const dedupeKey = idKey || nameKey;
+            if (!dedupeKey) continue;
+            if (seen.has(dedupeKey)) continue;
+
+            seen.add(dedupeKey);
+            merged.push(song);
+        }
+    }
+
+    return merged;
+}
+
+function mergeSongsIntoPayload(primaryPayload, songs) {
+    const safePayload = primaryPayload && typeof primaryPayload === 'object'
+        ? primaryPayload
+        : {};
+    const safeData = safePayload.data && typeof safePayload.data === 'object'
+        ? safePayload.data
+        : {};
+
+    return {
+        ...safePayload,
+        success: safePayload.success ?? true,
+        data: {
+            ...safeData,
+            start: safeData.start ?? 0,
+            total: songs.length,
+            results: songs,
+        },
+    };
+}
+
+function wrapSongsOnlyResponse(songs) {
+    const safeSongs = Array.isArray(songs) ? songs : [];
+    return {
+        success: true,
+        data: {
+            start: 0,
+            total: safeSongs.length,
+            results: safeSongs,
+        },
+    };
+}
+
 function getCachedSmartSearch(query) {
     const item = smartSearchCache.get(query);
     if (!item) return null;
-    if (Date.now() - item.ts > SEARCH_CACHE_TTL_MS) {
+    const now = Date.now();
+    const ageMs = now - item.updatedAt;
+    if (ageMs > SEARCH_CACHE_STALE_TTL_MS) {
         smartSearchCache.delete(query);
         return null;
     }
-    return item.data;
+
+    item.lastAccessAt = now;
+    return {
+        data: item.data,
+        state: ageMs <= SEARCH_CACHE_FRESH_TTL_MS ? 'fresh' : 'stale',
+    };
 }
 
 function setCachedSmartSearch(query, data) {
-    smartSearchCache.set(query, { ts: Date.now(), data });
+    const now = Date.now();
+    smartSearchCache.set(query, {
+        updatedAt: now,
+        lastAccessAt: now,
+        data,
+    });
+    trimSmartSearchCache();
+}
+
+function trimSmartSearchCache() {
     if (smartSearchCache.size <= SEARCH_CACHE_MAX_ENTRIES) return;
 
-    const keys = smartSearchCache.keys();
-    const oldest = keys.next();
-    if (!oldest.done) {
-        smartSearchCache.delete(oldest.value);
+    let oldestKey = null;
+    let oldestAccess = Number.POSITIVE_INFINITY;
+
+    for (const [key, value] of smartSearchCache.entries()) {
+        const access = value?.lastAccessAt ?? value?.updatedAt ?? 0;
+        if (access < oldestAccess) {
+            oldestAccess = access;
+            oldestKey = key;
+        }
+    }
+
+    if (oldestKey) {
+        smartSearchCache.delete(oldestKey);
     }
 }
