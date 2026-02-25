@@ -12,8 +12,17 @@ const SMART_SEARCH_MAX_LATENCY_MS = 3200;
 const PRIMARY_SEARCH_TIMEOUT_MS = 2200;
 const FALLBACK_SEARCH_TIMEOUT_MS = 1800;
 const CATALOG_SEARCH_TIMEOUT_MS = 1500;
+const LOCAL_INDEX_MAX_ENTRIES = 6000;
+const LOCAL_INDEX_MAX_CANDIDATES = 120;
 const smartSearchCache = new Map();
 const smartSearchInFlight = new Map();
+const localSongIndex = new Map();
+const MATCH_TIERS = Object.freeze({
+    EXACT: 0,
+    STARTS_WITH: 1,
+    CONTAINS: 2,
+    FUZZY: 3,
+});
 const LANGUAGE_HINTS = new Set([
     'hindi',
     'malayalam',
@@ -156,60 +165,91 @@ export async function searchSongsOnlyFallback(query) {
  * - ranks and deduplicates results
  *
  * @param {string} query
- * @param {{ waitForFresh?: boolean }} [options]
+ * @param {{ waitForFresh?: boolean, preferredLanguages?: string[] }} [options]
  * @returns {Promise<object[]>}
  */
 export async function searchSongsSmart(query, options = {}) {
     const normalizedQuery = normalizeQuery(query);
     if (!normalizedQuery) return [];
     const waitForFresh = options?.waitForFresh === true;
+    const preferredLanguages = normalizeLanguageList(options?.preferredLanguages);
+    const cacheKey = buildSmartSearchCacheKey(normalizedQuery, preferredLanguages);
+    const context = {
+        cacheKey,
+        normalizedQuery,
+        preferredLanguages,
+    };
 
-    const cached = getCachedSmartSearch(normalizedQuery);
+    const cached = getCachedSmartSearch(cacheKey);
     if (cached) {
         if (cached.state === 'fresh') {
             return cached.data;
         }
 
         if (!waitForFresh) {
-            triggerBackgroundSmartSearchRefresh(normalizedQuery);
+            triggerBackgroundSmartSearchRefresh(context);
             return cached.data;
         }
     }
 
-    return refreshSmartSearch(normalizedQuery);
+    return refreshSmartSearch(context);
 }
 
-async function refreshSmartSearch(normalizedQuery) {
-    const inFlight = smartSearchInFlight.get(normalizedQuery);
+async function refreshSmartSearch(context) {
+    const { cacheKey, normalizedQuery, preferredLanguages } = context;
+    const inFlight = smartSearchInFlight.get(cacheKey);
     if (inFlight) return inFlight;
 
     const promise = (async () => {
-        const output = await computeSmartSearchResults(normalizedQuery);
-        setCachedSmartSearch(normalizedQuery, output);
+        const output = await computeSmartSearchResults({
+            normalizedQuery,
+            preferredLanguages,
+        });
+        setCachedSmartSearch(cacheKey, output);
         return output;
     })();
 
-    smartSearchInFlight.set(normalizedQuery, promise);
+    smartSearchInFlight.set(cacheKey, promise);
     promise.then(
-        () => smartSearchInFlight.delete(normalizedQuery),
-        () => smartSearchInFlight.delete(normalizedQuery)
+        () => smartSearchInFlight.delete(cacheKey),
+        () => smartSearchInFlight.delete(cacheKey)
     );
 
     return promise;
 }
 
-function triggerBackgroundSmartSearchRefresh(normalizedQuery) {
-    if (smartSearchInFlight.has(normalizedQuery)) return;
-    refreshSmartSearch(normalizedQuery).catch((error) => {
+function triggerBackgroundSmartSearchRefresh(context) {
+    if (smartSearchInFlight.has(context.cacheKey)) return;
+    refreshSmartSearch(context).catch((error) => {
         console.error('Background smart search refresh failed:', error?.message ?? error);
     });
 }
 
-async function computeSmartSearchResults(normalizedQuery) {
+async function computeSmartSearchResults({
+    normalizedQuery,
+    preferredLanguages,
+}) {
     const startedAt = Date.now();
     const variants = buildSearchQueryVariants(normalizedQuery);
     const languageHint = extractLanguageHint(normalizedQuery);
-    const ranked = new Map(); // id -> { song, score }
+    const preferredLanguageSet = new Set(preferredLanguages);
+    const ranked = new Map(); // id -> { song, score, matchTier }
+
+    const indexedSongs = searchLocalSongIndex(normalizedQuery);
+    if (indexedSongs.length > 0) {
+        addRankedSongs({
+            ranked,
+            songs: indexedSongs,
+            query: normalizedQuery,
+            variantIndex: 0,
+            sourceWeight: 20,
+            languageHint,
+            preferredLanguageSet,
+        });
+    }
+    if (hasStrongRankedCoverage(ranked)) {
+        return buildRankedOutput(ranked);
+    }
 
     for (let i = 0; i < variants.length; i += 1) {
         const elapsedMs = Date.now() - startedAt;
@@ -254,6 +294,7 @@ async function computeSmartSearchResults(normalizedQuery) {
             variantIndex: i,
             sourceWeight: 15,
             languageHint,
+            preferredLanguageSet,
         });
         addRankedSongs({
             ranked,
@@ -262,6 +303,7 @@ async function computeSmartSearchResults(normalizedQuery) {
             variantIndex: i,
             sourceWeight: 8,
             languageHint,
+            preferredLanguageSet,
         });
         addRankedSongs({
             ranked,
@@ -270,6 +312,7 @@ async function computeSmartSearchResults(normalizedQuery) {
             variantIndex: i,
             sourceWeight: 5,
             languageHint,
+            preferredLanguageSet,
         });
 
         // Stop once we have enough candidates or we hit our time budget.
@@ -281,11 +324,40 @@ async function computeSmartSearchResults(normalizedQuery) {
         }
     }
 
-    const output = Array.from(ranked.values())
-        .sort((a, b) => b.score - a.score)
-        .slice(0, MAX_SMART_RESULTS)
-        .map(entry => entry.song);
-    return output;
+    if (!hasExactRankedMatch(ranked)) {
+        const globalSettled = await Promise.allSettled([
+            searchSongs(normalizedQuery, 1),
+            searchSongsOnlyFallback(normalizedQuery),
+        ]);
+
+        const globalSongs = globalSettled[0]?.status === 'fulfilled'
+            ? (globalSettled[0].value?.data?.results ?? [])
+            : [];
+        const fallbackSongs = globalSettled[1]?.status === 'fulfilled'
+            ? globalSettled[1].value
+            : [];
+
+        addRankedSongs({
+            ranked,
+            songs: globalSongs,
+            query: normalizedQuery,
+            variantIndex: SMART_SEARCH_MAX_VARIANTS + 1,
+            sourceWeight: 6,
+            languageHint,
+            preferredLanguageSet,
+        });
+        addRankedSongs({
+            ranked,
+            songs: fallbackSongs,
+            query: normalizedQuery,
+            variantIndex: SMART_SEARCH_MAX_VARIANTS + 1,
+            sourceWeight: 4,
+            languageHint,
+            preferredLanguageSet,
+        });
+    }
+
+    return buildRankedOutput(ranked);
 }
 
 /**
@@ -358,6 +430,27 @@ export async function getArtistSongs(artistId) {
 }
 
 /**
+ * Get an artist's albums by artist ID with pagination.
+ * @param {string} artistId - Artist ID
+ * @param {{ limit?: number, page?: number }} [options]
+ * @returns {Promise<object>} Artist albums payload
+ */
+export async function getArtistAlbums(artistId, options = {}) {
+    const parsedLimit = Number.parseInt(options.limit, 10);
+    const parsedPage = Number.parseInt(options.page, 10);
+    const limit = Number.isNaN(parsedLimit) ? 20 : Math.max(1, Math.min(parsedLimit, 50));
+    const page = Number.isNaN(parsedPage) ? 1 : Math.max(parsedPage, 1);
+
+    return requestJsonWithTimeout(
+        `${BASE_URL}/api/artists/${encodeURIComponent(artistId)}/albums?limit=${limit}&page=${page}`,
+        {
+            timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+            label: 'Saavn artist albums',
+        }
+    );
+}
+
+/**
  * Get artist details by ID.
  * @param {string} artistId - Artist ID
  * @returns {Promise<object>} Artist details
@@ -408,6 +501,7 @@ export default {
     searchAlbums,
     searchArtists,
     getArtistSongs,
+    getArtistAlbums,
     getArtistById,
     getArtistsByLanguage,
 };
@@ -483,24 +577,33 @@ function addRankedSongs({
     variantIndex,
     sourceWeight,
     languageHint,
+    preferredLanguageSet,
 }) {
     const safeSongs = Array.isArray(songs) ? songs : [];
     for (const rawSong of safeSongs) {
         const song = normalizePrimarySong(rawSong);
         if (!song || !song.id) continue;
+        upsertLocalSongIndex(song);
 
-        const score = scoreSongMatch({
+        const match = scoreSongMatch({
             song,
             query,
             variantIndex,
             sourceWeight,
             languageHint,
+            preferredLanguageSet,
         });
-        if (score < 0) continue;
+        if (!match) continue;
+
+        const candidate = {
+            song,
+            score: match.score,
+            matchTier: match.matchTier,
+        };
 
         const existing = ranked.get(song.id);
-        if (!existing || score > existing.score) {
-            ranked.set(song.id, { song, score });
+        if (!existing || compareRankedEntries(candidate, existing) < 0) {
+            ranked.set(song.id, candidate);
         }
     }
 }
@@ -518,6 +621,11 @@ function normalizeQuery(query) {
         .toLowerCase()
         .replace(/\s+/g, ' ')
         .trim();
+}
+
+function normalizeCompact(value) {
+    return normalizeQuery(value)
+        .replace(/[^\p{L}\p{N}]/gu, '');
 }
 
 function buildSearchQueryVariants(query) {
@@ -580,11 +688,79 @@ function tokenize(value) {
         .filter(Boolean);
 }
 
+function normalizeLanguageList(values) {
+    if (!Array.isArray(values) || values.length === 0) return [];
+    const normalized = values
+        .map(language => normalizeQuery(language))
+        .filter(Boolean);
+    return Array.from(new Set(normalized)).sort();
+}
+
+function buildSmartSearchCacheKey(query, preferredLanguages) {
+    const languages = Array.isArray(preferredLanguages) && preferredLanguages.length > 0
+        ? preferredLanguages.join(',')
+        : '_';
+    return `${query}::${languages}`;
+}
+
 function extractLanguageHint(query) {
     for (const token of tokenize(query)) {
         if (LANGUAGE_HINTS.has(token)) return token;
     }
     return null;
+}
+
+function extractSongSearchFields(song) {
+    const name = normalizeQuery(song?.name ?? song?.title ?? '');
+    const artists = normalizeQuery(
+        song?.primaryArtists ??
+        song?.artists?.primary?.map(artist => artist?.name ?? '').join(' ') ??
+        ''
+    );
+    const album = normalizeQuery(
+        typeof song?.album === 'object' ? (song?.album?.name ?? '') : (song?.album ?? '')
+    );
+    const haystack = `${name} ${artists} ${album}`.trim();
+
+    return {
+        name,
+        artists,
+        album,
+        haystack,
+        compactName: normalizeCompact(name),
+        compactHaystack: normalizeCompact(haystack),
+        haystackTokens: tokenize(haystack),
+    };
+}
+
+function compareRankedEntries(a, b) {
+    if (a.matchTier !== b.matchTier) return a.matchTier - b.matchTier;
+    return b.score - a.score;
+}
+
+function buildRankedOutput(ranked) {
+    return Array.from(ranked.values())
+        .sort(compareRankedEntries)
+        .slice(0, MAX_SMART_RESULTS)
+        .map(entry => entry.song);
+}
+
+function hasExactRankedMatch(ranked) {
+    for (const entry of ranked.values()) {
+        if (entry.matchTier === MATCH_TIERS.EXACT) return true;
+    }
+    return false;
+}
+
+function hasStrongRankedCoverage(ranked) {
+    let strongMatches = 0;
+    for (const entry of ranked.values()) {
+        if (entry.matchTier <= MATCH_TIERS.CONTAINS) {
+            strongMatches += 1;
+            if (strongMatches >= SMART_SEARCH_MIN_RESULTS) return true;
+        }
+    }
+    return false;
 }
 
 function scoreSongMatch({
@@ -593,42 +769,87 @@ function scoreSongMatch({
     variantIndex,
     sourceWeight,
     languageHint,
+    preferredLanguageSet,
 }) {
-    const name = normalizeQuery(song.name ?? '');
-    const artists = normalizeQuery(
-        song.primaryArtists ??
-        song.artists?.primary?.map(a => a?.name ?? '').join(' ') ??
-        ''
-    );
-    const album = normalizeQuery(
-        typeof song.album === 'object' ? (song.album?.name ?? '') : (song.album ?? '')
-    );
-    const haystack = `${name} ${artists} ${album}`.trim();
-    const haystackTokens = tokenize(haystack);
+    const {
+        name,
+        artists,
+        album,
+        haystack,
+        compactName,
+        compactHaystack,
+        haystackTokens,
+    } = extractSongSearchFields(song);
+    const compactQuery = normalizeCompact(query);
     const queryTerms = tokenize(query).filter(token => !QUERY_NOISE_WORDS.has(token));
-    const matchedTerms = queryTerms.filter(term => haystack.includes(term));
+    const effectiveTerms = queryTerms.length > 0 ? queryTerms : tokenize(query);
+    const maxMissingTerms = effectiveTerms.length > 1 ? 1 : 0;
+    const minimumTermMatches = effectiveTerms.length === 0
+        ? 0
+        : Math.max(1, effectiveTerms.length - maxMissingTerms);
 
     let score = 0;
+    let directMatches = 0;
+    let fuzzyMatches = 0;
 
-    // Avoid noisy unrelated results for unmatched queries.
-    if (queryTerms.length > 0 && matchedTerms.length === 0 && !name.includes(query)) {
-        return -1;
+    for (const term of effectiveTerms) {
+        if (name.includes(term)) {
+            directMatches += 1;
+            score += 20;
+        } else if (artists.includes(term)) {
+            directMatches += 1;
+            score += 13;
+        } else if (album.includes(term)) {
+            directMatches += 1;
+            score += 10;
+        } else if (hasFuzzyTokenMatch(term, haystackTokens)) {
+            fuzzyMatches += 1;
+            score += 6;
+        }
     }
 
-    if (name === query) score += 120;
-    if (name.includes(query)) score += 70;
-    if (haystack.includes(query)) score += 30;
+    const totalMatches = directMatches + fuzzyMatches;
+    const hasTermCoverage = effectiveTerms.length === 0 || totalMatches >= minimumTermMatches;
 
-    for (const term of queryTerms) {
-        if (name.includes(term)) {
-            score += 18;
-        } else if (artists.includes(term)) {
-            score += 10;
-        } else if (album.includes(term)) {
-            score += 8;
-        } else if (hasFuzzyTokenMatch(term, haystackTokens)) {
-            score += 5;
+    let matchTier = null;
+    if (name === query || (compactQuery && compactName === compactQuery)) {
+        matchTier = MATCH_TIERS.EXACT;
+        score += 260;
+    } else if (
+        name.startsWith(query) ||
+        (compactQuery && compactName.startsWith(compactQuery))
+    ) {
+        matchTier = MATCH_TIERS.STARTS_WITH;
+        score += 200;
+    } else if (
+        name.includes(query) ||
+        haystack.includes(query) ||
+        (compactQuery && (
+            compactName.includes(compactQuery) ||
+            compactHaystack.includes(compactQuery)
+        ))
+    ) {
+        matchTier = MATCH_TIERS.CONTAINS;
+        score += 140;
+    } else {
+        const maxCompactDistance = resolveMaxEditDistance(compactQuery.length);
+        const hasCompactFuzzy = Boolean(compactQuery && compactName)
+            && Math.abs(compactQuery.length - compactName.length) <= maxCompactDistance
+            && levenshteinDistance(compactQuery, compactName) <= maxCompactDistance;
+        if (hasTermCoverage || hasCompactFuzzy || fuzzyMatches > 0) {
+            matchTier = MATCH_TIERS.FUZZY;
+            score += 80;
         }
+    }
+
+    if (matchTier == null) return null;
+    if (matchTier === MATCH_TIERS.FUZZY && effectiveTerms.length >= 2 && !hasTermCoverage) {
+        return null;
+    }
+
+    // Avoid noisy unrelated results for unmatched long queries.
+    if (effectiveTerms.length >= 2 && totalMatches === 0 && matchTier > MATCH_TIERS.CONTAINS) {
+        return null;
     }
 
     if (languageHint) {
@@ -640,10 +861,31 @@ function scoreSongMatch({
         }
     }
 
-    score += sourceWeight;
-    score -= variantIndex * 12;
+    if (preferredLanguageSet?.size > 0) {
+        const language = normalizeQuery(song.language ?? '');
+        if (preferredLanguageSet.has(language)) {
+            score += 28;
+        } else {
+            score -= 2;
+        }
+    }
 
-    return score;
+    score += sourceWeight;
+    score -= variantIndex * 10;
+    if (matchTier === MATCH_TIERS.FUZZY) {
+        score -= 10;
+    }
+
+    return {
+        score,
+        matchTier,
+    };
+}
+
+function resolveMaxEditDistance(length) {
+    if (length >= 10) return 3;
+    if (length >= 6) return 2;
+    return 1;
 }
 
 function hasFuzzyTokenMatch(queryTerm, targetTokens) {
@@ -680,6 +922,109 @@ function levenshteinDistance(a, b) {
         }
     }
     return dp[rows - 1][cols - 1];
+}
+
+function searchLocalSongIndex(query) {
+    if (localSongIndex.size === 0) return [];
+
+    const normalizedQuery = normalizeQuery(query);
+    if (!normalizedQuery) return [];
+    const compactQuery = normalizeCompact(normalizedQuery);
+    const queryTerms = tokenize(normalizedQuery).filter(token => !QUERY_NOISE_WORDS.has(token));
+    const effectiveTerms = queryTerms.length > 0 ? queryTerms : tokenize(normalizedQuery);
+    const maxMissingTerms = effectiveTerms.length > 1 ? 1 : 0;
+    const minimumMatches = effectiveTerms.length === 0
+        ? 0
+        : Math.max(1, effectiveTerms.length - maxMissingTerms);
+    const now = Date.now();
+
+    const candidates = [];
+    for (const entry of localSongIndex.values()) {
+        const {
+            song,
+            name,
+            haystack,
+            compactName,
+            compactHaystack,
+            haystackTokens,
+        } = entry;
+        let score = 0;
+        let matches = 0;
+
+        if (name === normalizedQuery || (compactQuery && compactName === compactQuery)) {
+            score += 180;
+        } else if (
+            name.startsWith(normalizedQuery) ||
+            (compactQuery && compactName.startsWith(compactQuery))
+        ) {
+            score += 120;
+        } else if (
+            name.includes(normalizedQuery) ||
+            haystack.includes(normalizedQuery) ||
+            (compactQuery && compactHaystack.includes(compactQuery))
+        ) {
+            score += 80;
+        }
+
+        for (const term of effectiveTerms) {
+            if (name.includes(term) || haystack.includes(term)) {
+                matches += 1;
+                score += 10;
+            } else if (hasFuzzyTokenMatch(term, haystackTokens)) {
+                matches += 1;
+                score += 5;
+            }
+        }
+
+        if (minimumMatches > 0 && matches < minimumMatches && score < 70) {
+            continue;
+        }
+        if (score <= 0) continue;
+
+        entry.lastAccessAt = now;
+        candidates.push({ song, score });
+    }
+
+    return candidates
+        .sort((a, b) => b.score - a.score)
+        .slice(0, LOCAL_INDEX_MAX_CANDIDATES)
+        .map(entry => entry.song);
+}
+
+function upsertLocalSongIndex(song) {
+    if (!song || typeof song !== 'object') return;
+    const normalizedSong = normalizePrimarySong(song);
+    if (!normalizedSong || !normalizedSong.id) return;
+
+    const now = Date.now();
+    const fields = extractSongSearchFields(normalizedSong);
+    if (!fields.name) return;
+
+    localSongIndex.set(normalizedSong.id, {
+        song: normalizedSong,
+        ...fields,
+        updatedAt: now,
+        lastAccessAt: now,
+    });
+    trimLocalSongIndex();
+}
+
+function trimLocalSongIndex() {
+    while (localSongIndex.size > LOCAL_INDEX_MAX_ENTRIES) {
+        let oldestKey = null;
+        let oldestAccess = Number.POSITIVE_INFINITY;
+
+        for (const [key, value] of localSongIndex.entries()) {
+            const access = value?.lastAccessAt ?? value?.updatedAt ?? 0;
+            if (access < oldestAccess) {
+                oldestAccess = access;
+                oldestKey = key;
+            }
+        }
+
+        if (!oldestKey) break;
+        localSongIndex.delete(oldestKey);
+    }
 }
 
 function mergeUniqueSongs(...songLists) {
