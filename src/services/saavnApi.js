@@ -7,6 +7,11 @@ const SMART_SEARCH_MIN_RESULTS = 8;
 const SEARCH_CACHE_FRESH_TTL_MS = 2 * 60 * 1000;
 const SEARCH_CACHE_STALE_TTL_MS = 20 * 60 * 1000;
 const SEARCH_CACHE_MAX_ENTRIES = 300;
+const SMART_SEARCH_MAX_VARIANTS = 4;
+const SMART_SEARCH_MAX_LATENCY_MS = 3200;
+const PRIMARY_SEARCH_TIMEOUT_MS = 2200;
+const FALLBACK_SEARCH_TIMEOUT_MS = 1800;
+const CATALOG_SEARCH_TIMEOUT_MS = 1500;
 const smartSearchCache = new Map();
 const smartSearchInFlight = new Map();
 const LANGUAGE_HINTS = new Set([
@@ -41,68 +46,82 @@ const QUERY_NOISE_WORDS = new Set([
     'ost',
 ]);
 
+async function requestJsonWithTimeout(url, { timeoutMs, label }) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+        const { statusCode, body } = await request(url, {
+            signal: controller.signal,
+            headersTimeout: timeoutMs,
+            bodyTimeout: timeoutMs,
+        });
+
+        if (statusCode !== 200) {
+            throw new Error(`${label} failed with status ${statusCode}`);
+        }
+
+        return body.json();
+    } catch (error) {
+        if (error?.name === 'AbortError' || error?.code === 'UND_ERR_ABORTED') {
+            throw new Error(`${label} timed out after ${timeoutMs}ms`);
+        }
+        throw error;
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
 export async function searchSongs(query, page = 1) {
-    const { statusCode, body } = await request(
-        `${BASE_URL}/api/search?query=${encodeURIComponent(query)}&page=${page}`
+    return requestJsonWithTimeout(
+        `${BASE_URL}/api/search?query=${encodeURIComponent(query)}&page=${page}`,
+        {
+            timeoutMs: PRIMARY_SEARCH_TIMEOUT_MS,
+            label: 'Saavn search',
+        }
     );
-    if (statusCode !== 200) throw new Error(`Saavn search failed with status ${statusCode}`);
-    return body.json();
 }
 
 export async function searchSongsOnly(query, page = 1) {
     const pageNumber = Number.parseInt(page, 10) || 1;
 
-    // Keep paging stable; fallback is used as a recovery path for page > 1.
-    if (pageNumber > 1) {
-        try {
-            return await searchSongsOnlyPrimary(query, pageNumber);
-        } catch (_primaryError) {
+    let primaryPayload = null;
+    try {
+        primaryPayload = await searchSongsOnlyPrimary(query, pageNumber);
+    } catch (_primaryError) {
+        if (pageNumber > 1) {
             const fallbackSongs = await searchSongsOnlyFallback(query);
             return wrapSongsOnlyResponse(fallbackSongs);
         }
     }
 
-    const [primaryResult, fallbackResult] = await Promise.allSettled([
-        searchSongsOnlyPrimary(query, pageNumber),
-        searchSongsOnlyFallback(query),
-    ]);
-
-    if (primaryResult.status === 'fulfilled') {
-        const primaryPayload = primaryResult.value;
-        const primarySongs = primaryPayload?.data?.results ?? [];
-        const fallbackSongs = fallbackResult.status === 'fulfilled'
-            ? (fallbackResult.value ?? [])
-            : [];
-
-        if (fallbackSongs.length === 0) {
-            return primaryPayload;
-        }
-
-        const mergedSongs = mergeUniqueSongs(primarySongs, fallbackSongs);
-        return mergeSongsIntoPayload(primaryPayload, mergedSongs);
+    if (!primaryPayload) {
+        const fallbackSongs = await searchSongsOnlyFallback(query);
+        return wrapSongsOnlyResponse(fallbackSongs);
     }
 
-    if (fallbackResult.status === 'fulfilled') {
-        return wrapSongsOnlyResponse(fallbackResult.value ?? []);
+    const primarySongs = primaryPayload?.data?.results ?? [];
+    if (primarySongs.length >= SMART_SEARCH_MIN_RESULTS || pageNumber > 1) {
+        return primaryPayload;
     }
 
-    const primaryMsg = primaryResult.status === 'rejected'
-        ? (primaryResult.reason?.message ?? 'unknown')
-        : 'unknown';
-    const fallbackMsg = fallbackResult.status === 'rejected'
-        ? (fallbackResult.reason?.message ?? 'unknown')
-        : 'unknown';
-    throw new Error(
-        `Multi-source song search failed. primary=${primaryMsg}; fallback=${fallbackMsg}`
-    );
+    const fallbackSongs = await searchSongsOnlyFallback(query).catch(() => []);
+    if (fallbackSongs.length === 0) {
+        return primaryPayload;
+    }
+
+    const mergedSongs = mergeUniqueSongs(primarySongs, fallbackSongs);
+    return mergeSongsIntoPayload(primaryPayload, mergedSongs);
 }
 
 async function searchSongsOnlyPrimary(query, page = 1) {
-    const { statusCode, body } = await request(
-        `${BASE_URL}/api/search/songs?query=${encodeURIComponent(query)}&page=${page}`
+    return requestJsonWithTimeout(
+        `${BASE_URL}/api/search/songs?query=${encodeURIComponent(query)}&page=${page}`,
+        {
+            timeoutMs: PRIMARY_SEARCH_TIMEOUT_MS,
+            label: 'Saavn song search',
+        }
     );
-    if (statusCode !== 200) throw new Error(`Saavn song search failed with status ${statusCode}`);
-    return body.json();
 }
 
 /**
@@ -113,14 +132,13 @@ async function searchSongsOnlyPrimary(query, page = 1) {
  * @returns {Promise<object[]>}
  */
 export async function searchSongsOnlyFallback(query) {
-    const { statusCode, body } = await request(
-        `${FALLBACK_BASE_URL}/result/?query=${encodeURIComponent(query)}`
+    const payload = await requestJsonWithTimeout(
+        `${FALLBACK_BASE_URL}/result/?query=${encodeURIComponent(query)}`,
+        {
+            timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
+            label: 'Fallback song search',
+        }
     );
-    if (statusCode !== 200) {
-        throw new Error(`Fallback song search failed with status ${statusCode}`);
-    }
-
-    const payload = await body.json();
     if (!Array.isArray(payload)) return [];
 
     return payload
@@ -188,27 +206,45 @@ function triggerBackgroundSmartSearchRefresh(normalizedQuery) {
 }
 
 async function computeSmartSearchResults(normalizedQuery) {
+    const startedAt = Date.now();
     const variants = buildSearchQueryVariants(normalizedQuery);
     const languageHint = extractLanguageHint(normalizedQuery);
     const ranked = new Map(); // id -> { song, score }
 
     for (let i = 0; i < variants.length; i += 1) {
-        const variant = variants[i];
-        const [songsOnlyResult, searchResult, fallbackResult] =
-            await Promise.allSettled([
-                searchSongsOnlyPrimary(variant, 1),
-                searchSongs(variant, 1),
-                searchSongsOnlyFallback(variant),
-            ]);
+        const elapsedMs = Date.now() - startedAt;
+        if (elapsedMs >= SMART_SEARCH_MAX_LATENCY_MS && ranked.size > 0) {
+            break;
+        }
 
-        const primarySongs = songsOnlyResult.status === 'fulfilled'
-            ? (songsOnlyResult.value?.data?.results ?? [])
+        const variant = variants[i];
+        const shouldFetchBroad = i < 2 || ranked.size < SMART_SEARCH_MIN_RESULTS;
+        const shouldFetchFallback = i === 0 || ranked.size < Math.ceil(SMART_SEARCH_MIN_RESULTS / 2);
+        const jobs = [
+            { key: 'primary', promise: searchSongsOnlyPrimary(variant, 1) },
+        ];
+
+        if (shouldFetchBroad) {
+            jobs.push({ key: 'broad', promise: searchSongs(variant, 1) });
+        }
+        if (shouldFetchFallback) {
+            jobs.push({ key: 'fallback', promise: searchSongsOnlyFallback(variant) });
+        }
+
+        const settled = await Promise.allSettled(jobs.map(job => job.promise));
+        const resultsByKey = {};
+        for (let j = 0; j < settled.length; j += 1) {
+            resultsByKey[jobs[j].key] = settled[j];
+        }
+
+        const primarySongs = resultsByKey.primary?.status === 'fulfilled'
+            ? (resultsByKey.primary.value?.data?.results ?? [])
             : [];
-        const broadSongs = searchResult.status === 'fulfilled'
-            ? (searchResult.value?.data?.results ?? [])
+        const broadSongs = resultsByKey.broad?.status === 'fulfilled'
+            ? (resultsByKey.broad.value?.data?.results ?? [])
             : [];
-        const fallbackSongs = fallbackResult.status === 'fulfilled'
-            ? fallbackResult.value
+        const fallbackSongs = resultsByKey.fallback?.status === 'fulfilled'
+            ? resultsByKey.fallback.value
             : [];
 
         addRankedSongs({
@@ -236,8 +272,11 @@ async function computeSmartSearchResults(normalizedQuery) {
             languageHint,
         });
 
-        // Stop early once we have enough strong candidates.
-        if (ranked.size >= SMART_SEARCH_MIN_RESULTS && i >= 2) {
+        // Stop once we have enough candidates or we hit our time budget.
+        if (ranked.size >= SMART_SEARCH_MIN_RESULTS) {
+            break;
+        }
+        if (Date.now() - startedAt >= SMART_SEARCH_MAX_LATENCY_MS) {
             break;
         }
     }
@@ -281,11 +320,13 @@ export async function getAlbumById(id) {
  * @returns {Promise<object>} Album search results
  */
 export async function searchAlbums(query) {
-    const { statusCode, body } = await request(
-        `${BASE_URL}/api/search/albums?query=${encodeURIComponent(query)}`
+    return requestJsonWithTimeout(
+        `${BASE_URL}/api/search/albums?query=${encodeURIComponent(query)}`,
+        {
+            timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+            label: 'Saavn album search',
+        }
     );
-    if (statusCode !== 200) throw new Error(`Saavn album search failed with status ${statusCode}`);
-    return body.json();
 }
 
 /**
@@ -294,11 +335,13 @@ export async function searchAlbums(query) {
  * @returns {Promise<object>} Artist search results
  */
 export async function searchArtists(query) {
-    const { statusCode, body } = await request(
-        `${BASE_URL}/api/search/artists?query=${encodeURIComponent(query)}`
+    return requestJsonWithTimeout(
+        `${BASE_URL}/api/search/artists?query=${encodeURIComponent(query)}`,
+        {
+            timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+            label: 'Saavn artist search',
+        }
     );
-    if (statusCode !== 200) throw new Error(`Saavn artist search failed with status ${statusCode}`);
-    return body.json();
 }
 
 /**
@@ -527,7 +570,7 @@ function buildSearchQueryVariants(query) {
         push(softened);
     }
 
-    return variants.slice(0, 6);
+    return variants.slice(0, SMART_SEARCH_MAX_VARIANTS);
 }
 
 function tokenize(value) {
