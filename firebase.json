@@ -13,7 +13,7 @@
       "anonymous": false,
       "emailPassword": true,
       "googleSignIn": {
-        "oAuthBrandDisplayName": "Music Hub",
+        "oAuthBrandDisplayName": 
         "supportEmail": 
       }
     }
