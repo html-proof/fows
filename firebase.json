@@ -14,7 +14,7 @@
       "emailPassword": true,
       "googleSignIn": {
         "oAuthBrandDisplayName": "Music Hub",
-        "supportEmail": "imeseban@gmail.com"
+        "supportEmail": 
       }
     }
   }
