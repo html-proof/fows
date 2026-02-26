@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { authenticateUser } from '../middleware/auth.js';
 import { getUserPreferences } from '../services/database.js';
-import { generateRecommendations } from '../services/recommendation.js';
+import { generateRecommendations, generateNextSongRecommendations } from '../services/recommendation.js';
 
 const router = Router();
 
@@ -44,6 +44,51 @@ router.get('/', authenticateUser, async (req, res) => {
     } catch (error) {
         console.error('Recommendation error:', error.message);
         res.status(500).json({ error: 'Failed to generate recommendations' });
+    }
+});
+
+/**
+ * POST /api/recommendations/next
+ * Get "play next" recommendations based on current song.
+ *
+ * Body:
+ * {
+ *   currentSong: {
+ *     songId?: string,
+ *     id?: string,
+ *     language?: string,
+ *     genre?: string,
+ *     artist?: string,
+ *     album?: { id?: string, name?: string }
+ *   },
+ *   limit?: number
+ * }
+ */
+router.post('/next', authenticateUser, async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.body?.limit, 10) || 10, 20);
+        const currentSong = req.body?.currentSong ?? req.body ?? {};
+        const hasSongIdentity = currentSong?.songId || currentSong?.id;
+        if (!hasSongIdentity && !currentSong?.language) {
+            return res.status(400).json({
+                error: 'currentSong.songId (or id) or currentSong.language is required',
+            });
+        }
+
+        const recommendations = await generateNextSongRecommendations({
+            uid: req.user.uid,
+            currentSong,
+            limit,
+        });
+
+        return res.json({
+            success: true,
+            count: recommendations.length,
+            data: recommendations,
+        });
+    } catch (error) {
+        console.error('Next recommendation error:', error.message);
+        return res.status(500).json({ error: 'Failed to generate next-song recommendations' });
     }
 });
 

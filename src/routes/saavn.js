@@ -17,9 +17,26 @@ const router = Router();
 const DEFAULT_LIMIT = 20;
 const MIN_LIMIT = 10;
 const MAX_LIMIT = 20;
+const MAX_RELATED_LANGUAGES = 5;
+const MAX_ALBUM_LANGUAGE_BUCKETS = 4;
 const USER_LANGUAGE_CACHE_TTL_MS = 5 * 60 * 1000;
 const USER_LANGUAGE_CACHE_MAX_ENTRIES = 300;
 const userLanguageCache = new Map();
+const LANGUAGE_HINTS = new Set([
+    'hindi',
+    'malayalam',
+    'tamil',
+    'telugu',
+    'kannada',
+    'english',
+    'punjabi',
+    'marathi',
+    'bengali',
+    'gujarati',
+    'odia',
+    'assamese',
+    'urdu',
+]);
 
 // Search API (public)
 // Example: /api/search?query=Imagine+Dragons&page=2
@@ -55,12 +72,32 @@ router.get('/search', async (req, res) => {
                 })
                 : baseSongs;
             const songs = rankedSongs.slice(0, limit);
+            const relatedLanguages = buildRelatedLanguages({
+                query,
+                preferredLanguages,
+                songs,
+                albums: [],
+            });
             return res.json({
                 success: true,
                 data: {
                     songs,
                     albums: [],
                     artists: [],
+                    topResult: songs.length > 0
+                        ? { type: 'song', data: songs[0] }
+                        : null,
+                    relatedLanguages,
+                    albumLanguageSections: [],
+                    sections: buildSearchSections({
+                        songs,
+                        albums: [],
+                        artists: [],
+                        topResult: songs.length > 0
+                            ? { type: 'song', data: songs[0] }
+                            : null,
+                        albumLanguageSections: [],
+                    }),
                 },
             });
         }
@@ -86,16 +123,49 @@ router.get('/search', async (req, res) => {
             })
             : orderedSongs;
 
+        const songsOut = rankedSongs.slice(0, limit);
+        const albumsOut = albumsData.status === 'fulfilled'
+            ? (albumsData.value?.data?.results ?? []).slice(0, limit)
+            : [];
+        const artistsOut = artistsData.status === 'fulfilled'
+            ? (artistsData.value?.data?.results ?? []).slice(0, limit)
+            : [];
+
+        const relatedLanguages = buildRelatedLanguages({
+            query,
+            preferredLanguages,
+            songs: songsOut,
+            albums: albumsOut,
+        });
+        const albumLanguageSections = buildAlbumLanguageSections({
+            albums: albumsOut,
+            songs: songsOut,
+            relatedLanguages,
+            maxBuckets: MAX_ALBUM_LANGUAGE_BUCKETS,
+        });
+        const topResult = resolveTopResult({
+            query,
+            songs: songsOut,
+            albums: albumsOut,
+            artists: artistsOut,
+        });
+
         res.json({
             success: true,
             data: {
-                songs: rankedSongs.slice(0, limit),
-                albums: albumsData.status === 'fulfilled'
-                    ? (albumsData.value?.data?.results ?? []).slice(0, limit)
-                    : [],
-                artists: artistsData.status === 'fulfilled'
-                    ? (artistsData.value?.data?.results ?? []).slice(0, limit)
-                    : [],
+                songs: songsOut,
+                albums: albumsOut,
+                artists: artistsOut,
+                topResult,
+                relatedLanguages,
+                albumLanguageSections,
+                sections: buildSearchSections({
+                    songs: songsOut,
+                    albums: albumsOut,
+                    artists: artistsOut,
+                    topResult,
+                    albumLanguageSections,
+                }),
             },
         });
     } catch (error) {
@@ -204,6 +274,263 @@ function prioritizeSongsByLanguage(songs, preferredLanguages) {
     }
 
     return [...preferred, ...remaining];
+}
+
+function buildRelatedLanguages({
+    query,
+    preferredLanguages,
+    songs,
+    albums,
+}) {
+    const scoreByLanguage = new Map();
+    const add = (language, score) => {
+        const normalized = normalizeLanguage(language);
+        if (!normalized) return;
+        scoreByLanguage.set(normalized, (scoreByLanguage.get(normalized) ?? 0) + score);
+    };
+
+    for (const language of preferredLanguages ?? []) {
+        add(language, 4);
+    }
+
+    for (const hint of detectLanguageHints(query)) {
+        add(hint, 6);
+    }
+
+    for (const song of songs ?? []) {
+        add(song?.language, 2);
+    }
+
+    for (const album of albums ?? []) {
+        add(album?.language, 1.2);
+    }
+
+    return Array.from(scoreByLanguage.entries())
+        .sort((a, b) => b[1] - a[1])
+        .map(([language]) => language)
+        .slice(0, MAX_RELATED_LANGUAGES);
+}
+
+function detectLanguageHints(query) {
+    const hints = [];
+    const tokens = String(query ?? '')
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+        .split(/\s+/)
+        .filter(Boolean);
+
+    for (const token of tokens) {
+        if (LANGUAGE_HINTS.has(token)) {
+            hints.push(token);
+        }
+    }
+
+    return hints;
+}
+
+function buildAlbumLanguageSections({
+    albums,
+    songs,
+    relatedLanguages,
+    maxBuckets,
+}) {
+    const songAlbumLanguageMap = buildSongAlbumLanguageMap(songs ?? []);
+    const grouped = new Map();
+    const fallbackLanguage = Array.isArray(relatedLanguages) && relatedLanguages.length > 0
+        ? relatedLanguages[0]
+        : null;
+
+    for (const album of albums ?? []) {
+        const language = resolveAlbumLanguage(album, songAlbumLanguageMap, fallbackLanguage);
+        if (!language) continue;
+
+        if (!grouped.has(language)) {
+            grouped.set(language, []);
+        }
+
+        grouped.get(language).push({
+            ...album,
+            _resolvedLanguage: language,
+        });
+    }
+
+    const prioritizedOrder = [
+        ...(relatedLanguages ?? []).map(normalizeLanguage).filter(Boolean),
+        ...Array.from(grouped.keys()),
+    ];
+
+    const uniqueOrder = [];
+    const seen = new Set();
+    for (const language of prioritizedOrder) {
+        if (!language || seen.has(language)) continue;
+        seen.add(language);
+        uniqueOrder.push(language);
+    }
+
+    return uniqueOrder
+        .slice(0, Math.max(1, maxBuckets))
+        .map(language => ({
+            language,
+            count: grouped.get(language)?.length ?? 0,
+            albums: grouped.get(language) ?? [],
+        }))
+        .filter(section => section.count > 0);
+}
+
+function buildSongAlbumLanguageMap(songs) {
+    const map = new Map();
+
+    for (const song of songs ?? []) {
+        const albumId = String(song?.album?.id ?? '').trim();
+        const language = normalizeLanguage(song?.language);
+        if (!albumId || !language) continue;
+
+        if (!map.has(albumId)) {
+            map.set(albumId, new Map());
+        }
+
+        const counts = map.get(albumId);
+        counts.set(language, (counts.get(language) ?? 0) + 1);
+    }
+
+    return map;
+}
+
+function resolveAlbumLanguage(album, songAlbumLanguageMap, fallbackLanguage) {
+    const explicit = normalizeLanguage(album?.language);
+    if (explicit) return explicit;
+
+    const albumId = String(album?.id ?? '').trim();
+    if (albumId && songAlbumLanguageMap.has(albumId)) {
+        const counts = Array.from(songAlbumLanguageMap.get(albumId).entries())
+            .sort((a, b) => b[1] - a[1]);
+        if (counts.length > 0) {
+            return counts[0][0];
+        }
+    }
+
+    const hinted = detectLanguageHints(album?.name ?? '')[0];
+    if (hinted) return hinted;
+
+    return normalizeLanguage(fallbackLanguage);
+}
+
+function resolveTopResult({
+    query,
+    songs,
+    albums,
+    artists,
+}) {
+    const candidates = [];
+
+    const addCandidate = (type, item) => {
+        if (!item) return;
+        const name = type === 'song'
+            ? (item?.name ?? item?.title)
+            : item?.name;
+        const score = scoreTopResultCandidate(name, query);
+        candidates.push({
+            type,
+            data: item,
+            score,
+        });
+    };
+
+    addCandidate('song', songs?.[0]);
+    addCandidate('artist', artists?.[0]);
+    addCandidate('album', albums?.[0]);
+
+    if (candidates.length === 0) return null;
+
+    candidates.sort((a, b) => b.score - a.score);
+    return {
+        type: candidates[0].type,
+        data: candidates[0].data,
+    };
+}
+
+function scoreTopResultCandidate(name, query) {
+    const normalizedName = String(name ?? '')
+        .toLowerCase()
+        .trim();
+    const normalizedQuery = String(query ?? '')
+        .toLowerCase()
+        .trim();
+
+    if (!normalizedName || !normalizedQuery) return 0;
+    if (normalizedName === normalizedQuery) return 1;
+    if (normalizedName.startsWith(normalizedQuery)) return 0.95;
+    if (normalizedName.includes(normalizedQuery)) return 0.85;
+
+    const queryTerms = normalizedQuery.split(/\s+/).filter(Boolean);
+    if (queryTerms.length === 0) return 0.5;
+
+    let hits = 0;
+    for (const term of queryTerms) {
+        if (normalizedName.includes(term)) {
+            hits += 1;
+        }
+    }
+
+    return hits / queryTerms.length;
+}
+
+function buildSearchSections({
+    songs,
+    albums,
+    artists,
+    topResult,
+    albumLanguageSections,
+}) {
+    const sections = [];
+
+    if (topResult) {
+        sections.push({
+            id: 'top-result',
+            type: 'topResult',
+            title: 'Top result',
+            data: [topResult],
+        });
+    }
+
+    sections.push({
+        id: 'songs',
+        type: 'songs',
+        title: 'Songs',
+        data: songs ?? [],
+    });
+
+    sections.push({
+        id: 'artists',
+        type: 'artists',
+        title: 'Artists',
+        data: artists ?? [],
+    });
+
+    sections.push({
+        id: 'albums',
+        type: 'albums',
+        title: 'Albums',
+        data: albums ?? [],
+    });
+
+    if (Array.isArray(albumLanguageSections) && albumLanguageSections.length > 0) {
+        sections.push({
+            id: 'albums-by-language',
+            type: 'albumsByLanguage',
+            title: 'Albums by related language',
+            data: albumLanguageSections,
+        });
+    }
+
+    return sections;
+}
+
+function normalizeLanguage(value) {
+    const normalized = String(value ?? '')
+        .trim()
+        .toLowerCase();
+    return normalized || '';
 }
 
 function getCachedUserLanguages(uid) {

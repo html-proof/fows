@@ -41,6 +41,7 @@ app.get('/', (req, res) => {
                 'POST /api/activity/skip',
                 'GET  /api/activity/history',
                 'GET  /api/recommendations',
+                'POST /api/recommendations/next',
             ],
         },
     });

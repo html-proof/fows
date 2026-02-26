@@ -1,5 +1,5 @@
 import { getArtistPlayCounts, getSkippedSongIds, getRecentActivity } from './database.js';
-import { searchSongsOnly } from './saavnApi.js';
+import { searchSongsOnly, searchSongsSmart, getSongById } from './saavnApi.js';
 import { rerankSongsForUser } from './personalizationModel.js';
 
 /**
@@ -176,6 +176,83 @@ export async function generateRecommendations(userPrefs, uid) {
 }
 
 /**
+ * Generate next-song recommendations using strict playback constraints:
+ * - same language as current song
+ * - different artist
+ * - not same album
+ * - not recently played/skipped
+ * - prefer same genre + popular songs
+ *
+ * @param {{ uid: string, currentSong: object, limit?: number }} params
+ * @returns {Promise<object[]>}
+ */
+export async function generateNextSongRecommendations({ uid, currentSong, limit = 10 }) {
+    const safeLimit = Math.max(1, Math.min(Number.parseInt(limit, 10) || 10, 20));
+    const context = await resolveCurrentSongContext(currentSong);
+    if (!context.songId && !context.language) {
+        return [];
+    }
+
+    const [recentPlays, recentSkips] = await Promise.all([
+        getRecentActivity(uid, 'play', 40),
+        getRecentActivity(uid, 'skip', 40),
+    ]);
+
+    const recentSongIds = new Set([
+        ...recentPlays.map(item => item.songId),
+        ...recentSkips.map(item => item.songId),
+    ].filter(Boolean));
+    if (context.songId) {
+        recentSongIds.add(context.songId);
+    }
+
+    const seedQueries = buildNextTrackSeedQueries(context);
+    const settled = await Promise.allSettled(
+        seedQueries.map(query => searchSongsSmart(query, {
+            preferredLanguages: context.language ? [context.language] : [],
+            waitForFresh: false,
+        }))
+    );
+
+    const mergedSongs = mergeUniqueSongs(
+        ...settled
+            .filter(item => item.status === 'fulfilled')
+            .map(item => item.value ?? [])
+    );
+
+    const filtered = mergedSongs
+        .filter(song => validateNextTrackCandidate({
+            song,
+            context,
+            recentSongIds,
+        }))
+        .map(song => ({
+            song,
+            score: scoreNextTrackCandidate(song, context),
+        }))
+        .sort((a, b) => b.score - a.score)
+        .map(item => item.song);
+
+    const reranked = await rerankSongsForUser({
+        uid,
+        songs: filtered.slice(0, safeLimit * 4),
+        query: `${context.language || ''} ${context.genre || ''}`.trim(),
+        preferredLanguages: context.language ? [context.language] : [],
+        mode: 'recommendation',
+    }).catch(() => filtered.slice(0, safeLimit * 4));
+
+    return reranked.slice(0, safeLimit).map(song => ({
+        ...song,
+        _nextReason: {
+            sameLanguage: true,
+            differentArtist: true,
+            differentAlbum: true,
+            filteredRecent: true,
+        },
+    }));
+}
+
+/**
  * Extract artist names from a song object.
  * Handles various Saavn API response formats.
  */
@@ -201,4 +278,253 @@ function extractArtistNames(song) {
     return names.filter(Boolean);
 }
 
-export default { generateRecommendations };
+async function resolveCurrentSongContext(currentSong) {
+    const input = currentSong && typeof currentSong === 'object' ? currentSong : {};
+    const songId = String(input.songId || input.id || '').trim();
+    const shouldFetchDetails = songId && (
+        !input.language ||
+        !input.artist && !input.primaryArtists &&
+        !input.artists
+    );
+
+    let resolvedSong = input;
+    if (shouldFetchDetails) {
+        try {
+            const details = await getSongById(songId);
+            resolvedSong = extractSongFromDetails(details) || input;
+        } catch (_error) {
+            resolvedSong = input;
+        }
+    }
+
+    const artists = extractArtistNames(resolvedSong).map(normalizeText);
+    const artistIds = extractArtistIds(resolvedSong);
+    const language = normalizeText(resolvedSong.language || input.language);
+    const genre = normalizeText(resolvePrimaryGenre(resolvedSong));
+    const albumId = String(
+        resolvedSong?.album?.id ||
+        resolvedSong?.albumId ||
+        input?.album?.id ||
+        input?.albumId ||
+        ''
+    ).trim();
+    const albumName = normalizeText(
+        resolvedSong?.album?.name ||
+        input?.album?.name ||
+        ''
+    );
+    const title = normalizeText(resolvedSong?.name || resolvedSong?.title || input?.songName || '');
+
+    return {
+        songId,
+        language,
+        genre,
+        artistIds,
+        artistNames: new Set(artists),
+        albumId,
+        albumName,
+        title,
+    };
+}
+
+function extractSongFromDetails(detailsPayload) {
+    if (!detailsPayload || typeof detailsPayload !== 'object') return null;
+    if (Array.isArray(detailsPayload?.data) && detailsPayload.data.length > 0) {
+        return detailsPayload.data[0];
+    }
+    if (detailsPayload?.data && typeof detailsPayload.data === 'object') {
+        if (Array.isArray(detailsPayload.data.songs) && detailsPayload.data.songs.length > 0) {
+            return detailsPayload.data.songs[0];
+        }
+        if (Array.isArray(detailsPayload.data.results) && detailsPayload.data.results.length > 0) {
+            return detailsPayload.data.results[0];
+        }
+    }
+    if (Array.isArray(detailsPayload?.results) && detailsPayload.results.length > 0) {
+        return detailsPayload.results[0];
+    }
+    return null;
+}
+
+function extractArtistIds(song) {
+    const ids = new Set();
+    if (Array.isArray(song?.artists?.primary)) {
+        for (const artist of song.artists.primary) {
+            const id = String(artist?.id || '').trim();
+            if (id) ids.add(id);
+        }
+    }
+    if (Array.isArray(song?.primaryArtists)) {
+        for (const artist of song.primaryArtists) {
+            const id = String(artist?.id || '').trim();
+            if (id) ids.add(id);
+        }
+    }
+    return ids;
+}
+
+function resolvePrimaryGenre(song) {
+    if (song?.genre) return song.genre;
+    if (Array.isArray(song?.genres) && song.genres.length > 0) return song.genres[0];
+    if (typeof song?.music === 'string') return song.music;
+    if (typeof song?.label === 'string') return song.label;
+    return '';
+}
+
+function buildNextTrackSeedQueries(context) {
+    const queries = [];
+    const push = (value) => {
+        const normalized = String(value || '').trim();
+        if (!normalized) return;
+        if (queries.includes(normalized)) return;
+        queries.push(normalized);
+    };
+
+    if (context.language && context.genre) {
+        push(`Top ${context.language} ${context.genre} songs`);
+        push(`${context.language} ${context.genre} songs`);
+    }
+    if (context.language) {
+        push(`Top ${context.language} songs`);
+        push(`Latest ${context.language} songs`);
+        push(`${context.language} songs`);
+    }
+    if (context.genre) {
+        push(`Top ${context.genre} songs`);
+    }
+    if (context.title) {
+        push(context.title);
+    }
+    if (queries.length === 0) {
+        push('Top Hindi songs');
+    }
+
+    return queries.slice(0, 6);
+}
+
+function validateNextTrackCandidate({ song, context, recentSongIds }) {
+    const songId = String(song?.id || '').trim();
+    if (!songId) return false;
+    if (recentSongIds.has(songId)) return false;
+
+    const songLanguage = normalizeText(song?.language);
+    if (context.language && songLanguage !== context.language) {
+        return false;
+    }
+
+    if (isSameArtist(song, context)) return false;
+    if (isSameAlbum(song, context)) return false;
+    if (isDuplicateVibe(song, context)) return false;
+
+    return true;
+}
+
+function isSameArtist(song, context) {
+    const candidateArtistIds = extractArtistIds(song);
+    for (const artistId of candidateArtistIds) {
+        if (context.artistIds.has(artistId)) return true;
+    }
+
+    const candidateArtists = extractArtistNames(song).map(normalizeText);
+    for (const artistName of candidateArtists) {
+        if (context.artistNames.has(artistName)) return true;
+    }
+
+    return false;
+}
+
+function isSameAlbum(song, context) {
+    const albumId = String(song?.album?.id || song?.albumId || '').trim();
+    if (context.albumId && albumId && context.albumId === albumId) return true;
+
+    const albumName = normalizeText(song?.album?.name || song?.album || '');
+    if (context.albumName && albumName && context.albumName === albumName) return true;
+
+    return false;
+}
+
+function isDuplicateVibe(song, context) {
+    const currentCanonical = canonicalSongTitle(context.title);
+    const candidateCanonical = canonicalSongTitle(song?.name || song?.title || '');
+    if (!currentCanonical || !candidateCanonical) return false;
+    if (currentCanonical === candidateCanonical) return true;
+
+    return currentCanonical.length >= 6
+        && candidateCanonical.includes(currentCanonical);
+}
+
+function canonicalSongTitle(value) {
+    const normalized = normalizeText(value);
+    if (!normalized) return '';
+
+    return normalized
+        .replace(/\((.*?)\)/g, ' ')
+        .replace(/\[(.*?)\]/g, ' ')
+        .replace(/\b(remix|version|live|slowed|reverb|karaoke|instrumental|lofi|cover)\b/g, ' ')
+        .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function scoreNextTrackCandidate(song, context) {
+    let score = 0;
+    const language = normalizeText(song?.language);
+    if (context.language && language === context.language) score += 120;
+
+    const genre = normalizeText(resolvePrimaryGenre(song));
+    if (context.genre && genre === context.genre) {
+        score += 50;
+    } else if (context.genre && genre.includes(context.genre)) {
+        score += 30;
+    }
+
+    score += resolvePopularityScore(song) * 40;
+
+    const year = Number.parseInt(song?.year, 10) || 0;
+    if (year >= 2020) score += 8;
+    else if (year >= 2015) score += 4;
+
+    return score;
+}
+
+function resolvePopularityScore(song) {
+    const raw = Number(
+        song?.global_popularity_score ??
+        song?.popularity ??
+        song?.playCount ??
+        song?.play_count ??
+        0
+    );
+    if (!Number.isFinite(raw) || raw <= 0) return 0.2;
+    return Math.min(1, Math.log10(raw + 1) / 2.6);
+}
+
+function mergeUniqueSongs(...songLists) {
+    const merged = [];
+    const seen = new Set();
+
+    for (const list of songLists) {
+        const safeList = Array.isArray(list) ? list : [];
+        for (const song of safeList) {
+            if (!song || typeof song !== 'object') continue;
+            const id = String(song?.id || '').trim();
+            if (!id || seen.has(id)) continue;
+            seen.add(id);
+            merged.push(song);
+        }
+    }
+
+    return merged;
+}
+
+function normalizeText(value) {
+    return String(value ?? '')
+        .toLowerCase()
+        .trim()
+        .replace(/\s+/g, ' ');
+}
+
+export default {
+    generateRecommendations,
+    generateNextSongRecommendations,
+};
