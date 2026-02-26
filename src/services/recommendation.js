@@ -159,6 +159,7 @@ export async function generateRecommendations(userPrefs, uid) {
             songs: baseRecommendationSongs,
             query: queries.slice(0, 4).join(' '),
             preferredLanguages: languages,
+            mode: 'recommendation',
         });
     } catch (error) {
         console.error('Recommendation reranking fallback:', error?.message ?? error);

@@ -46,7 +46,13 @@ router.get('/search', async (req, res) => {
                 preferredLanguages
             );
             const rankedSongs = uid
-                ? await rerankSongsForUser({ uid, songs: baseSongs, query, preferredLanguages })
+                ? await rerankSongsForUser({
+                    uid,
+                    songs: baseSongs,
+                    query,
+                    preferredLanguages,
+                    mode: 'search',
+                })
                 : baseSongs;
             const songs = rankedSongs.slice(0, limit);
             return res.json({
@@ -71,7 +77,13 @@ router.get('/search', async (req, res) => {
             : [];
         const orderedSongs = prioritizeSongsByLanguage(songs, preferredLanguages);
         const rankedSongs = uid
-            ? await rerankSongsForUser({ uid, songs: orderedSongs, query, preferredLanguages })
+            ? await rerankSongsForUser({
+                uid,
+                songs: orderedSongs,
+                query,
+                preferredLanguages,
+                mode: 'search',
+            })
             : orderedSongs;
 
         res.json({

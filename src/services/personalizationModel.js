@@ -4,6 +4,17 @@ const PROFILE_CACHE_TTL_MS = 2 * 60 * 1000;
 const PROFILE_CACHE_MAX_ENTRIES = 300;
 const EMBEDDING_DIM = 16;
 const MAX_INTERACTION_ITEMS = 200;
+const SEARCH_NOISE_WORDS = new Set([
+    'song',
+    'songs',
+    'music',
+    'video',
+    'official',
+    'audio',
+    'lyrics',
+    'full',
+    'hd',
+]);
 
 const profileCache = new Map();
 
@@ -31,16 +42,20 @@ export async function rerankSongsForUser({
     songs,
     query = '',
     preferredLanguages = [],
+    mode = 'search',
 }) {
     const safeSongs = Array.isArray(songs) ? songs : [];
     if (!uid || safeSongs.length === 0) return safeSongs;
 
+    const safeMode = mode === 'recommendation' ? 'recommendation' : 'search';
+    const normalizedQuery = normalizeText(query);
     const profile = await getCachedUserProfile(uid);
     const userVector = buildUserEmbedding(profile);
     const preferredLanguageSet = new Set(
         normalizeStringArray(preferredLanguages.length > 0 ? preferredLanguages : profile.languages)
     );
-    const queryTerms = tokenize(query);
+    const queryTerms = tokenize(query).filter(term => !SEARCH_NOISE_WORDS.has(term));
+    const effectiveQueryTerms = queryTerms.length > 0 ? queryTerms : tokenize(query);
     const total = safeSongs.length;
 
     const ranked = safeSongs.map((song, index) => {
@@ -54,7 +69,8 @@ export async function rerankSongsForUser({
         const interaction = profile.songInteractions?.[songFields.id];
         const interactionScore = resolveInteractionScore(interaction);
         const skipRiskScore = resolveSkipRisk(interaction);
-        const queryIntentScore = resolveQueryIntentScore(queryTerms, songFields);
+        const queryIntentScore = resolveQueryIntentScore(effectiveQueryTerms, songFields);
+        const lexicalScore = resolveLexicalPrecisionScore(normalizedQuery, effectiveQueryTerms, songFields);
 
         const nnScore = forwardNeuralRanker([
             textRankScore,
@@ -68,18 +84,44 @@ export async function rerankSongsForUser({
         ]);
 
         const preferenceMatch = clamp01((embeddingSimilarity + languageScore + artistScore) / 3);
-        const finalScore = clamp01(
-            textRankScore * 0.4 +
-            preferenceMatch * 0.3 +
-            popularityScore * 0.2 +
-            interactionScore * 0.1
-        ) * 0.65 + nnScore * 0.35;
+        const personalizationScore = clamp01(
+            preferenceMatch * 0.45 +
+            interactionScore * 0.35 +
+            popularityScore * 0.2
+        );
+        let finalScore;
+
+        if (safeMode === 'search') {
+            finalScore = clamp01(
+                lexicalScore * 0.58 +
+                textRankScore * 0.18 +
+                queryIntentScore * 0.1 +
+                preferenceMatch * 0.06 +
+                popularityScore * 0.05 +
+                interactionScore * 0.03
+            );
+            finalScore = finalScore * 0.88 + nnScore * 0.12;
+
+            // Guardrails: never let weak lexical matches outrank strong ones.
+            if (effectiveQueryTerms.length >= 2 && lexicalScore < 0.2) {
+                finalScore *= 0.45;
+            } else if (lexicalScore < 0.35) {
+                finalScore *= 0.78;
+            }
+        } else {
+            finalScore = clamp01(
+                textRankScore * 0.22 +
+                personalizationScore * 0.58 +
+                popularityScore * 0.2
+            ) * 0.7 + nnScore * 0.3;
+        }
 
         return {
             ...song,
             _ranking: {
                 finalScore: Number(finalScore.toFixed(4)),
                 textRankScore: Number(textRankScore.toFixed(4)),
+                lexicalScore: Number(lexicalScore.toFixed(4)),
                 preferenceMatch: Number(preferenceMatch.toFixed(4)),
                 popularityScore: Number(popularityScore.toFixed(4)),
                 interactionScore: Number(interactionScore.toFixed(4)),
@@ -89,7 +131,21 @@ export async function rerankSongsForUser({
     });
 
     ranked.sort((a, b) => (b._ranking?.finalScore ?? 0) - (a._ranking?.finalScore ?? 0));
-    return ranked;
+
+    if (safeMode !== 'search' || effectiveQueryTerms.length === 0) {
+        return ranked;
+    }
+
+    const lexicalFloor = effectiveQueryTerms.length >= 2 ? 0.14 : 0.08;
+    const strongMatches = ranked.filter(song => (song?._ranking?.lexicalScore ?? 0) >= lexicalFloor);
+    const strongSet = new Set(strongMatches.map(song => String(song?.id ?? song?.songId ?? '')));
+    const weakMatches = ranked.filter(song => {
+        const key = String(song?.id ?? song?.songId ?? '');
+        return !strongSet.has(key);
+    });
+
+    // Keep low-relevance results at the bottom while preserving output size.
+    return [...strongMatches, ...weakMatches];
 }
 
 async function getCachedUserProfile(uid) {
@@ -303,6 +359,75 @@ function resolveQueryIntentScore(queryTerms, songFields) {
     return clamp01(matches / queryTerms.length);
 }
 
+function resolveLexicalPrecisionScore(normalizedQuery, queryTerms, songFields) {
+    if (!Array.isArray(queryTerms) || queryTerms.length === 0) {
+        return normalizedQuery ? 0.5 : 0.45;
+    }
+
+    const title = songFields.title || '';
+    const artistText = songFields.artists.join(' ');
+    const haystack = `${title} ${artistText}`.trim();
+    const compactTitle = normalizeCompact(title);
+    const compactQuery = normalizeCompact(normalizedQuery);
+    const haystackTokens = tokenize(haystack);
+
+    if (normalizedQuery && (title === normalizedQuery || (compactQuery && compactTitle === compactQuery))) {
+        return 1;
+    }
+
+    if (normalizedQuery && (
+        title.startsWith(normalizedQuery) ||
+        (compactQuery && compactTitle.startsWith(compactQuery))
+    )) {
+        return 0.96;
+    }
+
+    if (normalizedQuery && title.includes(normalizedQuery)) {
+        return 0.93;
+    }
+
+    let weightedHits = 0;
+    let directHits = 0;
+    let fuzzyHits = 0;
+
+    for (const term of queryTerms) {
+        if (!term) continue;
+
+        if (title.includes(term)) {
+            weightedHits += 1.25;
+            directHits += 1;
+            continue;
+        }
+        if (artistText.includes(term)) {
+            weightedHits += 0.95;
+            directHits += 1;
+            continue;
+        }
+        if (hasFuzzyTokenMatch(term, haystackTokens)) {
+            weightedHits += 0.6;
+            fuzzyHits += 1;
+        }
+    }
+
+    const coverage = clamp01((directHits + fuzzyHits * 0.7) / queryTerms.length);
+    let score = clamp01(weightedHits / Math.max(1, queryTerms.length * 1.25));
+    score = Math.max(score, coverage * 0.9);
+
+    if (normalizedQuery && haystack.includes(normalizedQuery)) {
+        score = Math.max(score, 0.86);
+    }
+    if (directHits === queryTerms.length) {
+        score = Math.max(score, 0.9);
+    }
+
+    // Strongly suppress unrelated songs for multi-term queries.
+    if (queryTerms.length >= 2 && directHits === 0 && fuzzyHits === 0) {
+        score = Math.min(score, 0.12);
+    }
+
+    return clamp01(score);
+}
+
 function forwardNeuralRanker(features) {
     const safeFeatures = features.map(value => clamp01(Number(value) || 0));
     const hidden = NN_BIAS_1.map((bias, i) => {
@@ -342,6 +467,10 @@ function tokenize(value) {
         .filter(Boolean);
 }
 
+function normalizeCompact(value) {
+    return normalizeText(value).replace(/[^\p{L}\p{N}]/gu, '');
+}
+
 function normalizeText(value) {
     return String(value ?? '')
         .toLowerCase()
@@ -357,6 +486,44 @@ function signedHash(value) {
         hash |= 0;
     }
     return hash;
+}
+
+function hasFuzzyTokenMatch(term, tokens) {
+    if (!term || !Array.isArray(tokens) || tokens.length === 0) return false;
+    for (const token of tokens) {
+        if (!token) continue;
+        const maxDistance = term.length >= 7 ? 2 : 1;
+        if (Math.abs(term.length - token.length) > maxDistance) continue;
+        if (term[0] !== token[0]) continue;
+        if (levenshteinDistance(term, token) <= maxDistance) return true;
+    }
+    return false;
+}
+
+function levenshteinDistance(a, b) {
+    if (a === b) return 0;
+    if (!a.length) return b.length;
+    if (!b.length) return a.length;
+
+    const rows = a.length + 1;
+    const cols = b.length + 1;
+    const dp = Array.from({ length: rows }, () => Array(cols).fill(0));
+
+    for (let i = 0; i < rows; i += 1) dp[i][0] = i;
+    for (let j = 0; j < cols; j += 1) dp[0][j] = j;
+
+    for (let i = 1; i < rows; i += 1) {
+        for (let j = 1; j < cols; j += 1) {
+            const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+            dp[i][j] = Math.min(
+                dp[i - 1][j] + 1,
+                dp[i][j - 1] + 1,
+                dp[i - 1][j - 1] + cost
+            );
+        }
+    }
+
+    return dp[rows - 1][cols - 1];
 }
 
 function normalizeVector(vector) {
