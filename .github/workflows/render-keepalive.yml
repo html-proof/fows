@@ -1,0 +1,29 @@
+name: Render Keepalive
+
+on:
+  schedule:
+    # GitHub Actions minimum cron interval is 5 minutes.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render backend
+        env:
+          KEEPALIVE_URL: ${{ secrets.RENDER_BACKEND_URL }}
+        run: |
+          if [ -z "$KEEPALIVE_URL" ]; then
+            echo "Missing required secret: RENDER_BACKEND_URL"
+            exit 1
+          fi
+
+          echo "Pinging $KEEPALIVE_URL"
+          status_code=$(curl -s -o /dev/null -w "%{http_code}" "$KEEPALIVE_URL")
+          echo "HTTP status: $status_code"
+
+          if [ "$status_code" -ge 400 ]; then
+            echo "Keepalive ping failed."
+            exit 1
+          fi
