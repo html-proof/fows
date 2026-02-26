@@ -11,6 +11,7 @@ import {
 } from '../services/saavnApi.js';
 import { auth } from '../config/firebase.js';
 import { getUserPreferences } from '../services/database.js';
+import { rerankSongsForUser } from '../services/personalizationModel.js';
 
 const router = Router();
 const DEFAULT_LIMIT = 20;
@@ -29,7 +30,7 @@ router.get('/search', async (req, res) => {
             return res.status(400).json({ error: 'Query parameter "query" is required' });
         }
 
-        const preferredLanguages = await resolvePreferredLanguages(req);
+        const { uid, preferredLanguages } = await resolveUserContext(req);
         const parsedPage = parseInt(req.query.page, 10);
         const page = Number.isNaN(parsedPage) ? 1 : Math.max(parsedPage, 1);
         const parsedLimit = parseInt(req.query.limit, 10);
@@ -40,10 +41,14 @@ router.get('/search', async (req, res) => {
         // For page > 1, only fetch songs. This powers "load more" efficiently.
         if (page > 1) {
             const songsData = await searchSongsOnly(query, page);
-            const songs = prioritizeSongsByLanguage(
+            const baseSongs = prioritizeSongsByLanguage(
                 songsData?.data?.results ?? [],
                 preferredLanguages
-            ).slice(0, limit);
+            );
+            const rankedSongs = uid
+                ? await rerankSongsForUser({ uid, songs: baseSongs, query, preferredLanguages })
+                : baseSongs;
+            const songs = rankedSongs.slice(0, limit);
             return res.json({
                 success: true,
                 data: {
@@ -65,11 +70,14 @@ router.get('/search', async (req, res) => {
             ? songsData.value ?? []
             : [];
         const orderedSongs = prioritizeSongsByLanguage(songs, preferredLanguages);
+        const rankedSongs = uid
+            ? await rerankSongsForUser({ uid, songs: orderedSongs, query, preferredLanguages })
+            : orderedSongs;
 
         res.json({
             success: true,
             data: {
-                songs: orderedSongs.slice(0, limit),
+                songs: rankedSongs.slice(0, limit),
                 albums: albumsData.status === 'fulfilled'
                     ? (albumsData.value?.data?.results ?? []).slice(0, limit)
                     : [],
@@ -108,31 +116,60 @@ function parsePreferredLanguagesFromArray(value) {
         .filter(Boolean);
 }
 
-async function resolvePreferredLanguages(req) {
+async function resolveUserContext(req) {
     const queryLanguages = parsePreferredLanguages(req.query.languages);
-    if (queryLanguages.length > 0) return queryLanguages;
-
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) return [];
-
-    const idToken = authHeader.slice('Bearer '.length).trim();
-    if (!idToken) return [];
+    const idToken = extractBearerToken(req);
+    if (!idToken) {
+        return {
+            uid: null,
+            preferredLanguages: queryLanguages,
+        };
+    }
 
     try {
         const decodedToken = await auth.verifyIdToken(idToken);
-        const uid = decodedToken?.uid;
-        if (!uid) return [];
+        const uid = decodedToken?.uid || null;
+        if (!uid) {
+            return {
+                uid: null,
+                preferredLanguages: queryLanguages,
+            };
+        }
+
+        if (queryLanguages.length > 0) {
+            return {
+                uid,
+                preferredLanguages: queryLanguages,
+            };
+        }
 
         const cached = getCachedUserLanguages(uid);
-        if (cached) return cached;
+        if (cached) {
+            return {
+                uid,
+                preferredLanguages: cached,
+            };
+        }
 
         const preferences = await getUserPreferences(uid);
-        const languages = parsePreferredLanguagesFromArray(preferences?.languages);
+        const languages = parsePreferredLanguagesFromArray(preferences?.languages ?? preferences?.preferred_language);
         setCachedUserLanguages(uid, languages);
-        return languages;
+        return {
+            uid,
+            preferredLanguages: languages,
+        };
     } catch (_error) {
-        return [];
+        return {
+            uid: null,
+            preferredLanguages: queryLanguages,
+        };
     }
+}
+
+function extractBearerToken(req) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) return '';
+    return authHeader.slice('Bearer '.length).trim();
 }
 
 function prioritizeSongsByLanguage(songs, preferredLanguages) {

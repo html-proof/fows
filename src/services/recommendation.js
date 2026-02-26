@@ -1,5 +1,6 @@
 import { getArtistPlayCounts, getSkippedSongIds, getRecentActivity } from './database.js';
-import { searchSongsOnly, getArtistSongs } from './saavnApi.js';
+import { searchSongsOnly } from './saavnApi.js';
+import { rerankSongsForUser } from './personalizationModel.js';
 
 /**
  * Generate song recommendations for a user based on their preferences and activity.
@@ -146,10 +147,31 @@ export async function generateRecommendations(userPrefs, uid) {
         filtered = ranked.slice(0, 100);
     }
 
-    return filtered.map(({ song, score }) => ({
+    const baseRecommendationSongs = filtered.map(({ song, score }) => ({
         ...song,
         _recommendationScore: score,
     }));
+
+    let personalizedSongs = baseRecommendationSongs;
+    try {
+        personalizedSongs = await rerankSongsForUser({
+            uid,
+            songs: baseRecommendationSongs,
+            query: queries.slice(0, 4).join(' '),
+            preferredLanguages: languages,
+        });
+    } catch (error) {
+        console.error('Recommendation reranking fallback:', error?.message ?? error);
+    }
+
+    return personalizedSongs.map((song) => {
+        const ruleScore = Number(song._recommendationScore || 0);
+        const modelScore = Number(song?._ranking?.finalScore || 0) * 100;
+        return {
+            ...song,
+            _recommendationScore: Number((ruleScore * 0.6 + modelScore * 0.4).toFixed(2)),
+        };
+    });
 }
 
 /**

@@ -34,12 +34,14 @@ router.post('/search', authenticateUser, async (req, res) => {
  *   songId: string,
  *   songName: string,
  *   artist: string,
+ *   language?: string,
+ *   genre?: string,
  *   duration?: number     // seconds the user listened
  * }
  */
 router.post('/play', authenticateUser, async (req, res) => {
     try {
-        const { songId, songName, artist, duration } = req.body;
+        const { songId, songName, artist, language, genre, duration } = req.body;
 
         if (!songId) {
             return res.status(400).json({ error: '"songId" is required' });
@@ -48,6 +50,8 @@ router.post('/play', authenticateUser, async (req, res) => {
         const payload = { songId };
         if (songName) payload.songName = songName;
         if (artist) payload.artist = artist;
+        if (language) payload.language = language;
+        if (genre) payload.genre = genre;
         if (duration != null) payload.duration = Number(duration);
 
         const result = await logActivity(req.user.uid, 'play', payload);
@@ -66,12 +70,14 @@ router.post('/play', authenticateUser, async (req, res) => {
  *   songId: string,
  *   songName: string,
  *   artist: string,
+ *   language?: string,
+ *   genre?: string,
  *   skipTime?: number     // seconds into the song when skipped
  * }
  */
 router.post('/skip', authenticateUser, async (req, res) => {
     try {
-        const { songId, songName, artist, skipTime } = req.body;
+        const { songId, songName, artist, language, genre, skipTime } = req.body;
 
         if (!songId) {
             return res.status(400).json({ error: '"songId" is required' });
@@ -80,6 +86,8 @@ router.post('/skip', authenticateUser, async (req, res) => {
         const payload = { songId };
         if (songName) payload.songName = songName;
         if (artist) payload.artist = artist;
+        if (language) payload.language = language;
+        if (genre) payload.genre = genre;
         if (skipTime != null) payload.skipTime = Number(skipTime);
 
         const result = await logActivity(req.user.uid, 'skip', payload);
@@ -87,6 +95,43 @@ router.post('/skip', authenticateUser, async (req, res) => {
     } catch (error) {
         console.error('Log skip activity error:', error.message);
         res.status(500).json({ error: 'Failed to log skip activity' });
+    }
+});
+
+/**
+ * POST /api/activity/search-click
+ * Record which search result the user clicked.
+ *
+ * Body: {
+ *   songId: string,
+ *   songName?: string,
+ *   artist?: string,
+ *   language?: string,
+ *   genre?: string,
+ *   query?: string,
+ *   position?: number
+ * }
+ */
+router.post('/search-click', authenticateUser, async (req, res) => {
+    try {
+        const { songId, songName, artist, language, genre, query, position } = req.body;
+        if (!songId) {
+            return res.status(400).json({ error: '"songId" is required' });
+        }
+
+        const payload = { songId };
+        if (songName) payload.songName = songName;
+        if (artist) payload.artist = artist;
+        if (language) payload.language = language;
+        if (genre) payload.genre = genre;
+        if (query) payload.query = query;
+        if (position != null) payload.position = Number(position);
+
+        const result = await logActivity(req.user.uid, 'search_click', payload);
+        res.json({ success: true, data: result });
+    } catch (error) {
+        console.error('Log search click activity error:', error.message);
+        res.status(500).json({ error: 'Failed to log search click activity' });
     }
 });
 

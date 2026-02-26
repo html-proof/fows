@@ -36,6 +36,7 @@ app.get('/', (req, res) => {
                 'POST /api/user/preferences',
                 'GET  /api/user/preferences',
                 'POST /api/activity/search',
+                'POST /api/activity/search-click',
                 'POST /api/activity/play',
                 'POST /api/activity/skip',
                 'GET  /api/activity/history',
