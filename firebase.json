@@ -13,8 +13,8 @@
       "anonymous": false,
       "emailPassword": true,
       "googleSignIn": {
-        "oAuthBrandDisplayName": 
-        "supportEmail": 
+        "oAuthBrandDisplayName":"Music Hub"
+        "supportEmail": "imeseban@gmail.com"
       }
     }
   }
