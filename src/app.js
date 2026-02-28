@@ -1,7 +1,6 @@
 import express from 'express';
 import cors from 'cors';
 
-// Route imports
 import saavnRoutes from './routes/saavn.js';
 import userRoutes from './routes/user.js';
 import activityRoutes from './routes/activity.js';
@@ -9,20 +8,28 @@ import recommendationRoutes from './routes/recommendations.js';
 
 const app = express();
 
-// ─── Global Middleware ──────────────────────────────────────
 app.use(cors());
 app.use(express.json());
 
-// ─── Public Routes (no auth required) ──────────────────────
 app.use('/api', saavnRoutes);
-
-// ─── Protected Routes (auth required — middleware is per-route) ─
 app.use('/api/user', userRoutes);
 app.use('/api/activity', activityRoutes);
 app.use('/api/recommendations', recommendationRoutes);
 
-// ─── Health Check ───────────────────────────────────────────
-app.get('/', (req, res) => {
+// Lightweight health routes for keepalive probes.
+app.get('/healthz', (_req, res) => {
+    res.status(200).json({
+        ok: true,
+        service: 'music-hub-backend',
+        timestamp: new Date().toISOString(),
+    });
+});
+
+app.get('/health', (_req, res) => {
+    res.redirect(302, '/healthz');
+});
+
+app.get('/', (_req, res) => {
     res.json({
         message: 'Music Hub API Backend is running',
         version: '2.0.0',

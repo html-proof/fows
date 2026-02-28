@@ -19,8 +19,15 @@ jobs:
             exit 1
           fi
 
-          echo "Pinging $KEEPALIVE_URL"
-          status_code=$(curl -s -o /dev/null -w "%{http_code}" "$KEEPALIVE_URL")
+          BASE_URL="${KEEPALIVE_URL%/}"
+          if [[ "$BASE_URL" == *"/healthz" ]]; then
+            TARGET_URL="$BASE_URL"
+          else
+            TARGET_URL="$BASE_URL/healthz"
+          fi
+
+          echo "Pinging $TARGET_URL"
+          status_code=$(curl -s -o /dev/null -w "%{http_code}" "$TARGET_URL")
           echo "HTTP status: $status_code"
 
           if [ "$status_code" -ge 400 ]; then
