@@ -366,11 +366,37 @@ async function computeSmartSearchResults({
  * @returns {Promise<object>} Song details
  */
 export async function getSongById(id) {
-    const { statusCode, body } = await request(
-        `${BASE_URL}/api/songs/${encodeURIComponent(id)}`
-    );
-    if (statusCode !== 200) throw new Error(`Saavn song fetch failed with status ${statusCode}`);
-    return body.json();
+    try {
+        return await requestJsonWithTimeout(
+            `${BASE_URL}/api/songs/${encodeURIComponent(id)}`,
+            {
+                timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+                label: 'Saavn song fetch',
+            }
+        );
+    } catch (error) {
+        try {
+            return await requestJsonWithTimeout(
+                `${BASE_URL}/api/songs?id=${encodeURIComponent(id)}`,
+                {
+                    timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+                    label: 'Saavn song fetch (query fallback)',
+                }
+            );
+        } catch (innerError) {
+            const fallbackData = await requestJsonWithTimeout(
+                `${FALLBACK_BASE_URL}/songs?id=${encodeURIComponent(id)}`,
+                {
+                    timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
+                    label: 'Fallback song fetch',
+                }
+            );
+            return {
+                success: true,
+                data: Array.isArray(fallbackData) ? fallbackData : [fallbackData],
+            };
+        }
+    }
 }
 
 /**
@@ -379,11 +405,37 @@ export async function getSongById(id) {
  * @returns {Promise<object>} Album details
  */
 export async function getAlbumById(id) {
-    const { statusCode, body } = await request(
-        `${BASE_URL}/api/albums?id=${encodeURIComponent(id)}`
-    );
-    if (statusCode !== 200) throw new Error(`Saavn album fetch failed with status ${statusCode}`);
-    return body.json();
+    try {
+        return await requestJsonWithTimeout(
+            `${BASE_URL}/api/albums/${encodeURIComponent(id)}`,
+            {
+                timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+                label: 'Saavn album fetch (path)',
+            }
+        );
+    } catch (error) {
+        try {
+            return await requestJsonWithTimeout(
+                `${BASE_URL}/api/albums?id=${encodeURIComponent(id)}`,
+                {
+                    timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+                    label: 'Saavn album fetch (query)',
+                }
+            );
+        } catch (innerError) {
+            const fallbackData = await requestJsonWithTimeout(
+                `${FALLBACK_BASE_URL}/albums?id=${encodeURIComponent(id)}`,
+                {
+                    timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
+                    label: 'Fallback album fetch',
+                }
+            );
+            return {
+                success: true,
+                data: fallbackData,
+            };
+        }
+    }
 }
 
 /**
@@ -392,13 +444,30 @@ export async function getAlbumById(id) {
  * @returns {Promise<object>} Album search results
  */
 export async function searchAlbums(query) {
-    return requestJsonWithTimeout(
-        `${BASE_URL}/api/search/albums?query=${encodeURIComponent(query)}`,
-        {
-            timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
-            label: 'Saavn album search',
-        }
-    );
+    try {
+        return await requestJsonWithTimeout(
+            `${BASE_URL}/api/search/albums?query=${encodeURIComponent(query)}`,
+            {
+                timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+                label: 'Saavn album search',
+            }
+        );
+    } catch (error) {
+        // Fallback for album search
+        const fallbackData = await requestJsonWithTimeout(
+            `${FALLBACK_BASE_URL}/search/albums?query=${encodeURIComponent(query)}`,
+            {
+                timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
+                label: 'Fallback album search',
+            }
+        );
+        return {
+            success: true,
+            data: {
+                results: fallbackData,
+            },
+        };
+    }
 }
 
 /**
@@ -407,13 +476,30 @@ export async function searchAlbums(query) {
  * @returns {Promise<object>} Artist search results
  */
 export async function searchArtists(query) {
-    return requestJsonWithTimeout(
-        `${BASE_URL}/api/search/artists?query=${encodeURIComponent(query)}`,
-        {
-            timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
-            label: 'Saavn artist search',
-        }
-    );
+    try {
+        return await requestJsonWithTimeout(
+            `${BASE_URL}/api/search/artists?query=${encodeURIComponent(query)}`,
+            {
+                timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+                label: 'Saavn artist search',
+            }
+        );
+    } catch (error) {
+        // Fallback for artist search
+        const fallbackData = await requestJsonWithTimeout(
+            `${FALLBACK_BASE_URL}/search/artists?query=${encodeURIComponent(query)}`,
+            {
+                timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
+                label: 'Fallback artist search',
+            }
+        );
+        return {
+            success: true,
+            data: {
+                results: fallbackData,
+            },
+        };
+    }
 }
 
 /**
@@ -422,11 +508,24 @@ export async function searchArtists(query) {
  * @returns {Promise<object>} Artist's songs
  */
 export async function getArtistSongs(artistId) {
-    const { statusCode, body } = await request(
-        `${BASE_URL}/api/artists/${encodeURIComponent(artistId)}/songs`
-    );
-    if (statusCode !== 200) throw new Error(`Saavn artist songs failed with status ${statusCode}`);
-    return body.json();
+    try {
+        return await requestJsonWithTimeout(
+            `${BASE_URL}/api/artists/${encodeURIComponent(artistId)}/songs`,
+            {
+                timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+                label: 'Saavn artist songs',
+            }
+        );
+    } catch (error) {
+        // Fallback or secondary pattern search
+        return await requestJsonWithTimeout(
+            `${FALLBACK_BASE_URL}/artists?id=${encodeURIComponent(artistId)}`,
+            {
+                timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
+                label: 'Fallback artist fetch (songs)',
+            }
+        ).catch(() => ({ success: true, data: { songs: [] } }));
+    }
 }
 
 /**
@@ -441,13 +540,24 @@ export async function getArtistAlbums(artistId, options = {}) {
     const limit = Number.isNaN(parsedLimit) ? 20 : Math.max(1, Math.min(parsedLimit, 50));
     const page = Number.isNaN(parsedPage) ? 1 : Math.max(parsedPage, 1);
 
-    return requestJsonWithTimeout(
-        `${BASE_URL}/api/artists/${encodeURIComponent(artistId)}/albums?limit=${limit}&page=${page}`,
-        {
-            timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
-            label: 'Saavn artist albums',
-        }
-    );
+    try {
+        return await requestJsonWithTimeout(
+            `${BASE_URL}/api/artists/${encodeURIComponent(artistId)}/albums?limit=${limit}&page=${page}`,
+            {
+                timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+                label: 'Saavn artist albums',
+            }
+        );
+    } catch (error) {
+        // Fallback for artist albums
+        return await requestJsonWithTimeout(
+            `${FALLBACK_BASE_URL}/artists?id=${encodeURIComponent(artistId)}`,
+            {
+                timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
+                label: 'Fallback artist albums',
+            }
+        ).catch(() => ({ success: true, data: { albums: [] } }));
+    }
 }
 
 /**
@@ -456,11 +566,23 @@ export async function getArtistAlbums(artistId, options = {}) {
  * @returns {Promise<object>} Artist details
  */
 export async function getArtistById(artistId) {
-    const { statusCode, body } = await request(
-        `${BASE_URL}/api/artists/${encodeURIComponent(artistId)}`
-    );
-    if (statusCode !== 200) throw new Error(`Saavn artist fetch failed with status ${statusCode}`);
-    return body.json();
+    try {
+        return await requestJsonWithTimeout(
+            `${BASE_URL}/api/artists/${encodeURIComponent(artistId)}`,
+            {
+                timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+                label: 'Saavn artist fetch',
+            }
+        );
+    } catch (error) {
+        return await requestJsonWithTimeout(
+            `${FALLBACK_BASE_URL}/artists?id=${encodeURIComponent(artistId)}`,
+            {
+                timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
+                label: 'Fallback artist fetch',
+            }
+        );
+    }
 }
 
 /**
