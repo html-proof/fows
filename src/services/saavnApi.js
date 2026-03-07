@@ -1,7 +1,7 @@
 import { request } from 'undici';
 
 const BASE_URL = 'https://saavn.sumit.co';
-const FALLBACK_BASE_URL = 'https://saavnapi-nine.vercel.app';
+const FALLBACK_BASE_URL = 'https://jiosaavn-api-murex.vercel.app';
 const MAX_SMART_RESULTS = 40;
 const SMART_SEARCH_MIN_RESULTS = 8;
 const SEARCH_CACHE_FRESH_TTL_MS = 2 * 60 * 1000;
@@ -142,17 +142,13 @@ async function searchSongsOnlyPrimary(query, page = 1) {
  */
 export async function searchSongsOnlyFallback(query) {
     const payload = await requestJsonWithTimeout(
-        `${FALLBACK_BASE_URL}/result/?query=${encodeURIComponent(query)}`,
+        `${FALLBACK_BASE_URL}/api/search/songs?query=${encodeURIComponent(query)}`,
         {
             timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
             label: 'Fallback song search',
         }
     );
-    if (!Array.isArray(payload)) return [];
-
-    return payload
-        .map(normalizeFallbackSong)
-        .filter(song => song && song.id && song.name);
+    return payload?.data?.results ?? [];
 }
 
 /**
@@ -385,7 +381,7 @@ export async function getSongById(id) {
             );
         } catch (innerError) {
             const fallbackData = await requestJsonWithTimeout(
-                `${FALLBACK_BASE_URL}/songs?id=${encodeURIComponent(id)}`,
+                `${FALLBACK_BASE_URL}/api/songs?id=${encodeURIComponent(id)}`,
                 {
                     timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
                     label: 'Fallback song fetch',
@@ -393,7 +389,7 @@ export async function getSongById(id) {
             );
             return {
                 success: true,
-                data: Array.isArray(fallbackData) ? fallbackData : [fallbackData],
+                data: fallbackData?.data ?? [],
             };
         }
     }
@@ -424,7 +420,7 @@ export async function getAlbumById(id) {
             );
         } catch (innerError) {
             const fallbackData = await requestJsonWithTimeout(
-                `${FALLBACK_BASE_URL}/albums?id=${encodeURIComponent(id)}`,
+                `${FALLBACK_BASE_URL}/api/albums?id=${encodeURIComponent(id)}`,
                 {
                     timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
                     label: 'Fallback album fetch',
@@ -432,7 +428,7 @@ export async function getAlbumById(id) {
             );
             return {
                 success: true,
-                data: fallbackData,
+                data: fallbackData?.data ?? null,
             };
         }
     }
@@ -455,7 +451,7 @@ export async function searchAlbums(query) {
     } catch (error) {
         // Fallback for album search
         const fallbackData = await requestJsonWithTimeout(
-            `${FALLBACK_BASE_URL}/search/albums?query=${encodeURIComponent(query)}`,
+            `${FALLBACK_BASE_URL}/api/search/albums?query=${encodeURIComponent(query)}`,
             {
                 timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
                 label: 'Fallback album search',
@@ -464,7 +460,7 @@ export async function searchAlbums(query) {
         return {
             success: true,
             data: {
-                results: fallbackData,
+                results: fallbackData?.data?.results ?? [],
             },
         };
     }
@@ -487,7 +483,7 @@ export async function searchArtists(query) {
     } catch (error) {
         // Fallback for artist search
         const fallbackData = await requestJsonWithTimeout(
-            `${FALLBACK_BASE_URL}/search/artists?query=${encodeURIComponent(query)}`,
+            `${FALLBACK_BASE_URL}/api/search/artists?query=${encodeURIComponent(query)}`,
             {
                 timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
                 label: 'Fallback artist search',
@@ -496,7 +492,7 @@ export async function searchArtists(query) {
         return {
             success: true,
             data: {
-                results: fallbackData,
+                results: fallbackData?.data?.results ?? [],
             },
         };
     }
@@ -519,7 +515,7 @@ export async function getArtistSongs(artistId) {
     } catch (error) {
         // Fallback or secondary pattern search
         return await requestJsonWithTimeout(
-            `${FALLBACK_BASE_URL}/artists?id=${encodeURIComponent(artistId)}`,
+            `${FALLBACK_BASE_URL}/api/artists/${encodeURIComponent(artistId)}/songs`,
             {
                 timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
                 label: 'Fallback artist fetch (songs)',
@@ -551,7 +547,7 @@ export async function getArtistAlbums(artistId, options = {}) {
     } catch (error) {
         // Fallback for artist albums
         return await requestJsonWithTimeout(
-            `${FALLBACK_BASE_URL}/artists?id=${encodeURIComponent(artistId)}`,
+            `${FALLBACK_BASE_URL}/api/artists/${encodeURIComponent(artistId)}/albums`,
             {
                 timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
                 label: 'Fallback artist albums',
@@ -576,7 +572,7 @@ export async function getArtistById(artistId) {
         );
     } catch (error) {
         return await requestJsonWithTimeout(
-            `${FALLBACK_BASE_URL}/artists?id=${encodeURIComponent(artistId)}`,
+            `${FALLBACK_BASE_URL}/api/artists/${encodeURIComponent(artistId)}`,
             {
                 timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
                 label: 'Fallback artist fetch',
@@ -628,69 +624,6 @@ export default {
     getArtistsByLanguage,
 };
 
-function normalizeFallbackSong(raw) {
-    if (!raw || typeof raw !== 'object') return null;
-
-    const id = (raw.id ?? raw.songid ?? '').toString().trim();
-    const name = (raw.song ?? raw.title ?? '').toString().trim();
-    const artistText = (raw.primary_artists ?? raw.singers ?? '').toString();
-    const artistNames = artistText
-        .split(',')
-        .map(name => name.trim())
-        .filter(Boolean);
-
-    const artistsPrimary = artistNames.map((artistName, index) => ({
-        id: `${id}_a${index}`,
-        name: artistName,
-        role: 'primary_artists',
-        image: '',
-        type: 'artist',
-        url: '',
-    }));
-
-    const mediaUrl = (raw.media_url ?? raw.url ?? '').toString().trim();
-    const downloadUrl = [];
-    if (mediaUrl) {
-        downloadUrl.push({ quality: '320kbps', url: mediaUrl });
-    }
-
-    const imageUrl = (raw.image ?? raw.image_url ?? '').toString().trim();
-    const image = imageUrl
-        ? [
-            { quality: '50x50', url: imageUrl },
-            { quality: '150x150', url: imageUrl },
-            { quality: '500x500', url: imageUrl },
-        ]
-        : [];
-
-    const albumId = (raw.albumid ?? '').toString().trim();
-    const albumName = (raw.album ?? '').toString().trim();
-    const albumUrl = (raw.album_url ?? '').toString().trim();
-
-    return {
-        id,
-        name,
-        type: 'song',
-        year: (raw.year ?? '').toString(),
-        releaseDate: raw.release_date ?? null,
-        duration: Number.parseInt(raw.duration, 10) || null,
-        language: (raw.language ?? '').toString().toLowerCase(),
-        url: (raw.perma_url ?? '').toString(),
-        album: {
-            id: albumId,
-            name: albumName,
-            url: albumUrl,
-        },
-        primaryArtists: artistText,
-        artists: {
-            primary: artistsPrimary,
-            featured: [],
-            all: artistsPrimary,
-        },
-        image,
-        downloadUrl,
-    };
-}
 
 function addRankedSongs({
     ranked,
