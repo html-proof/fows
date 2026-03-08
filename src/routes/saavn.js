@@ -630,6 +630,38 @@ router.get('/artists/by-language', async (req, res) => {
     }
 });
 
+// Artist Details by artist ID (public)
+// Example: /api/artists/459320
+router.get('/artists/:id', async (req, res) => {
+    try {
+        const artistId = req.params.id?.trim();
+        if (!artistId) {
+            return res.status(400).json({ error: 'Artist "id" parameter is required' });
+        }
+        const data = await getArtistById(artistId);
+        return res.json(data);
+    } catch (error) {
+        console.error('Artist Details API error:', error.message);
+        return res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Artist Songs (Top tracks) by artist ID (public)
+// Example: /api/artists/459320/songs
+router.get('/artists/:id/songs', async (req, res) => {
+    try {
+        const artistId = req.params.id?.trim();
+        if (!artistId) {
+            return res.status(400).json({ error: 'Artist "id" parameter is required' });
+        }
+        const data = await getArtistSongs(artistId);
+        return res.json(data);
+    } catch (error) {
+        console.error('Artist Songs API error:', error.message);
+        return res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 // Artist albums by artist ID (public)
 // Example: /api/artists/459320/albums?limit=20&page=1
 router.get('/artists/:id/albums', async (req, res) => {
