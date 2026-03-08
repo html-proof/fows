@@ -5,6 +5,8 @@ import {
     searchArtists,
     getArtistsByLanguage,
     getArtistAlbums,
+    getArtistById,
+    getArtistSongs,
     getSongById,
     getAlbumById,
     searchAlbums,
