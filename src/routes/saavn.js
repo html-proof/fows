@@ -10,6 +10,7 @@ import {
     getSongById,
     getAlbumById,
     searchAlbums,
+    getLyricsBySongId,
 } from '../services/saavnApi.js';
 import { auth } from '../config/firebase.js';
 import { getUserPreferences } from '../services/database.js';
@@ -586,6 +587,18 @@ router.get('/songs/:id', async (req, res) => {
         res.json(data);
     } catch (error) {
         console.error('Song API error:', error.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Song Lyrics API (public)
+// Example: /api/songs/:id/lyrics
+router.get('/songs/:id/lyrics', async (req, res) => {
+    try {
+        const data = await getLyricsBySongId(req.params.id);
+        res.json(data);
+    } catch (error) {
+        console.error('Lyrics API error:', error.message);
         res.status(500).json({ error: 'Internal server error' });
     }
 });

@@ -609,6 +609,44 @@ export async function getArtistsByLanguage(language) {
     return Array.from(artistMap.values());
 }
 
+/**
+ * Get song lyrics by song ID.
+ * @param {string} id - Song ID
+ * @returns {Promise<object>} Lyrics data
+ */
+export async function getLyricsBySongId(id) {
+    try {
+        // Primary: check /api/songs/:id/lyrics (new spec)
+        return await requestJsonWithTimeout(
+            `${BASE_URL}/api/songs/${encodeURIComponent(id)}/lyrics`,
+            {
+                timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+                label: 'Saavn lyrics fetch (path)',
+            }
+        );
+    } catch (error) {
+        try {
+            // Secondary: check /api/lyrics?id=:id (older spec)
+            return await requestJsonWithTimeout(
+                `${BASE_URL}/api/lyrics?id=${encodeURIComponent(id)}`,
+                {
+                    timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+                    label: 'Saavn lyrics fetch (query)',
+                }
+            );
+        } catch (innerError) {
+            // Fallback: check alternate provider
+            return await requestJsonWithTimeout(
+                `${FALLBACK_BASE_URL}/api/lyrics?id=${encodeURIComponent(id)}`,
+                {
+                    timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
+                    label: 'Fallback lyrics fetch',
+                }
+            ).catch(() => ({ success: false, data: null }));
+        }
+    }
+}
+
 export default {
     searchSongs,
     searchSongsOnly,
@@ -622,6 +660,7 @@ export default {
     getArtistAlbums,
     getArtistById,
     getArtistsByLanguage,
+    getLyricsBySongId,
 };
 
 
