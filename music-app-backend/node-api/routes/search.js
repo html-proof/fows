@@ -1,19 +1,24 @@
 const express = require('express');
 const axios = require('axios');
-const db = require('../firebase');
+const { db } = require('../firebase');
+const { authenticateUser } = require('../middleware/auth');
 
 const router = express.Router();
 const CANDIDATE_LIMIT = 30;
 
-router.post('/', async (req, res) => {
+router.post('/', authenticateUser, async (req, res) => {
     try {
         const { query, userId } = req.body || {};
+        const effectiveUserId = req.user?.uid;
+        if (!effectiveUserId) {
+            return res.status(401).json({ error: 'Unauthorized' });
+        }
+        if (userId && String(userId) !== effectiveUserId) {
+            return res.status(403).json({ error: 'Forbidden' });
+        }
         const normalizedQuery = String(query || '').trim().toLowerCase();
         if (!normalizedQuery) {
             return res.status(400).json({ error: 'query is required' });
-        }
-        if (!userId) {
-            return res.status(400).json({ error: 'userId is required' });
         }
 
         const snapshot = await db.ref('songs').once('value');
@@ -32,12 +37,16 @@ router.post('/', async (req, res) => {
         }
 
         const mlBaseUrl = process.env.ML_SERVICE_URL || 'http://localhost:8000';
+        const mlApiKey = process.env.ML_SERVICE_API_KEY;
         const mlResponse = await axios.post(`${mlBaseUrl}/rank`, {
-            userId,
+            userId: effectiveUserId,
             query: normalizedQuery,
             songs: candidates,
             topK: 10,
-        }, { timeout: 5000 });
+        }, {
+            timeout: 5000,
+            headers: mlApiKey ? { 'X-API-KEY': mlApiKey } : undefined,
+        });
 
         return res.json(mlResponse.data);
     } catch (error) {

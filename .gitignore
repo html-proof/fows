@@ -1,6 +1,7 @@
 node_modules/
 .env
-music-16f5c-firebase-adminsdk-*.json
+*firebase-adminsdk-*.json
+serviceAccountKey.json
 .DS_Store
 dist/
 build/

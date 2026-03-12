@@ -3,11 +3,12 @@ import { request } from 'undici';
 const BASE_URL = 'https://saavn.sumit.co';
 const FALLBACK_BASE_URL = 'https://jiosaavn-api-murex.vercel.app';
 const MAX_SMART_RESULTS = 40;
+const BIGRAM_MIN_OVERLAP = 0.35;
 const SMART_SEARCH_MIN_RESULTS = 8;
 const SEARCH_CACHE_FRESH_TTL_MS = 2 * 60 * 1000;
 const SEARCH_CACHE_STALE_TTL_MS = 20 * 60 * 1000;
 const SEARCH_CACHE_MAX_ENTRIES = 300;
-const SMART_SEARCH_MAX_VARIANTS = 4;
+const SMART_SEARCH_MAX_VARIANTS = 3;
 const SMART_SEARCH_MAX_LATENCY_MS = 3200;
 const PRIMARY_SEARCH_TIMEOUT_MS = 2200;
 const FALLBACK_SEARCH_TIMEOUT_MS = 1800;
@@ -733,43 +734,21 @@ function buildSearchQueryVariants(query) {
 
     push(query);
 
-    // Remove language/noise words (e.g., "malayalam", "song", "lyrics").
-    const filteredTokens = tokenize(query).filter(token => !QUERY_NOISE_WORDS.has(token));
-    if (filteredTokens.length > 0) {
+    // Remove language/noise words but only if something meaningful remains.
+    const tokens = tokenize(query);
+    const filteredTokens = tokens.filter(token => !QUERY_NOISE_WORDS.has(token));
+    if (filteredTokens.length > 0 && filteredTokens.length < tokens.length) {
         push(filteredTokens.join(' '));
     }
 
-    // Drop trailing token (often a typo/noise fragment).
-    const tokens = tokenize(query);
-    if (tokens.length > 2) {
+    // Drop trailing token for long queries (often a typo/noise fragment).
+    if (tokens.length > 3) {
         push(tokens.slice(0, -1).join(' '));
     }
 
-    // Keep first two terms for broad match.
-    if (tokens.length > 2) {
+    // Keep first two terms only for queries with 4+ terms.
+    if (tokens.length > 3) {
         push(tokens.slice(0, 2).join(' '));
-    }
-
-    // Keep first token as broad fallback.
-    if (tokens.length > 0) {
-        push(tokens[0]);
-    }
-
-    // Try removing one token at a time for long queries.
-    if (tokens.length >= 3) {
-        for (let i = 0; i < tokens.length; i += 1) {
-            const trimmed = tokens.filter((_, idx) => idx !== i).join(' ');
-            push(trimmed);
-        }
-    }
-
-    // Typo-tolerant variant: shorten long words by one char.
-    const shortenable = tokens.some(token => token.length >= 6);
-    if (shortenable) {
-        const softened = tokens
-            .map(token => (token.length >= 6 ? token.slice(0, -1) : token))
-            .join(' ');
-        push(softened);
     }
 
     return variants.slice(0, SMART_SEARCH_MAX_VARIANTS);
@@ -877,68 +856,92 @@ function scoreSongMatch({
     const compactQuery = normalizeCompact(query);
     const queryTerms = tokenize(query).filter(token => !QUERY_NOISE_WORDS.has(token));
     const effectiveTerms = queryTerms.length > 0 ? queryTerms : tokenize(query);
-    const maxMissingTerms = effectiveTerms.length > 1 ? 1 : 0;
+    // For short queries (1-2 tokens), require ALL tokens to match. For longer, allow 1 miss.
+    const maxMissingTerms = effectiveTerms.length > 2 ? 1 : 0;
     const minimumTermMatches = effectiveTerms.length === 0
         ? 0
         : Math.max(1, effectiveTerms.length - maxMissingTerms);
 
     let score = 0;
-    let directMatches = 0;
+    let nameMatches = 0;
+    let artistMatches = 0;
+    let albumMatches = 0;
     let fuzzyMatches = 0;
 
     for (const term of effectiveTerms) {
         if (name.includes(term)) {
-            directMatches += 1;
-            score += 20;
+            nameMatches += 1;
+            score += 25;
         } else if (artists.includes(term)) {
-            directMatches += 1;
-            score += 13;
+            artistMatches += 1;
+            score += 15;
         } else if (album.includes(term)) {
-            directMatches += 1;
+            albumMatches += 1;
             score += 10;
         } else if (hasFuzzyTokenMatch(term, haystackTokens)) {
             fuzzyMatches += 1;
-            score += 6;
+            score += 5;
         }
     }
 
+    const directMatches = nameMatches + artistMatches + albumMatches;
     const totalMatches = directMatches + fuzzyMatches;
     const hasTermCoverage = effectiveTerms.length === 0 || totalMatches >= minimumTermMatches;
+    // Bonus for having ALL terms match directly (precision signal)
+    if (effectiveTerms.length > 0 && directMatches === effectiveTerms.length) {
+        score += 30;
+    }
 
     let matchTier = null;
     if (name === query || (compactQuery && compactName === compactQuery)) {
         matchTier = MATCH_TIERS.EXACT;
-        score += 260;
+        score += 300;
     } else if (
         name.startsWith(query) ||
         (compactQuery && compactName.startsWith(compactQuery))
     ) {
         matchTier = MATCH_TIERS.STARTS_WITH;
-        score += 200;
+        score += 220;
     } else if (
         name.includes(query) ||
+        (compactQuery && compactName.includes(compactQuery))
+    ) {
+        // Name-level substring match is stronger than haystack substring
+        matchTier = MATCH_TIERS.CONTAINS;
+        score += 160;
+    } else if (
         haystack.includes(query) ||
-        (compactQuery && (
-            compactName.includes(compactQuery) ||
-            compactHaystack.includes(compactQuery)
-        ))
+        (compactQuery && compactHaystack.includes(compactQuery))
     ) {
         matchTier = MATCH_TIERS.CONTAINS;
-        score += 140;
+        score += 120;
     } else {
         const maxCompactDistance = resolveMaxEditDistance(compactQuery.length);
         const hasCompactFuzzy = Boolean(compactQuery && compactName)
             && Math.abs(compactQuery.length - compactName.length) <= maxCompactDistance
             && levenshteinDistance(compactQuery, compactName) <= maxCompactDistance;
-        if (hasTermCoverage || hasCompactFuzzy || fuzzyMatches > 0) {
+        const bigramScore = compactQuery && compactName
+            ? bigramOverlap(compactQuery, compactName)
+            : 0;
+        if (hasTermCoverage && (directMatches > 0 || hasCompactFuzzy || bigramScore >= BIGRAM_MIN_OVERLAP)) {
             matchTier = MATCH_TIERS.FUZZY;
-            score += 80;
+            score += 70;
+        } else if (fuzzyMatches > 0 && hasTermCoverage) {
+            matchTier = MATCH_TIERS.FUZZY;
+            score += 50;
         }
     }
 
     if (matchTier == null) return null;
     if (matchTier === MATCH_TIERS.FUZZY && effectiveTerms.length >= 2 && !hasTermCoverage) {
         return null;
+    }
+    // Reject fuzzy matches with no direct matches and no strong bigram overlap
+    if (matchTier === MATCH_TIERS.FUZZY && directMatches === 0 && fuzzyMatches <= 1) {
+        const bigramScore = compactQuery && compactName
+            ? bigramOverlap(compactQuery, compactName)
+            : 0;
+        if (bigramScore < 0.4) return null;
     }
 
     // Avoid noisy unrelated results for unmatched long queries.
@@ -949,25 +952,25 @@ function scoreSongMatch({
     if (languageHint) {
         const language = normalizeQuery(song.language ?? '');
         if (language === languageHint) {
-            score += 18;
+            score += 22;
         } else {
-            score -= 4;
+            score -= 6;
         }
     }
 
     if (preferredLanguageSet?.size > 0) {
         const language = normalizeQuery(song.language ?? '');
         if (preferredLanguageSet.has(language)) {
-            score += 28;
+            score += 32;
         } else {
-            score -= 2;
+            score -= 4;
         }
     }
 
     score += sourceWeight;
-    score -= variantIndex * 10;
+    score -= variantIndex * 15;
     if (matchTier === MATCH_TIERS.FUZZY) {
-        score -= 10;
+        score -= 15;
     }
 
     return {
@@ -977,17 +980,35 @@ function scoreSongMatch({
 }
 
 function resolveMaxEditDistance(length) {
-    if (length >= 10) return 3;
-    if (length >= 6) return 2;
+    if (length >= 12) return 2;
+    if (length >= 6) return 1;
     return 1;
 }
 
+function bigramOverlap(a, b) {
+    if (!a || !b || a.length < 2 || b.length < 2) return 0;
+    const bigramsA = new Set();
+    for (let i = 0; i < a.length - 1; i += 1) bigramsA.add(a.slice(i, i + 2));
+    let matches = 0;
+    let total = 0;
+    for (let i = 0; i < b.length - 1; i += 1) {
+        total += 1;
+        if (bigramsA.has(b.slice(i, i + 2))) matches += 1;
+    }
+    return total === 0 ? 0 : matches / Math.max(bigramsA.size, total);
+}
+
 function hasFuzzyTokenMatch(queryTerm, targetTokens) {
+    if (!queryTerm || queryTerm.length < 3) return false;
     for (const token of targetTokens) {
-        if (!token || token.length < 2) continue;
-        const maxDistance = queryTerm.length >= 7 ? 2 : 1;
+        if (!token || token.length < 3) continue;
+        // Tighter fuzzy: max 1 edit for shorter terms, 2 only for 8+ char terms
+        const maxDistance = queryTerm.length >= 8 ? 2 : 1;
         if (Math.abs(queryTerm.length - token.length) > maxDistance) continue;
-        if (queryTerm[0] !== token[0]) continue;
+        // First character must match for single-edit tolerance,
+        // or first 2 chars must share at least 1 for double-edit tolerance
+        if (maxDistance <= 1 && queryTerm[0] !== token[0]) continue;
+        if (maxDistance > 1 && queryTerm[0] !== token[0] && queryTerm[1] !== token[1]) continue;
         if (levenshteinDistance(queryTerm, token) <= maxDistance) return true;
     }
     return false;

@@ -1,14 +1,22 @@
 const express = require('express');
-const db = require('../firebase');
+const { db } = require('../firebase');
+const { authenticateUser } = require('../middleware/auth');
 
 const router = express.Router();
 
-router.post('/', async (req, res) => {
+router.post('/', authenticateUser, async (req, res) => {
     try {
         const { userId, songId, action } = req.body || {};
-        if (!userId || !songId || !action) {
+        const effectiveUserId = req.user?.uid;
+        if (!effectiveUserId) {
+            return res.status(401).json({ error: 'Unauthorized' });
+        }
+        if (userId && String(userId) !== effectiveUserId) {
+            return res.status(403).json({ error: 'Forbidden' });
+        }
+        if (!songId || !action) {
             return res.status(400).json({
-                error: 'userId, songId, and action are required',
+                error: 'songId and action are required',
             });
         }
 
@@ -19,7 +27,7 @@ router.post('/', async (req, res) => {
             });
         }
 
-        const ref = db.ref(`user_activity/${userId}/${songId}`);
+        const ref = db.ref(`user_activity/${effectiveUserId}/${songId}`);
         const snapshot = await ref.once('value');
         const current = snapshot.val() || {
             play_count: 0,
@@ -35,7 +43,7 @@ router.post('/', async (req, res) => {
         await ref.set(current);
         return res.json({
             success: true,
-            userId,
+            userId: effectiveUserId,
             songId,
             action: normalizedAction,
             data: current,

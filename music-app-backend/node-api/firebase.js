@@ -29,6 +29,7 @@ if (!admin.apps.length) {
     });
 }
 
+const auth = admin.auth();
 const db = admin.database();
 
-module.exports = db;
+module.exports = { db, auth, admin };

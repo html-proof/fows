@@ -1,11 +1,13 @@
+import os
 from typing import Any, Dict, List
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from model import rank_songs_for_user, recommend_for_user
 
 app = FastAPI(title="music-ml-service", version="1.0.0")
+API_KEY = os.getenv("ML_SERVICE_API_KEY", "").strip()
 
 
 class RankRequest(BaseModel):
@@ -27,8 +29,19 @@ def health() -> Dict[str, str]:
     return {"status": "ok", "service": "ml-service"}
 
 
+def verify_api_key(request: Request, x_api_key: str | None = Header(default=None)) -> None:
+    if API_KEY:
+        if x_api_key != API_KEY:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        return
+
+    client_host = request.client.host if request.client else ""
+    if client_host not in ("127.0.0.1", "localhost", "::1"):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 @app.post("/rank")
-def rank_songs(req: RankRequest) -> Dict[str, Any]:
+def rank_songs(req: RankRequest, _auth: None = Depends(verify_api_key)) -> Dict[str, Any]:
     ranked = rank_songs_for_user(
         user_id=req.userId,
         songs=req.songs,
@@ -39,7 +52,7 @@ def rank_songs(req: RankRequest) -> Dict[str, Any]:
 
 
 @app.post("/recommend")
-def recommend(req: RecommendRequest) -> Dict[str, Any]:
+def recommend(req: RecommendRequest, _auth: None = Depends(verify_api_key)) -> Dict[str, Any]:
     return recommend_for_user(
         user_id=req.userId,
         user_data=req.userData,
