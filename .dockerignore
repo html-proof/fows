@@ -7,3 +7,17 @@ serviceAccountKey.json
 .gitignore
 docker-compose.yml
 README.md
+SECURITY.md
+music_hub
+.github
+.firebaserc
+firebase.json
+firestore.rules
+firestore.indexes.json
+database.rules.json
+signing_info.txt
+scripts
+music-app-backend/ml-service/__pycache__
+music-app-backend/ml-service/.env.example
+music-app-backend/ml-service/.gitignore
+music-app-backend/README.md
