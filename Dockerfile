@@ -45,7 +45,7 @@ COPY music-app-backend/ml-service/main.py ./
 COPY music-app-backend/ml-service/model.py ./
 COPY music-app-backend/ml-service/train.py ./
 
-# ── Supervisord config ──
+# ── Supervisord config (cache bust: v3-no-api-key) ──
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
 # ── Environment variables ──
