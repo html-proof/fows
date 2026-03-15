@@ -34,8 +34,9 @@ COPY music-app-backend/ml-service/requirements.txt ./
 
 # Install Python dependencies in a virtual env (avoids PEP 668 issues)
 RUN python3 -m venv /opt/ml-venv && \
-    /opt/ml-venv/bin/pip install --no-cache-dir --upgrade pip && \
+    /opt/ml-venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel && \
     /opt/ml-venv/bin/pip install --no-cache-dir -r requirements.txt
+
 
 COPY music-app-backend/ml-service/main.py ./
 COPY music-app-backend/ml-service/model.py ./
