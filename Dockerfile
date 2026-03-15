@@ -13,13 +13,16 @@ RUN npm ci --omit=dev
 FROM node:20-slim
 
 # Install Python 3.11, pip, and supervisord
+# Cache bust: 2026-03-15-v2
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-venv \
+    python3-dev \
     supervisor \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
+
 
 # ── Node.js setup ──
 WORKDIR /app
