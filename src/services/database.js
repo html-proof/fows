@@ -5,6 +5,12 @@ const PROFILE_ACTIVITY_SAMPLE_SIZE = 300;
 const PROFILE_SEARCH_LIMIT = 40;
 const PROFILE_MAX_SONG_INTERACTIONS = 500;
 
+// ── Trending & Collaborative Filtering constants ──
+const TRENDING_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
+const CO_LISTEN_SESSION_GAP_MS = 30 * 60 * 1000; // 30 min gap = new session
+const TRENDING_CACHE_TTL_MS = 5 * 60 * 1000; // 5 min cache
+let _trendingCache = { data: null, expiresAt: 0 };
+
 /**
  * Save user preferences (languages, favorite artists) in RTDB.
  */
@@ -271,6 +277,12 @@ async function updateDerivedRealtimeNodes(uid, type, payload, timestamp) {
         tasks.push(updateListeningHistory(uid, type, payload, timestamp));
     }
 
+    // ── NEW: Global trending + co-listen tracking ──
+    if (type === 'play' && payload?.songId) {
+        tasks.push(updateGlobalTrending(payload, timestamp));
+        tasks.push(updateCoListenPairs(uid, payload, timestamp));
+    }
+
     if (tasks.length === 0) return;
 
     const outcomes = await Promise.allSettled(tasks);
@@ -428,6 +440,195 @@ function dedupeOrdered(values) {
     return output;
 }
 
+// ── NEW: Global Trending Tracker ──
+// Tracks play counts per song across ALL users in a rolling 24h window.
+async function updateGlobalTrending(payload, timestamp) {
+    const songId = String(payload.songId || '').trim();
+    if (!songId) return;
+
+    const ref = db.ref(`global_trending/${songId}`);
+    await ref.transaction((current) => {
+        const value = current && typeof current === 'object' ? current : {};
+        return {
+            ...value,
+            songId,
+            songName: payload.songName || value.songName || '',
+            artist: payload.artist || value.artist || '',
+            language: payload.language || value.language || '',
+            genre: payload.genre || value.genre || '',
+            playCount: (Number.parseInt(value.playCount, 10) || 0) + 1,
+            lastPlayed: timestamp,
+        };
+    });
+}
+
+/**
+ * Get globally trending songs (across all users) from the last 24 hours.
+ * Results are cached for 5 minutes to reduce DB reads.
+ */
+export async function getGlobalTrending(limit = 50) {
+    const now = Date.now();
+    if (_trendingCache.data && _trendingCache.expiresAt > now) {
+        return _trendingCache.data.slice(0, limit);
+    }
+
+    const snapshot = await db.ref('global_trending')
+        .orderByChild('lastPlayed')
+        .limitToLast(200)
+        .get();
+
+    if (!snapshot.exists()) return [];
+
+    const cutoff = now - TRENDING_WINDOW_MS;
+    const songs = [];
+    snapshot.forEach((child) => {
+        const value = child.val();
+        if (!value || (value.lastPlayed || 0) < cutoff) return;
+        songs.push(value);
+    });
+
+    songs.sort((a, b) => (b.playCount || 0) - (a.playCount || 0));
+    const result = songs.slice(0, 100);
+    _trendingCache = { data: result, expiresAt: now + TRENDING_CACHE_TTL_MS };
+    return result.slice(0, limit);
+}
+
+// ── NEW: Co-Listen Pairs (Collaborative Filtering) ──
+// Records pairs of songs played in the same session by ANY user.
+async function updateCoListenPairs(uid, payload, timestamp) {
+    const songId = String(payload.songId || '').trim();
+    if (!songId) return;
+
+    // Get user's last played song to form a "pair"
+    const lastPlaySnap = await db.ref(`users/${uid}/last_played_song`).get();
+    const lastPlayed = lastPlaySnap.exists() ? lastPlaySnap.val() : null;
+
+    // Update last played song for next co-listen pair
+    await db.ref(`users/${uid}/last_played_song`).set({
+        songId,
+        timestamp,
+    });
+
+    if (!lastPlayed || !lastPlayed.songId) return;
+    if (lastPlayed.songId === songId) return;
+
+    // Only link songs played within the same session (30 min window)
+    if (timestamp - (lastPlayed.timestamp || 0) > CO_LISTEN_SESSION_GAP_MS) return;
+
+    // Create a canonical pair key (alphabetically sorted to avoid duplicates)
+    const pairKey = [lastPlayed.songId, songId].sort().join('__');
+    const pairRef = db.ref(`co_listen_pairs/${pairKey}`);
+    await pairRef.transaction((current) => {
+        const value = current && typeof current === 'object' ? current : {};
+        return {
+            songA: [lastPlayed.songId, songId].sort()[0],
+            songB: [lastPlayed.songId, songId].sort()[1],
+            count: (Number.parseInt(value.count, 10) || 0) + 1,
+            lastSeen: timestamp,
+        };
+    });
+}
+
+/**
+ * Get co-listened songs for a given song ID.
+ * Returns songs that are frequently played in the same session as the target song.
+ */
+export async function getCoListenedSongs(songId, limit = 20) {
+    if (!songId) return [];
+
+    // Search both songA and songB positions
+    const [snapA, snapB] = await Promise.all([
+        db.ref('co_listen_pairs')
+            .orderByChild('songA')
+            .equalTo(songId)
+            .limitToLast(50)
+            .get(),
+        db.ref('co_listen_pairs')
+            .orderByChild('songB')
+            .equalTo(songId)
+            .limitToLast(50)
+            .get(),
+    ]);
+
+    const pairs = [];
+    const addPairs = (snapshot) => {
+        if (!snapshot.exists()) return;
+        snapshot.forEach((child) => {
+            const value = child.val();
+            if (!value) return;
+            const partnerId = value.songA === songId ? value.songB : value.songA;
+            if (partnerId) {
+                pairs.push({ songId: partnerId, coListenCount: value.count || 0 });
+            }
+        });
+    };
+
+    addPairs(snapA);
+    addPairs(snapB);
+
+    // Deduplicate and sort by co-listen count
+    const deduped = new Map();
+    for (const pair of pairs) {
+        const existing = deduped.get(pair.songId);
+        if (!existing || existing.coListenCount < pair.coListenCount) {
+            deduped.set(pair.songId, pair);
+        }
+    }
+
+    return Array.from(deduped.values())
+        .sort((a, b) => b.coListenCount - a.coListenCount)
+        .slice(0, limit);
+}
+
+/**
+ * Calculate engagement depth score from duration and skip time.
+ * Returns 0.0 (skipped instantly) to 1.0 (listened to completion).
+ */
+export function calculateEngagementDepth(payload) {
+    const duration = Number(payload?.duration || 0);
+    const skipTime = Number(payload?.skipTime || 0);
+    const totalDuration = Number(payload?.totalDuration || 0);
+
+    if (totalDuration > 0 && duration > 0) {
+        return Math.min(1, duration / totalDuration);
+    }
+    if (duration > 0) {
+        return Math.min(1, duration / 240);
+    }
+    if (skipTime > 0) {
+        return Math.min(0.5, skipTime / 240);
+    }
+
+    return 0.5;
+}
+
+/**
+ * Get the user's recent session plays (within the last 30 min).
+ * Used for mood/session context detection.
+ */
+export async function getSessionPlays(uid, sessionGapMs = CO_LISTEN_SESSION_GAP_MS) {
+    const now = Date.now();
+    const cutoff = now - sessionGapMs;
+
+    const snapshot = await db.ref(`users/${uid}/activity`)
+        .orderByChild('timestamp')
+        .startAt(cutoff)
+        .limitToLast(30)
+        .get();
+
+    if (!snapshot.exists()) return [];
+
+    const plays = [];
+    snapshot.forEach((child) => {
+        const value = child.val();
+        if (value && value.type === 'play') {
+            plays.push(value);
+        }
+    });
+
+    return plays;
+}
+
 export default {
     saveUserPreferences,
     getUserPreferences,
@@ -438,4 +639,8 @@ export default {
     getUserSongInteractions,
     getUserSearchHistory,
     getUserRealtimeProfile,
+    getGlobalTrending,
+    getCoListenedSongs,
+    calculateEngagementDepth,
+    getSessionPlays,
 };

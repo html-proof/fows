@@ -72,6 +72,10 @@ export async function rerankSongsForUser({
         const queryIntentScore = resolveQueryIntentScore(effectiveQueryTerms, songFields);
         const lexicalScore = resolveLexicalPrecisionScore(normalizedQuery, effectiveQueryTerms, songFields);
 
+        // ── NEW: Trending and Mood context for AI reranking ──
+        const trendingScore = song._trending ? clamp01((song._trendingPlayCount || 0) / 50) : 0;
+        const moodMatchScore = (song._sessionMood === song._timeMood) ? 0.35 : 0.15;
+
         const nnScore = forwardNeuralRanker([
             textRankScore,
             embeddingSimilarity,
@@ -85,9 +89,11 @@ export async function rerankSongsForUser({
 
         const preferenceMatch = clamp01((embeddingSimilarity + languageScore + artistScore) / 3);
         const personalizationScore = clamp01(
-            preferenceMatch * 0.45 +
-            interactionScore * 0.35 +
-            popularityScore * 0.2
+            preferenceMatch * 0.40 +
+            interactionScore * 0.30 +
+            popularityScore * 0.15 +
+            trendingScore * 0.10 +
+            moodMatchScore * 0.05
         );
         let finalScore;
 
@@ -110,9 +116,10 @@ export async function rerankSongsForUser({
             }
         } else {
             finalScore = clamp01(
-                textRankScore * 0.22 +
-                personalizationScore * 0.58 +
-                popularityScore * 0.2
+                textRankScore * 0.20 +
+                personalizationScore * 0.55 +
+                popularityScore * 0.15 +
+                trendingScore * 0.10
             ) * 0.7 + nnScore * 0.3;
         }
 
@@ -125,6 +132,7 @@ export async function rerankSongsForUser({
                 preferenceMatch: Number(preferenceMatch.toFixed(4)),
                 popularityScore: Number(popularityScore.toFixed(4)),
                 interactionScore: Number(interactionScore.toFixed(4)),
+                trendingScore: Number(trendingScore.toFixed(4)),
                 neuralScore: Number(nnScore.toFixed(4)),
             },
         };

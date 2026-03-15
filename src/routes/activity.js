@@ -7,17 +7,13 @@ const router = Router();
 /**
  * POST /api/activity/search
  * Record a search event.
- *
- * Body: { query: string }
  */
 router.post('/search', authenticateUser, async (req, res) => {
     try {
         const { query } = req.body;
-
         if (!query) {
             return res.status(400).json({ error: '"query" is required' });
         }
-
         const result = await logActivity(req.user.uid, 'search', { query });
         res.json({ success: true, data: result });
     } catch (error) {
@@ -29,20 +25,10 @@ router.post('/search', authenticateUser, async (req, res) => {
 /**
  * POST /api/activity/play
  * Record a song played event.
- *
- * Body: {
- *   songId: string,
- *   songName: string,
- *   artist: string,
- *   language?: string,
- *   genre?: string,
- *   duration?: number     // seconds the user listened
- * }
  */
 router.post('/play', authenticateUser, async (req, res) => {
     try {
-        const { songId, songName, artist, language, genre, duration } = req.body;
-
+        const { songId, songName, artist, language, genre, duration, totalDuration } = req.body;
         if (!songId) {
             return res.status(400).json({ error: '"songId" is required' });
         }
@@ -53,6 +39,7 @@ router.post('/play', authenticateUser, async (req, res) => {
         if (language) payload.language = language;
         if (genre) payload.genre = genre;
         if (duration != null) payload.duration = Number(duration);
+        if (totalDuration != null) payload.totalDuration = Number(totalDuration);
 
         const result = await logActivity(req.user.uid, 'play', payload);
         res.json({ success: true, data: result });
@@ -65,20 +52,10 @@ router.post('/play', authenticateUser, async (req, res) => {
 /**
  * POST /api/activity/skip
  * Record a song skipped event.
- *
- * Body: {
- *   songId: string,
- *   songName: string,
- *   artist: string,
- *   language?: string,
- *   genre?: string,
- *   skipTime?: number     // seconds into the song when skipped
- * }
  */
 router.post('/skip', authenticateUser, async (req, res) => {
     try {
-        const { songId, songName, artist, language, genre, skipTime } = req.body;
-
+        const { songId, songName, artist, language, genre, skipTime, totalDuration } = req.body;
         if (!songId) {
             return res.status(400).json({ error: '"songId" is required' });
         }
@@ -89,6 +66,7 @@ router.post('/skip', authenticateUser, async (req, res) => {
         if (language) payload.language = language;
         if (genre) payload.genre = genre;
         if (skipTime != null) payload.skipTime = Number(skipTime);
+        if (totalDuration != null) payload.totalDuration = Number(totalDuration);
 
         const result = await logActivity(req.user.uid, 'skip', payload);
         res.json({ success: true, data: result });
@@ -101,16 +79,6 @@ router.post('/skip', authenticateUser, async (req, res) => {
 /**
  * POST /api/activity/search-click
  * Record which search result the user clicked.
- *
- * Body: {
- *   songId: string,
- *   songName?: string,
- *   artist?: string,
- *   language?: string,
- *   genre?: string,
- *   query?: string,
- *   position?: number
- * }
  */
 router.post('/search-click', authenticateUser, async (req, res) => {
     try {
@@ -137,11 +105,6 @@ router.post('/search-click', authenticateUser, async (req, res) => {
 
 /**
  * GET /api/activity/history
- * Get the user's recent activity history.
- *
- * Query params:
- *  - type: "search" | "play" | "skip" (optional)
- *  - limit: number (optional, default 50)
  */
 router.get('/history', authenticateUser, async (req, res) => {
     try {
