@@ -832,15 +832,28 @@ function resolvePopularityScore(song) {
 
 function mergeUniqueSongs(...songLists) {
     const merged = [];
-    const seen = new Set();
+    const seenIds = new Set();
+    const seenVibes = new Set(); // Stores canonicalTitle|primaryArtist
 
     for (const list of songLists) {
         const safeList = Array.isArray(list) ? list : [];
         for (const song of safeList) {
             if (!song || typeof song !== 'object') continue;
             const id = String(song?.id || '').trim();
-            if (!id || seen.has(id)) continue;
-            seen.add(id);
+            if (!id || seenIds.has(id)) continue;
+            
+            // Deduplicate by "vibe" (canonical title + artist)
+            const title = canonicalSongTitle(song.name || song.title || '');
+            const artists = extractArtistNames(song).map(normalizeText);
+            const primaryArtist = artists[0] || '';
+            const vibe = `${title}|${primaryArtist}`;
+            
+            // Only deduplicate by vibe if the title contains enough distinctive content 
+            // to avoid over-filtering generic terms, while still catching clear repeats.
+            if (vibe.length > 6 && seenVibes.has(vibe)) continue;
+
+            seenIds.add(id);
+            if (vibe.length > 6) seenVibes.add(vibe);
             merged.push(song);
         }
     }

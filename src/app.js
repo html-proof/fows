@@ -5,6 +5,7 @@ import saavnRoutes from './routes/saavn.js';
 import userRoutes from './routes/user.js';
 import activityRoutes from './routes/activity.js';
 import recommendationRoutes from './routes/recommendations.js';
+import playlistImportRoutes from './routes/playlistImport.js';
 
 const app = express();
 
@@ -36,6 +37,7 @@ app.use('/api', saavnRoutes);
 app.use('/api/user', userRoutes);
 app.use('/api/activity', activityRoutes);
 app.use('/api/recommendations', recommendationRoutes);
+app.use('/api/playlist', playlistImportRoutes);
 
 // Lightweight health routes for keepalive probes.
 app.get('/healthz', (_req, res) => {
@@ -70,6 +72,8 @@ app.get('/', (_req, res) => {
                 'GET  /api/activity/history',
                 'GET  /api/recommendations',
                 'POST /api/recommendations/next',
+                'POST /api/playlist/import',
+                'POST /api/playlist/parse',
             ],
         },
     });
