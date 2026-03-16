@@ -373,7 +373,7 @@ function extractTracksFromSpotifyJson(data) {
 
         // Look for track-like objects: { name, artists: [...] } or { title, artist: "..." }
         const name = obj.name ?? obj.title;
-        const artists = obj.artists ?? obj.artist;
+        const artists = obj.artists ?? obj.artist ?? obj.subtitle;
 
         if (name && typeof name === 'string' && artists) {
             let artistName = '';
