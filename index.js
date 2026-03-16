@@ -28,8 +28,8 @@ async function selfPing() {
     }
 }
 
-app.listen(PORT, () => {
-    console.log(`🎵 Music Hub API server running on http://localhost:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🎵 Music Hub API server running on 0.0.0.0:${PORT}`);
 
     // Start self-ping only in production (when a public URL is available).
     if (KEEPALIVE_URL) {
