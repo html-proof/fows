@@ -1,5 +1,4 @@
 import { Router } from 'express';
-import { request } from 'undici';
 import {
     matchPlaylistItems,
     parsePlaylistText,
@@ -194,7 +193,7 @@ async function fetchPageHtml(url) {
     const timeout = setTimeout(() => controller.abort(), SCRAPE_TIMEOUT_MS);
 
     try {
-        const { statusCode, body, headers } = await request(url, {
+        const response = await fetch(url, {
             signal: controller.signal,
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -203,14 +202,14 @@ async function fetchPageHtml(url) {
                 'Cache-Control': 'no-cache',
                 'Pragma': 'no-cache',
             },
-            maxRedirections: 5,
+            redirect: 'follow',
         });
 
-        if (statusCode !== 200) {
-            throw new Error(`HTTP ${statusCode}`);
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
         }
 
-        let html = await body.text();
+        let html = await response.text();
 
         // If we hit a redirect that points to a spotify.com URL from a spotify.link,
         // and it's not and embed URL, try to fetch the embed version instead.
