@@ -451,7 +451,7 @@ function normalizeForSimilarity(value) {
         .trim();
 }
 
-function unescapeHtml(text) {
+export function unescapeHtml(text) {
     if (!text) return '';
     return text
         .replace(/&amp;/g, '&')
