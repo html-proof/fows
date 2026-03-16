@@ -1,7 +1,7 @@
 import { searchSongsSmart } from './saavnApi.js';
 
-const MATCH_CONCURRENCY = 20;
-const MATCH_TIMEOUT_MS = 3000;
+const MATCH_CONCURRENCY = 10;
+const MATCH_TIMEOUT_MS = 6000;
 const MIN_FUZZY_SIMILARITY = 0.45;
 
 /**
@@ -79,15 +79,19 @@ async function matchSingleItem(item, { preferredLanguages }) {
                     preferredLanguages,
                 }),
                 new Promise((_, reject) =>
-                    setTimeout(() => reject(new Error('Match timeout')), 1500)
+                    setTimeout(() => reject(new Error('Match timeout')), MATCH_TIMEOUT_MS)
                 ),
             ]);
 
-            if (!Array.isArray(songs) || songs.length === 0) continue;
+            if (!Array.isArray(songs) || songs.length === 0) {
+                continue;
+            }
 
             const best = pickBestMatch(songs, title, artist);
-            if (best) return best;
-        } catch (_error) {
+            if (best) {
+                return best;
+            }
+        } catch (error) {
             // Try next query variant
         }
     }
@@ -112,35 +116,61 @@ function buildSearchQueries(title, artist) {
         push(`${title} ${artist}`);
     }
 
+    // Secondary: "title firstArtist" (if multiple artists)
+    if (artist && artist.includes(',')) {
+        const firstArtist = artist.split(',')[0].trim();
+        if (firstArtist) push(`${title} ${firstArtist}`);
+    }
+
     // Just title
     push(title);
 
-    // Title without parenthetical info (e.g. "feat." or "remix")
-    const cleaned = title
-        .replace(/\s*[\(\[].*?[\)\]]\s*/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-    if (cleaned && cleaned !== title) {
-        if (artist) push(`${cleaned} ${artist}`);
-        push(cleaned);
+    // Drops " - From ..." or similar noise common in various music platforms
+    const noiseRemovals = [
+        /\s*-\s*from\s+.*$/i,
+        /\s*-\s*original\s+motion\s+picture\s+soundtrack\s*$/i,
+        /\s*-\s*remastered\s*$/i,
+        /\s*-\s*remix\s*$/i,
+        /\s*-\s*single\s+version\s*$/i,
+        /\s*[\(\[].*?[\)\]]\s*/g,
+    ];
+
+    let queryTitle = title;
+    for (const pattern of noiseRemovals) {
+        queryTitle = queryTitle.replace(pattern, ' ');
+    }
+    queryTitle = queryTitle.replace(/\s+/g, ' ').trim();
+
+    if (queryTitle && queryTitle !== title) {
+        if (artist) push(`${queryTitle} ${artist}`);
+        const firstArtist = artist && artist.includes(',') ? artist.split(',')[0].trim() : artist;
+        if (firstArtist && firstArtist !== artist) push(`${queryTitle} ${firstArtist}`);
+        push(queryTitle);
     }
 
-    return queries.slice(0, 3);
+    // Fallback: search just first 3 words of title if it's long
+    const words = title.split(/\s+/);
+    if (words.length > 5) {
+        const shortTitle = words.slice(0, 3).join(' ');
+        if (artist) push(`${shortTitle} ${artist}`);
+    }
+
+    return queries.slice(0, 5); // Allow more variants
 }
 
 /**
  * Pick the best match from search results for a given title + artist.
  */
 function pickBestMatch(songs, targetTitle, targetArtist) {
-    const normalizedTitle = normalize(targetTitle);
-    const normalizedArtist = normalize(targetArtist);
+    const normalizedTitle = normalizeForSimilarity(targetTitle);
+    const normalizedArtist = normalizeForSimilarity(targetArtist);
 
     let bestSong = null;
     let bestScore = -1;
 
     for (const song of songs) {
-        const songName = normalize(song?.name ?? song?.title ?? '');
-        const songArtist = normalize(
+        const songName = normalizeForSimilarity(song?.name ?? song?.title ?? '');
+        const songArtist = normalizeForSimilarity(
             song?.primaryArtists ??
             (Array.isArray(song?.artists?.primary)
                 ? song.artists.primary.map(a => a?.name ?? '').join(' ')
@@ -252,22 +282,50 @@ export function parseSpotifyEmbedHtml(html) {
     const items = [];
 
     try {
-        // Look for track data in the initial state / resource JSON
-        const jsonMatches = html.match(/<script[^>]*type="application\/json"[^>]*>(.*?)<\/script>/gs);
-        if (jsonMatches) {
-            for (const match of jsonMatches) {
-                const jsonContent = match.replace(/<\/?script[^>]*>/g, '');
-                try {
-                    const data = JSON.parse(jsonContent);
-                    const extracted = extractTracksFromSpotifyJson(data);
-                    if (extracted.length > 0) {
-                        items.push(...extracted);
-                    }
-                } catch (_e) { /* not JSON, skip */ }
+        // Look for track data in the initial state / resource JSON / JSON-LD / NEXT_DATA
+        const jsonMatches = html.match(/<script[^>]*type="application\/(?:ld\+)?json"[^>]*>(.*?)<\/script>/gs)
+            ?? [];
+        const nextDataMatches = html.match(/<script id="__NEXT_DATA__"[^>]*>(.*?)<\/script>/gs)
+            ?? [];
+        
+        const allJsonBlocks = [...jsonMatches, ...nextDataMatches];
+
+        for (const match of allJsonBlocks) {
+            const jsonContent = match.replace(/<\/?script[^>]*>/gs, '');
+            try {
+                const data = JSON.parse(jsonContent);
+                const extracted = extractTracksFromSpotifyJson(data);
+                if (extracted.length > 0) {
+                    items.push(...extracted);
+                }
+            } catch (_e) { /* not JSON, skip */ }
+        }
+
+        // Fallback: Scraping from the HTML structure (Spotify embed uses h3 for title and h4 for artist)
+        const htmlTracks = [];
+        const trackRegex = /<h3[^>]*>(.*?)<\/h3>\s*<h4[^>]*>(.*?)<\/h4>/gs;
+        let match;
+        while ((match = trackRegex.exec(html)) !== null) {
+            const title = unescapeHtml(match[1].replace(/<[^>]+>/g, '').trim());
+            const artist = unescapeHtml(match[2].replace(/<[^>]+>/g, '').trim());
+            if (title && !title.includes('Spotify')) {
+                htmlTracks.push({ title, artist });
+            }
+        }
+        
+        if (htmlTracks.length > items.length) {
+            // Deduplicate and merge
+            const seen = new Set(items.map(i => `${i.title.toLowerCase()}|${i.artist.toLowerCase()}`));
+            for (const track of htmlTracks) {
+                const key = `${track.title.toLowerCase()}|${track.artist.toLowerCase()}`;
+                if (!seen.has(key)) {
+                    items.push(track);
+                    seen.add(key);
+                }
             }
         }
 
-        // Fallback: look for track info in meta tags
+        // Final Fallback: look for track info in meta tags
         if (items.length === 0) {
             const titleMatches = html.match(/content="([^"]+?)(?:\s+by\s+|\s*[-–]\s*)([^"]+?)"/g);
             if (titleMatches) {
@@ -289,6 +347,23 @@ export function parseSpotifyEmbedHtml(html) {
 function extractTracksFromSpotifyJson(data) {
     const items = [];
 
+    // Case 1: Standard JSON-LD
+    if (data?.['@type'] === 'MusicPlaylist' || data?.['@type'] === 'MusicAlbum' || data?.['@type'] === 'MusicRecording') {
+        const tracks = data.track ?? data.tracks ?? (data?.['@type'] === 'MusicRecording' ? [data] : []);
+        if (Array.isArray(tracks)) {
+            for (const t of tracks) {
+                const title = t.name ?? t.title;
+                const artist = t.byArtist?.name ?? t.artist?.name ?? '';
+                if (title) items.push({ 
+                    title: unescapeHtml(String(title).trim()), 
+                    artist: unescapeHtml(String(artist).trim()) 
+                });
+            }
+        }
+        if (items.length > 0) return items;
+    }
+
+    // Case 2: Deep walk for track-like objects
     function walk(obj) {
         if (!obj || typeof obj !== 'object') return;
         if (Array.isArray(obj)) {
@@ -296,10 +371,11 @@ function extractTracksFromSpotifyJson(data) {
             return;
         }
 
-        // Look for track-like objects
+        // Look for track-like objects: { name, artists: [...] } or { title, artist: "..." }
         const name = obj.name ?? obj.title;
         const artists = obj.artists ?? obj.artist;
-        if (name && artists) {
+
+        if (name && typeof name === 'string' && artists) {
             let artistName = '';
             if (typeof artists === 'string') {
                 artistName = artists;
@@ -308,15 +384,39 @@ function extractTracksFromSpotifyJson(data) {
                     .map(a => (typeof a === 'string' ? a : a?.name ?? ''))
                     .filter(Boolean)
                     .join(', ');
+            } else if (typeof artists === 'object' && artists.name) {
+                artistName = artists.name;
             }
 
-            if (name && typeof name === 'string') {
-                items.push({ title: name.trim(), artist: artistName.trim() });
+            if (name.length > 0) {
+                items.push({ 
+                    title: unescapeHtml(name.trim()), 
+                    artist: unescapeHtml(artistName.trim()) 
+                });
             }
         }
 
-        for (const value of Object.values(obj)) {
-            walk(value);
+        // Specifically look for track lists in Spotify's internal structures
+        if (obj.trackList && Array.isArray(obj.trackList)) {
+            walk(obj.trackList);
+        }
+        if (obj.items && Array.isArray(obj.items)) {
+            walk(obj.items);
+        }
+        if (obj.tracks && typeof obj.tracks === 'object') {
+            walk(obj.tracks);
+        }
+
+        // Avoid infinite recursion by checking strictly for interesting keys
+        // or just walking everything if it's small.
+        for (const key of Object.keys(obj)) {
+            const val = obj[key];
+            if (val && typeof val === 'object') {
+                // Heuristic: only dive into keys that likely contain music data
+                if (['data', 'resources', 'track', 'tracks', 'items', 'pageProps', 'state', 'content', 'entity'].includes(key)) {
+                    walk(val);
+                }
+            }
         }
     }
 
@@ -339,6 +439,30 @@ function normalize(value) {
         .toLowerCase()
         .replace(/\s+/g, ' ')
         .trim();
+}
+
+/**
+ * More aggressive normalization for similarity: removes punctuation.
+ */
+function normalizeForSimilarity(value) {
+    return normalize(value)
+        .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function unescapeHtml(text) {
+    if (!text) return '';
+    return text
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#039;/g, "'")
+        .replace(/&apos;/g, "'")
+        .replace(/&ndash;/g, '-')
+        .replace(/&mdash;/g, '-')
+        .replace(/&bull;/g, '•');
 }
 
 /**

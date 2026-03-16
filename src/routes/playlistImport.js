@@ -4,6 +4,7 @@ import {
     matchPlaylistItems,
     parsePlaylistText,
     parseSpotifyEmbedHtml,
+    unescapeHtml,
 } from '../services/playlistMatcher.js';
 
 const router = Router();
@@ -141,24 +142,42 @@ router.post('/parse', async (req, res) => {
  * Fetch and parse a playlist URL (Spotify, YouTube, or generic).
  */
 async function parsePlaylistUrl(url) {
-    const normalizedUrl = String(url ?? '').trim();
+    let normalizedUrl = String(url ?? '').trim();
     if (!normalizedUrl) {
         return { items: [], name: '' };
     }
 
     try {
+        // Spotify: handle shortened links (spotify.link) and ensuring embed format
+        // Use embed format where possible as it's cleaner for scraping
+        if (normalizedUrl.includes('spotify.link/') || 
+           (normalizedUrl.includes('spotify.com/') && !normalizedUrl.includes('/embed/'))) {
+            
+            // If it's a standard open.spotify.com URL, convert to embed instantly
+            if (normalizedUrl.includes('open.spotify.com/')) {
+                normalizedUrl = normalizedUrl.replace('open.spotify.com/', 'open.spotify.com/embed/');
+            }
+            // For spotify.link, we'll follow the redirect first, then handle it
+        }
+
         const html = await fetchPageHtml(normalizedUrl);
 
         // Detect source and parse accordingly
-        if (normalizedUrl.includes('spotify.com')) {
+        // Check URL or HTML content for clues
+        const isSpotify = normalizedUrl.includes('spotify.com') || 
+                         normalizedUrl.includes('spotify.link') || 
+                         html.includes('spotify-embed') ||
+                         html.includes('spotify.com');
+
+        if (isSpotify) {
             return parseSpotifyPage(html, normalizedUrl);
         }
 
-        if (normalizedUrl.includes('youtube.com') || normalizedUrl.includes('youtu.be')) {
+        if (normalizedUrl.includes('youtube.com') || normalizedUrl.includes('youtu.be') || html.includes('youtube.com')) {
             return parseYouTubePage(html);
         }
 
-        if (normalizedUrl.includes('music.apple.com')) {
+        if (normalizedUrl.includes('music.apple.com') || html.includes('apple.com/apple-music')) {
             return parseAppleMusicPage(html);
         }
 
@@ -175,11 +194,14 @@ async function fetchPageHtml(url) {
     const timeout = setTimeout(() => controller.abort(), SCRAPE_TIMEOUT_MS);
 
     try {
-        const { statusCode, body } = await request(url, {
+        const { statusCode, body, headers } = await request(url, {
             signal: controller.signal,
             headers: {
-                'User-Agent': 'Mozilla/5.0 (compatible; MusicHubBot/1.0)',
-                'Accept': 'text/html,application/xhtml+xml',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Cache-Control': 'no-cache',
+                'Pragma': 'no-cache',
             },
             maxRedirections: 5,
         });
@@ -188,7 +210,19 @@ async function fetchPageHtml(url) {
             throw new Error(`HTTP ${statusCode}`);
         }
 
-        return await body.text();
+        let html = await body.text();
+
+        // If we hit a redirect that points to a spotify.com URL from a spotify.link,
+        // and it's not and embed URL, try to fetch the embed version instead.
+        if (url.includes('spotify.link') && html.length < 500 && html.includes('url=https://open.spotify.com')) {
+            const metaMatch = html.match(/url=(https:\/\/open\.spotify\.com\/[^"]+)/i);
+            if (metaMatch) {
+                const target = metaMatch[1].replace('open.spotify.com/', 'open.spotify.com/embed/');
+                return fetchPageHtml(target);
+            }
+        }
+
+        return html;
     } finally {
         clearTimeout(timeout);
     }
@@ -200,7 +234,7 @@ function parseSpotifyPage(html, url) {
     // Try to get playlist name from og:title
     const ogTitle = html.match(/<meta[^>]*property="og:title"[^>]*content="([^"]+)"/i);
     if (ogTitle) {
-        name = ogTitle[1].trim();
+        name = unescapeHtml(ogTitle[1].trim());
     }
 
     // Try JSON-LD or initial state for track data
@@ -230,8 +264,9 @@ function parseYouTubePage(html) {
     }
 
     // YouTube embeds initial data as JSON in a script tag
-    const ytInitialData = html.match(/var ytInitialData\s*=\s*(\{.+?\});/s)
-        ?? html.match(/window\["ytInitialData"\]\s*=\s*(\{.+?\});/s);
+    const ytInitialData = html.match(/(?:var|window\[['"]ytInitialData['"]\])\s*=\s*(\{.+?\});/s)
+        ?? html.match(/ytInitialData\s*=\s*(\{.+?\});/s)
+        ?? html.match(/>window\["ytInitialData"\]\s*=\s*(\{.+?\});<\/script>/s);
 
     if (ytInitialData) {
         try {
@@ -239,6 +274,14 @@ function parseYouTubePage(html) {
             const tracks = extractYouTubePlaylistTracks(data);
             items.push(...tracks);
         } catch (_e) { /* JSON parse failed */ }
+    }
+
+    // Try to handle YouTube Music specifically if it's a song
+    if (items.length === 0) {
+        const musicMatch = html.match(/"videoDetails"\s*:\s*\{[^}]*"title"\s*:\s*"([^"]+)"[^}]*"author"\s*:\s*"([^"]+)"/);
+        if (musicMatch) {
+            items.push({ title: musicMatch[1], artist: musicMatch[2] });
+        }
     }
 
     // Fallback: look for video titles in the HTML
@@ -313,11 +356,11 @@ function parseAppleMusicPage(html) {
             const jsonContent = match.replace(/<\/?script[^>]*>/g, '');
             try {
                 const data = JSON.parse(jsonContent);
-                const tracks = data?.track ?? data?.tracks ?? [];
+                const tracks = data?.track ?? data?.tracks ?? (data?.['@type'] === 'MusicRecording' ? [data] : []);
                 if (Array.isArray(tracks)) {
                     for (const track of tracks) {
                         const title = track?.name ?? '';
-                        const artist = track?.byArtist?.name ?? '';
+                        const artist = track?.byArtist?.name ?? track?.artist?.name ?? '';
                         if (title) items.push({ title, artist });
                     }
                 }
