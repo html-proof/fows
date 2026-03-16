@@ -29,6 +29,11 @@ def health() -> Dict[str, str]:
     return {"status": "ok", "service": "ml-service"}
 
 
+@app.get("/")
+def root() -> Dict[str, str]:
+    return {"message": "ML Service is healthy"}
+
+
 def verify_api_key(request: Request, x_api_key: str | None = Header(default=None)) -> None:
     if API_KEY:
         if x_api_key != API_KEY:
