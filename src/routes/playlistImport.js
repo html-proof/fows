@@ -150,13 +150,9 @@ async function parsePlaylistUrl(url) {
         // Spotify: handle shortened links (spotify.link) and ensuring embed format
         // Use embed format where possible as it's cleaner for scraping
         if (normalizedUrl.includes('spotify.link/') || 
-           (normalizedUrl.includes('spotify.com/') && !normalizedUrl.includes('/embed/'))) {
-            
-            // If it's a standard open.spotify.com URL, convert to embed instantly
-            if (normalizedUrl.includes('open.spotify.com/')) {
-                normalizedUrl = normalizedUrl.replace('open.spotify.com/', 'open.spotify.com/embed/');
-            }
-            // For spotify.link, we'll follow the redirect first, then handle it
+           (normalizedUrl.includes('spotify.com/') && normalizedUrl.includes('/playlist/'))) {
+            // Keep the original URL if it's a playlist to avoid embed caps
+            // For spotify.link, we'll follow the redirect first
         }
 
         const html = await fetchPageHtml(normalizedUrl);
