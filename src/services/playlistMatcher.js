@@ -333,8 +333,12 @@ export function parseSpotifyEmbedHtml(html) {
                     const contentMatch = match.match(/content="(.+?)"/);
                     if (contentMatch) {
                         const line = contentMatch[1];
+                        if (line.includes('viewport') || line.includes('device-width')) continue;
                         const parsed = parsePlaylistLine(line);
-                        if (parsed.title) items.push(parsed);
+                        // Require both title and artist for meta tag fallback to ensure it's a song
+                        if (parsed.title && parsed.artist) {
+                            items.push(parsed);
+                        }
                     }
                 }
             }
@@ -388,7 +392,10 @@ function extractTracksFromSpotifyJson(data) {
                 artistName = artists.name;
             }
 
-            if (name.length > 0) {
+            if (name.length > 0 && artistName.length > 0 && 
+                !name.toLowerCase().includes('viewport') && 
+                !name.toLowerCase().includes('device-width') &&
+                !artistName.toLowerCase().includes('viewport')) {
                 items.push({ 
                     title: unescapeHtml(name.trim()), 
                     artist: unescapeHtml(artistName.trim()) 
@@ -413,7 +420,7 @@ function extractTracksFromSpotifyJson(data) {
             const val = obj[key];
             if (val && typeof val === 'object') {
                 // Heuristic: only dive into keys that likely contain music data
-                if (['data', 'resources', 'track', 'tracks', 'items', 'pageProps', 'state', 'content', 'entity'].includes(key)) {
+                if (['data', 'resources', 'track', 'tracks', 'items', 'pageProps', 'state', 'content', 'entity', 'trackList', 'tracklist', 'playlistData', 'body'].includes(key)) {
                     walk(val);
                 }
             }

@@ -9,7 +9,7 @@ import {
 const router = Router();
 
 const MAX_ITEMS = 1000000;
-const SCRAPE_TIMEOUT_MS = 15000;
+const SCRAPE_TIMEOUT_MS = 25000;
 
 /**
  * POST /api/playlist/import
@@ -186,8 +186,7 @@ async function parsePlaylistUrl(url) {
 
 async function fetchPageHtml(url) {
     let lastError;
-    const maxRetries = 3;
-
+    const maxRetries = 2;
     for (let i = 0; i < maxRetries; i++) {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), SCRAPE_TIMEOUT_MS);
