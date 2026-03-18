@@ -3,13 +3,14 @@ import {
     matchPlaylistItems,
     parsePlaylistText,
     parseSpotifyEmbedHtml,
+    sanitizePlaylistItems,
     unescapeHtml,
 } from '../services/playlistMatcher.js';
 
 const router = Router();
 
 const MAX_ITEMS = 1000000;
-const SCRAPE_TIMEOUT_MS = 25000;
+const SCRAPE_TIMEOUT_MS = 7000;
 
 /**
  * POST /api/playlist/import
@@ -43,6 +44,7 @@ router.post('/import', async (req, res) => {
         }
 
         let items = [];
+        let parseError = '';
         let resolvedPlaylistName = playlistName || 'Imported Playlist';
 
         if (type === 'text') {
@@ -50,6 +52,7 @@ router.post('/import', async (req, res) => {
         } else if (type === 'url') {
             const parsed = await parsePlaylistUrl(content);
             items = parsed.items;
+            parseError = parsed.error || '';
             if (parsed.name && !playlistName) {
                 resolvedPlaylistName = parsed.name;
             }
@@ -63,7 +66,7 @@ router.post('/import', async (req, res) => {
         if (items.length === 0) {
             return res.json({
                 success: false,
-                error: 'No songs could be parsed from the input.',
+                error: parseError || 'No songs could be parsed from the input.',
                 playlistName: resolvedPlaylistName,
                 matched: [],
                 unmatched: [],
@@ -114,6 +117,7 @@ router.post('/parse', async (req, res) => {
 
         let items = [];
         let name = '';
+        let parseError = '';
 
         if (type === 'text') {
             items = parsePlaylistText(content);
@@ -121,6 +125,21 @@ router.post('/parse', async (req, res) => {
             const parsed = await parsePlaylistUrl(content);
             items = parsed.items;
             name = parsed.name;
+            parseError = parsed.error || '';
+        } else {
+            return res.status(400).json({
+                success: false,
+                error: 'Invalid type. Must be "text" or "url".',
+            });
+        }
+
+        if (items.length === 0 && parseError) {
+            return res.json({
+                success: false,
+                name: name || '',
+                items: [],
+                error: parseError,
+            });
         }
 
         return res.json({
@@ -141,52 +160,89 @@ router.post('/parse', async (req, res) => {
  * Fetch and parse a playlist URL (Spotify, YouTube, or generic).
  */
 async function parsePlaylistUrl(url) {
-    let normalizedUrl = String(url ?? '').trim();
+    const normalizedUrl = normalizeIncomingUrl(url);
     if (!normalizedUrl) {
-        return { items: [], name: '' };
+        return {
+            items: [],
+            name: '',
+            error: 'Please enter a valid playlist URL.',
+        };
     }
 
     try {
-        // Spotify: handle shortened links (spotify.link) and ensuring embed format
-        // Use embed format where possible as it's cleaner for scraping
-        if (normalizedUrl.includes('spotify.link/') || 
-           (normalizedUrl.includes('spotify.com/') && normalizedUrl.includes('/playlist/'))) {
-            // Keep the original URL if it's a playlist to avoid embed caps
-            // For spotify.link, we'll follow the redirect first
-        }
-
         const html = await fetchPageHtml(normalizedUrl);
+        const lowerUrl = normalizedUrl.toLowerCase();
+        const lowerHtml = html.toLowerCase();
 
-        // Detect source and parse accordingly
-        // Check URL or HTML content for clues
-        const isSpotify = normalizedUrl.includes('spotify.com') || 
-                         normalizedUrl.includes('spotify.link') || 
-                         html.includes('spotify-embed') ||
-                         html.includes('spotify.com');
+        const isSpotify = lowerUrl.includes('spotify.com') ||
+            lowerUrl.includes('spotify.link') ||
+            lowerHtml.includes('spotify.com') ||
+            lowerHtml.includes('spotify-embed');
 
-        if (isSpotify) {
-            return parseSpotifyPage(html, normalizedUrl);
-        }
+        const isYouTube = lowerUrl.includes('youtube.com') ||
+            lowerUrl.includes('youtu.be') ||
+            lowerHtml.includes('youtube.com');
 
-        if (normalizedUrl.includes('youtube.com') || normalizedUrl.includes('youtu.be') || html.includes('youtube.com')) {
-            return parseYouTubePage(html);
-        }
+        const isAppleMusic = lowerUrl.includes('music.apple.com') ||
+            lowerHtml.includes('apple.com/apple-music');
 
-        if (normalizedUrl.includes('music.apple.com') || html.includes('apple.com/apple-music')) {
-            return parseAppleMusicPage(html);
-        }
+        const parsed = isSpotify
+            ? await parseSpotifyPage(html, normalizedUrl)
+            : isYouTube
+                ? parseYouTubePage(html)
+                : isAppleMusic
+                    ? parseAppleMusicPage(html)
+                    : parseGenericPage(html);
 
-        // Generic: try to extract anything useful
-        return parseGenericPage(html);
+        return {
+            items: sanitizePlaylistItems(parsed?.items),
+            name: parsed?.name || '',
+            error: parsed?.error || '',
+        };
     } catch (error) {
         console.error('URL parse failed:', error?.message);
-        return { items: [], name: '' };
+        return {
+            items: [],
+            name: '',
+            error: 'Failed to fetch playlist data from this URL.',
+        };
+    }
+}
+
+function normalizeIncomingUrl(rawUrl) {
+    let value = String(rawUrl ?? '').trim();
+    if (!value) return '';
+
+    value = value
+        .replace(/^<+|>+$/g, '')
+        .replace(/^["']+|["']+$/g, '')
+        .trim();
+
+    const spotifyUriMatch = value.match(/^spotify:playlist:([a-zA-Z0-9]+)$/i);
+    if (spotifyUriMatch) {
+        return `https://open.spotify.com/playlist/${spotifyUriMatch[1]}`;
+    }
+
+    if (!/^https?:\/\//i.test(value)) {
+        if (/^(open\.)?spotify\.com\//i.test(value) ||
+            /^spotify\.link\//i.test(value) ||
+            /^music\.apple\.com\//i.test(value) ||
+            /^(www\.)?(youtube\.com|youtu\.be)\//i.test(value) ||
+            /^[a-z0-9.-]+\.[a-z]{2,}\/\S+/i.test(value)) {
+            value = `https://${value.replace(/^\/+/, '')}`;
+        }
+    }
+
+    try {
+        return new URL(value).toString();
+    } catch (_error) {
+        return value;
     }
 }
 
 async function fetchPageHtml(url) {
     let lastError;
-    const maxRetries = 2;
+    const maxRetries = 1;
     for (let i = 0; i < maxRetries; i++) {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), SCRAPE_TIMEOUT_MS);
@@ -204,18 +260,23 @@ async function fetchPageHtml(url) {
                 redirect: 'follow',
             });
 
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}`);
+            const html = await response.text();
+            if (!html) {
+                throw new Error(`Empty response body (HTTP ${response.status})`);
             }
 
-            const html = await response.text();
+            if (!response.ok) {
+                console.warn(`Received HTTP ${response.status} from ${url}`);
+            }
 
             // Handle spotify.link redirection if returned as meta refresh
-            if (url.includes('spotify.link') && html.length < 500 && html.includes('url=https://open.spotify.com')) {
-                const metaMatch = html.match(/url=(https:\/\/open\.spotify\.com\/[^"]+)/i);
+            if (url.includes('spotify.link') && html.includes('open.spotify.com')) {
+                const metaMatch = html.match(/url\s*=\s*(https:\/\/open\.spotify\.com\/[^"'<>\\\s]+)/i);
                 if (metaMatch) {
-                    const target = metaMatch[1]; //.replace('open.spotify.com/', 'open.spotify.com/embed/');
-                    return fetchPageHtml(target);
+                    const target = metaMatch[1];
+                    if (target && target !== url) {
+                        return fetchPageHtml(target);
+                    }
                 }
             }
 
@@ -223,7 +284,6 @@ async function fetchPageHtml(url) {
         } catch (error) {
             lastError = error;
             console.warn(`Fetch attempt ${i + 1} failed for ${url}:`, error?.message);
-            // Wait 1s before next attempt (if not last)
             if (i < maxRetries - 1) {
                 await new Promise(resolve => setTimeout(resolve, 1000));
             }
@@ -232,28 +292,83 @@ async function fetchPageHtml(url) {
         }
     }
 
-    throw lastError;
+    throw lastError ?? new Error('Failed to fetch page');
 }
 
-function parseSpotifyPage(html, url) {
+function extractSpotifyPlaylistId(url, html = '') {
+    const urlMatch = String(url ?? '').match(/spotify\.com\/(?:embed\/)?playlist\/([a-zA-Z0-9]+)/i);
+    if (urlMatch?.[1]) return urlMatch[1];
+
+    const shortUrlMatch = String(url ?? '').match(/spotify\.link\/([a-zA-Z0-9]+)/i);
+    if (shortUrlMatch?.[1]) return shortUrlMatch[1];
+
+    const htmlMatch = String(html ?? '').match(/open\.spotify\.com\/playlist\/([a-zA-Z0-9]+)/i);
+    if (htmlMatch?.[1]) return htmlMatch[1];
+
+    return '';
+}
+
+function isSpotifyUnavailablePage(html) {
+    const lower = String(html ?? '').toLowerCase();
+    return lower.includes('page not found') ||
+        lower.includes('404') ||
+        lower.includes('this content is unavailable') ||
+        lower.includes('this playlist is private');
+}
+
+function extractMetaContent(html, key) {
+    const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const propertyPattern = new RegExp(`<meta[^>]*property=["']${escapedKey}["'][^>]*content=["']([^"']+)["']`, 'i');
+    const namePattern = new RegExp(`<meta[^>]*name=["']${escapedKey}["'][^>]*content=["']([^"']+)["']`, 'i');
+
+    const propertyMatch = html.match(propertyPattern);
+    if (propertyMatch?.[1]) return unescapeHtml(propertyMatch[1].trim());
+
+    const nameMatch = html.match(namePattern);
+    if (nameMatch?.[1]) return unescapeHtml(nameMatch[1].trim());
+
+    return '';
+}
+
+function toSpotifyEmbedUrl(playlistId) {
+    return `https://open.spotify.com/embed/playlist/${playlistId}`;
+}
+
+async function parseSpotifyPage(html, url) {
     let name = '';
+    let error = '';
 
     // Try to get playlist name from og:title
-    const ogTitle = html.match(/<meta[^>]*property="og:title"[^>]*content="([^"]+)"/i);
-    if (ogTitle) {
-        name = unescapeHtml(ogTitle[1].trim());
-    }
+    name = extractMetaContent(html, 'og:title') || extractMetaContent(html, 'twitter:title');
 
     // Try JSON-LD or initial state for track data
-    const items = parseSpotifyEmbedHtml(html);
+    let items = parseSpotifyEmbedHtml(html);
 
     // If direct parse failed, try the embed URL variant
     if (items.length === 0 && !url.includes('/embed/')) {
-        // We can't fetch embed in the same call, but return what we have
-        // The client can retry with the embed URL
+        const playlistId = extractSpotifyPlaylistId(url, html);
+        if (playlistId) {
+            try {
+                const embedHtml = await fetchPageHtml(toSpotifyEmbedUrl(playlistId));
+                if (!name) {
+                    name = extractMetaContent(embedHtml, 'og:title')
+                        || extractMetaContent(embedHtml, 'twitter:title');
+                }
+                items = parseSpotifyEmbedHtml(embedHtml);
+                if (items.length === 0 && isSpotifyUnavailablePage(embedHtml)) {
+                    error = 'This Spotify playlist is unavailable, private, or invalid.';
+                }
+            } catch (embedError) {
+                console.warn('Spotify embed fallback failed:', embedError?.message);
+            }
+        }
     }
 
-    return { items, name };
+    if (items.length === 0 && isSpotifyUnavailablePage(html)) {
+        error = error || 'This Spotify playlist is unavailable, private, or invalid.';
+    }
+
+    return { items: sanitizePlaylistItems(items), name, error };
 }
 
 function parseYouTubePage(html) {

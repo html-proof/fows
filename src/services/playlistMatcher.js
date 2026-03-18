@@ -3,6 +3,8 @@ import { searchSongsSmart } from './saavnApi.js';
 const MATCH_CONCURRENCY = 10;
 const MATCH_TIMEOUT_MS = 6000;
 const MIN_FUZZY_SIMILARITY = 0.45;
+const MAX_PARSED_TITLE_LENGTH = 180;
+const MAX_PARSED_ARTIST_LENGTH = 140;
 
 /**
  * Match a list of { title, artist } items to real songs via search.
@@ -234,7 +236,7 @@ export function parsePlaylistText(rawText) {
         .map(line => line.trim())
         .filter(line => line.length > 0 && !isHeaderLine(line));
 
-    return lines.map(parsePlaylistLine).filter(item => item.title);
+    return sanitizePlaylistItems(lines.map(parsePlaylistLine));
 }
 
 function parsePlaylistLine(line) {
@@ -345,7 +347,7 @@ export function parseSpotifyEmbedHtml(html) {
         }
     } catch (_e) { /* parsing failed */ }
 
-    return items;
+    return sanitizePlaylistItems(items);
 }
 
 function extractTracksFromSpotifyJson(data) {
@@ -429,17 +431,72 @@ function extractTracksFromSpotifyJson(data) {
 
     walk(data);
 
-    // Deduplicate by title+artist
-    const seen = new Set();
-    return items.filter(item => {
-        const key = `${normalize(item.title)}::${normalize(item.artist)}`;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-    });
+    return sanitizePlaylistItems(items);
 }
 
 // ─── Utility Functions ───────────────────────────────────────
+
+export function sanitizePlaylistItems(items, options = {}) {
+    const requireArtist = options?.requireArtist === true;
+    const safeItems = Array.isArray(items) ? items : [];
+    const seen = new Set();
+    const cleaned = [];
+
+    for (const item of safeItems) {
+        const title = cleanTrackField(item?.title, MAX_PARSED_TITLE_LENGTH);
+        const artist = cleanTrackField(item?.artist, MAX_PARSED_ARTIST_LENGTH);
+
+        if (!title) continue;
+        if (requireArtist && !artist) continue;
+        if (!isLikelySongText(title)) continue;
+        if (artist && !isLikelySongText(artist)) continue;
+
+        const key = `${normalize(title)}::${normalize(artist)}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        cleaned.push({ title, artist });
+    }
+
+    return cleaned;
+}
+
+function cleanTrackField(value, maxLength) {
+    const normalized = unescapeHtml(String(value ?? ''))
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    if (!normalized || normalized.length > maxLength) {
+        return '';
+    }
+
+    return normalized;
+}
+
+function isLikelySongText(value) {
+    const text = String(value ?? '').trim();
+    if (!text) return false;
+
+    const lower = text.toLowerCase();
+
+    // Reject obvious HTML/config metadata.
+    if (/device-width|initial-scale|maximum-scale|minimum-scale|user-scalable|viewport|charset=|x-ua-compatible/.test(lower)) {
+        return false;
+    }
+    if (/^https?:\/\//.test(lower) || /^www\./.test(lower)) return false;
+    if (lower.includes('page not found')) return false;
+
+    // Reject script-like payloads that occasionally leak from page parsing.
+    if (/[{};]/.test(text) || /(?:window|document|function)\s*[\.\(]/i.test(text)) {
+        return false;
+    }
+
+    // Reject key/value config blobs such as width=device-width...
+    const equalSigns = (text.match(/=/g) ?? []).length;
+    if (equalSigns >= 2) return false;
+
+    return true;
+}
 
 function normalize(value) {
     return String(value ?? '')
