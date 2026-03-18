@@ -1,18 +1,21 @@
 import 'dotenv/config';
 import app from './src/app.js';
+import { markShuttingDown } from './src/runtimeState.js';
 
 const PORT = process.env.PORT || 3000;
+const SHUTDOWN_TIMEOUT_MS = Number(process.env.SHUTDOWN_TIMEOUT_MS || 10_000);
 
-// ── Self-ping keepalive to prevent Render free tier from sleeping ──
-// Render sets RENDER_EXTERNAL_URL automatically for web services.
 const KEEPALIVE_URL =
     process.env.KEEPALIVE_URL ||
     (process.env.RENDER_EXTERNAL_URL
         ? `${process.env.RENDER_EXTERNAL_URL}/healthz`
         : '');
-const KEEPALIVE_INTERVAL_MS = Number(process.env.KEEPALIVE_INTERVAL_MS || 240_000); // 4 min
+const KEEPALIVE_INTERVAL_MS = Number(process.env.KEEPALIVE_INTERVAL_MS || 240_000);
 
 let keepaliveTimer = null;
+let initialKeepaliveTimeout = null;
+let shutdownInFlight = false;
+const sockets = new Set();
 
 async function selfPing() {
     if (!KEEPALIVE_URL) return;
@@ -28,25 +31,77 @@ async function selfPing() {
     }
 }
 
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🎵 Music Hub API server running on 0.0.0.0:${PORT}`);
+function clearKeepaliveTimers() {
+    if (keepaliveTimer) {
+        clearInterval(keepaliveTimer);
+        keepaliveTimer = null;
+    }
+    if (initialKeepaliveTimeout) {
+        clearTimeout(initialKeepaliveTimeout);
+        initialKeepaliveTimeout = null;
+    }
+}
 
-    // Start self-ping only in production (when a public URL is available).
+const server = app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Music Hub API server running on 0.0.0.0:${PORT}`);
+
     if (KEEPALIVE_URL) {
         console.log(
             `[keepalive] Pinging ${KEEPALIVE_URL} every ${KEEPALIVE_INTERVAL_MS / 1000}s`
         );
         keepaliveTimer = setInterval(selfPing, KEEPALIVE_INTERVAL_MS);
-        // First ping after a short delay to let the server fully boot.
-        setTimeout(selfPing, 5_000);
+        initialKeepaliveTimeout = setTimeout(selfPing, 5_000);
     }
 });
 
-// Graceful shutdown
+server.on('connection', socket => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+});
+
+async function shutdown(signal) {
+    if (shutdownInFlight) {
+        console.log(`[shutdown] ${signal} received while shutdown is already in progress`);
+        return;
+    }
+
+    shutdownInFlight = true;
+    console.log(`${signal} received, shutting down gracefully...`);
+    markShuttingDown();
+    clearKeepaliveTimers();
+
+    const forceShutdownTimer = setTimeout(() => {
+        console.warn(
+            `[shutdown] forcing connection close after ${SHUTDOWN_TIMEOUT_MS}ms`
+        );
+        if (typeof server.closeIdleConnections === 'function') {
+            server.closeIdleConnections();
+        }
+        if (typeof server.closeAllConnections === 'function') {
+            server.closeAllConnections();
+        }
+        for (const socket of sockets) {
+            socket.destroy();
+        }
+        process.exit(0);
+    }, SHUTDOWN_TIMEOUT_MS);
+
+    forceShutdownTimer.unref?.();
+
+    server.close(err => {
+        clearTimeout(forceShutdownTimer);
+        if (err) {
+            console.error(`[shutdown] server close failed: ${err.message}`);
+            process.exit(1);
+            return;
+        }
+        console.log('[shutdown] HTTP server closed cleanly');
+        process.exit(0);
+    });
+}
+
 for (const signal of ['SIGINT', 'SIGTERM']) {
     process.on(signal, () => {
-        console.log(`${signal} received, shutting down...`);
-        if (keepaliveTimer) clearInterval(keepaliveTimer);
-        process.exit(0);
+        void shutdown(signal);
     });
 }

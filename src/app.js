@@ -6,6 +6,7 @@ import userRoutes from './routes/user.js';
 import activityRoutes from './routes/activity.js';
 import recommendationRoutes from './routes/recommendations.js';
 import playlistImportRoutes from './routes/playlistImport.js';
+import { isShuttingDown } from './runtimeState.js';
 
 const app = express();
 
@@ -41,8 +42,10 @@ app.use('/api/playlist', playlistImportRoutes);
 
 // Lightweight health routes for keepalive probes.
 app.get('/healthz', (_req, res) => {
-    res.status(200).json({
-        ok: true,
+    const shuttingDown = isShuttingDown();
+    res.status(shuttingDown ? 503 : 200).json({
+        ok: !shuttingDown,
+        state: shuttingDown ? 'shutting_down' : 'ok',
         service: 'music-hub-backend',
         timestamp: new Date().toISOString(),
     });
