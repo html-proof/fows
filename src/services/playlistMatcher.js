@@ -281,7 +281,7 @@ function isHeaderLine(line) {
  * contains track info in the initial HTML / JSON-LD.
  */
 export function parseSpotifyEmbedHtml(html) {
-    const items = [];
+    let bestFallbackItems = [];
 
     try {
         // Look for track data in the initial state / resource JSON / JSON-LD / NEXT_DATA
@@ -296,9 +296,14 @@ export function parseSpotifyEmbedHtml(html) {
             const jsonContent = match.replace(/<\/?script[^>]*>/gs, '');
             try {
                 const data = JSON.parse(jsonContent);
+                const orderedTracks = extractOrderedSpotifyTracks(data);
+                if (orderedTracks.length > 0) {
+                    return sanitizePlaylistItems(orderedTracks, { requireArtist: true });
+                }
+
                 const extracted = extractTracksFromSpotifyJson(data);
-                if (extracted.length > 0) {
-                    items.push(...extracted);
+                if (extracted.length > bestFallbackItems.length) {
+                    bestFallbackItems = extracted;
                 }
             } catch (_e) { /* not JSON, skip */ }
         }
@@ -315,20 +320,12 @@ export function parseSpotifyEmbedHtml(html) {
             }
         }
         
-        if (htmlTracks.length > items.length) {
-            // Deduplicate and merge
-            const seen = new Set(items.map(i => `${i.title.toLowerCase()}|${i.artist.toLowerCase()}`));
-            for (const track of htmlTracks) {
-                const key = `${track.title.toLowerCase()}|${track.artist.toLowerCase()}`;
-                if (!seen.has(key)) {
-                    items.push(track);
-                    seen.add(key);
-                }
-            }
+        if (htmlTracks.length > bestFallbackItems.length) {
+            return sanitizePlaylistItems(htmlTracks, { requireArtist: true });
         }
 
         // Final Fallback: look for track info in meta tags
-        if (items.length === 0) {
+        if (bestFallbackItems.length === 0) {
             const titleMatches = html.match(/content="([^"]+?)(?:\s+by\s+|\s*[-–]\s*)([^"]+?)"/g);
             if (titleMatches) {
                 for (const match of titleMatches) {
@@ -339,7 +336,7 @@ export function parseSpotifyEmbedHtml(html) {
                         const parsed = parsePlaylistLine(line);
                         // Require both title and artist for meta tag fallback to ensure it's a song
                         if (parsed.title && parsed.artist) {
-                            items.push(parsed);
+                            bestFallbackItems.push(parsed);
                         }
                     }
                 }
@@ -347,7 +344,10 @@ export function parseSpotifyEmbedHtml(html) {
         }
     } catch (_e) { /* parsing failed */ }
 
-    return sanitizePlaylistItems(items);
+    return sanitizePlaylistItems(bestFallbackItems, {
+        dedupe: true,
+        requireArtist: true,
+    });
 }
 
 function extractTracksFromSpotifyJson(data) {
@@ -366,7 +366,12 @@ function extractTracksFromSpotifyJson(data) {
                 });
             }
         }
-        if (items.length > 0) return items;
+        if (items.length > 0) {
+            return sanitizePlaylistItems(items, {
+                dedupe: true,
+                requireArtist: true,
+            });
+        }
     }
 
     // Case 2: Deep walk for track-like objects
@@ -431,15 +436,75 @@ function extractTracksFromSpotifyJson(data) {
 
     walk(data);
 
-    return sanitizePlaylistItems(items);
+    return sanitizePlaylistItems(items, {
+        dedupe: true,
+        requireArtist: true,
+    });
 }
 
 // ─── Utility Functions ───────────────────────────────────────
 
+function extractOrderedSpotifyTracks(data) {
+    let bestTrackList = [];
+
+    function walk(obj) {
+        if (!obj || typeof obj !== 'object') return;
+
+        if (Array.isArray(obj)) {
+            for (const item of obj) walk(item);
+            return;
+        }
+
+        for (const candidate of [obj.trackList, obj.tracklist]) {
+            if (!Array.isArray(candidate)) continue;
+
+            const parsed = candidate
+                .map(parseSpotifyTrackItem)
+                .filter(Boolean);
+
+            if (parsed.length > bestTrackList.length) {
+                bestTrackList = parsed;
+            }
+        }
+
+        for (const value of Object.values(obj)) {
+            if (value && typeof value === 'object') {
+                walk(value);
+            }
+        }
+    }
+
+    walk(data);
+    return bestTrackList;
+}
+
+function parseSpotifyTrackItem(item) {
+    if (!item || typeof item !== 'object') return null;
+
+    const title = item.title ?? item.name ?? '';
+    const artist = item.subtitle
+        ?? item.artist
+        ?? (Array.isArray(item.artists)
+            ? item.artists
+                .map(artistItem => typeof artistItem === 'string'
+                    ? artistItem
+                    : artistItem?.name ?? '')
+                .filter(Boolean)
+                .join(', ')
+            : '');
+
+    if (!title || !artist) return null;
+    return {
+        title: unescapeHtml(String(title).trim()),
+        artist: unescapeHtml(String(artist).trim()),
+    };
+}
+
 export function sanitizePlaylistItems(items, options = {}) {
     const requireArtist = options?.requireArtist === true;
+    const dedupe = options?.dedupe === true;
     const safeItems = Array.isArray(items) ? items : [];
-    const seen = new Set();
+    const seen = dedupe ? new Set() : null;
     const cleaned = [];
 
     for (const item of safeItems) {
@@ -451,9 +516,11 @@ export function sanitizePlaylistItems(items, options = {}) {
         if (!isLikelySongText(title)) continue;
         if (artist && !isLikelySongText(artist)) continue;
 
-        const key = `${normalize(title)}::${normalize(artist)}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
+        if (seen) {
+            const key = `${normalize(title)}::${normalize(artist)}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+        }
         cleaned.push({ title, artist });
     }
 
