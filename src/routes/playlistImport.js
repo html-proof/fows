@@ -8,7 +8,7 @@ import {
 
 const router = Router();
 
-const MAX_ITEMS = 200;
+const MAX_ITEMS = 1000000;
 const SCRAPE_TIMEOUT_MS = 8000;
 
 /**
