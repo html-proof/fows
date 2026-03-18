@@ -9,7 +9,7 @@ import {
 const router = Router();
 
 const MAX_ITEMS = 1000000;
-const SCRAPE_TIMEOUT_MS = 8000;
+const SCRAPE_TIMEOUT_MS = 15000;
 
 /**
  * POST /api/playlist/import
@@ -185,42 +185,55 @@ async function parsePlaylistUrl(url) {
 }
 
 async function fetchPageHtml(url) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), SCRAPE_TIMEOUT_MS);
+    let lastError;
+    const maxRetries = 3;
 
-    try {
-        const response = await fetch(url, {
-            signal: controller.signal,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache',
-            },
-            redirect: 'follow',
-        });
+    for (let i = 0; i < maxRetries; i++) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), SCRAPE_TIMEOUT_MS);
 
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-        }
+        try {
+            const response = await fetch(url, {
+                signal: controller.signal,
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Cache-Control': 'no-cache',
+                    'Pragma': 'no-cache',
+                },
+                redirect: 'follow',
+            });
 
-        let html = await response.text();
-
-        // If we hit a redirect that points to a spotify.com URL from a spotify.link,
-        // and it's not and embed URL, try to fetch the embed version instead.
-        if (url.includes('spotify.link') && html.length < 500 && html.includes('url=https://open.spotify.com')) {
-            const metaMatch = html.match(/url=(https:\/\/open\.spotify\.com\/[^"]+)/i);
-            if (metaMatch) {
-                const target = metaMatch[1].replace('open.spotify.com/', 'open.spotify.com/embed/');
-                return fetchPageHtml(target);
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
             }
-        }
 
-        return html;
-    } finally {
-        clearTimeout(timeout);
+            const html = await response.text();
+
+            // Handle spotify.link redirection if returned as meta refresh
+            if (url.includes('spotify.link') && html.length < 500 && html.includes('url=https://open.spotify.com')) {
+                const metaMatch = html.match(/url=(https:\/\/open\.spotify\.com\/[^"]+)/i);
+                if (metaMatch) {
+                    const target = metaMatch[1]; //.replace('open.spotify.com/', 'open.spotify.com/embed/');
+                    return fetchPageHtml(target);
+                }
+            }
+
+            return html;
+        } catch (error) {
+            lastError = error;
+            console.warn(`Fetch attempt ${i + 1} failed for ${url}:`, error?.message);
+            // Wait 1s before next attempt (if not last)
+            if (i < maxRetries - 1) {
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+        } finally {
+            clearTimeout(timeout);
+        }
     }
+
+    throw lastError;
 }
 
 function parseSpotifyPage(html, url) {
