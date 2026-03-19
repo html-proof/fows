@@ -50,8 +50,15 @@ app.get('/healthz', (_req, res) => {
         timestamp: new Date().toISOString(),
     });
 });
+app.head('/healthz', (_req, res) => {
+    const shuttingDown = isShuttingDown();
+    res.sendStatus(shuttingDown ? 503 : 200);
+});
 
 app.get('/health', (_req, res) => {
+    res.redirect(302, '/healthz');
+});
+app.head('/health', (_req, res) => {
     res.redirect(302, '/healthz');
 });
 
@@ -80,6 +87,9 @@ app.get('/', (_req, res) => {
             ],
         },
     });
+});
+app.head('/', (_req, res) => {
+    res.sendStatus(200);
 });
 
 export default app;

@@ -1,7 +1,7 @@
 import os
 from typing import Any, Dict, List
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from model import rank_songs_for_user, recommend_for_user
@@ -24,13 +24,17 @@ class RecommendRequest(BaseModel):
     topK: int = Field(default=20, ge=1, le=100)
 
 
-@app.get("/health")
-def health() -> Dict[str, str]:
+@app.api_route("/health", methods=["GET", "HEAD"])
+def health(request: Request) -> Dict[str, str] | Response:
+    if request.method == "HEAD":
+        return Response(status_code=200)
     return {"status": "ok", "service": "ml-service"}
 
 
-@app.get("/")
-def root() -> Dict[str, str]:
+@app.api_route("/", methods=["GET", "HEAD"])
+def root(request: Request) -> Dict[str, str] | Response:
+    if request.method == "HEAD":
+        return Response(status_code=200)
     return {"message": "ML Service is healthy"}
 
 
