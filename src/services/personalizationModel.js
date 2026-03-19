@@ -15,6 +15,34 @@ const SEARCH_NOISE_WORDS = new Set([
     'full',
     'hd',
 ]);
+const DERIVATIVE_KEYWORDS = [
+    'cover',
+    'remix',
+    'remixed',
+    'karaoke',
+    'instrumental',
+    'reprise',
+    'unplugged',
+    'acoustic',
+    'acoustic version',
+    'live',
+    'live version',
+    'live performance',
+    'lofi',
+    'lo-fi',
+    'lo fi',
+    'slowed',
+    'reverb',
+    'slowed reverb',
+    'slowed and reverb',
+    'mashup',
+    'mash-up',
+    'mash up',
+    'female version',
+    'male version',
+    'duet version',
+    'stripped',
+];
 
 const profileCache = new Map();
 
@@ -69,8 +97,11 @@ export async function rerankSongsForUser({
         const interaction = profile.songInteractions?.[songFields.id];
         const interactionScore = resolveInteractionScore(interaction);
         const skipRiskScore = resolveSkipRisk(interaction);
-        const queryIntentScore = resolveQueryIntentScore(effectiveQueryTerms, songFields);
+        const queryIntentScore = resolveQueryIntentScore(normalizedQuery, effectiveQueryTerms, songFields);
         const lexicalScore = resolveLexicalPrecisionScore(normalizedQuery, effectiveQueryTerms, songFields);
+        const searchBucket = safeMode === 'search'
+            ? resolveSearchBucket({ lexicalScore, queryIntentScore })
+            : 0;
 
         // ── NEW: Trending and Mood context for AI reranking ──
         const trendingScore = song._trending ? clamp01((song._trendingPlayCount || 0) / 50) : 0;
@@ -129,6 +160,8 @@ export async function rerankSongsForUser({
                 finalScore: Number(finalScore.toFixed(4)),
                 textRankScore: Number(textRankScore.toFixed(4)),
                 lexicalScore: Number(lexicalScore.toFixed(4)),
+                queryIntentScore: Number(queryIntentScore.toFixed(4)),
+                searchBucket,
                 preferenceMatch: Number(preferenceMatch.toFixed(4)),
                 popularityScore: Number(popularityScore.toFixed(4)),
                 interactionScore: Number(interactionScore.toFixed(4)),
@@ -138,7 +171,11 @@ export async function rerankSongsForUser({
         };
     });
 
-    ranked.sort((a, b) => (b._ranking?.finalScore ?? 0) - (a._ranking?.finalScore ?? 0));
+    if (safeMode === 'search' && effectiveQueryTerms.length > 0) {
+        ranked.sort(compareSearchRankedSongs);
+    } else {
+        ranked.sort((a, b) => (b._ranking?.finalScore ?? 0) - (a._ranking?.finalScore ?? 0));
+    }
 
     if (safeMode !== 'search' || effectiveQueryTerms.length === 0) {
         return ranked;
@@ -275,6 +312,9 @@ function addTokenEmbedding(vector, token, weight) {
 function extractSongFields(song) {
     const id = String(song?.id || song?.songId || '').trim();
     const title = normalizeText(song?.name || song?.title || song?.songName || '');
+    const album = normalizeText(
+        typeof song?.album === 'object' ? (song?.album?.name || '') : (song?.album || '')
+    );
     const language = normalizeText(song?.language || '');
     const genres = normalizeStringArray([
         song?.genre,
@@ -285,13 +325,24 @@ function extractSongFields(song) {
         ...(typeof song?.primaryArtists === 'string' ? song.primaryArtists.split(',') : []),
         song?.artist,
     ]);
+    const artistText = artists.join(' ');
+    const primaryArtist = artists[0] || '';
+    const haystack = `${title} ${artistText} ${album}`.trim();
 
     return {
         id,
         title,
+        album,
         language,
         artists,
+        primaryArtist,
+        haystack,
         genres,
+        compactTitle: normalizeCompact(title),
+        compactArtists: normalizeCompact(artistText),
+        compactPrimaryArtist: normalizeCompact(primaryArtist),
+        haystackTokens: tokenize(haystack),
+        isDerivative: containsDerivativeKeyword(`${title} ${album}`),
     };
 }
 
@@ -353,18 +404,62 @@ function resolveSkipRisk(interaction) {
     return clamp01(skips / Math.max(plays + skips, 1));
 }
 
-function resolveQueryIntentScore(queryTerms, songFields) {
-    if (!Array.isArray(queryTerms) || queryTerms.length === 0) return 0.5;
+function resolveQueryIntentScore(normalizedQuery, queryTerms, songFields) {
+    if (!Array.isArray(queryTerms) || queryTerms.length === 0) return normalizedQuery ? 0.5 : 0.45;
     const title = songFields.title || '';
     const artistText = songFields.artists.join(' ');
+    const compactQuery = normalizeCompact(normalizedQuery);
+    const titlePhraseInQuery = Boolean(
+        compactQuery &&
+        songFields.compactTitle &&
+        compactQuery.includes(songFields.compactTitle)
+    );
+    const primaryArtistPhraseInQuery = Boolean(
+        compactQuery &&
+        songFields.compactPrimaryArtist &&
+        compactQuery.includes(songFields.compactPrimaryArtist)
+    );
+    const artistPhraseInQuery = Boolean(
+        compactQuery &&
+        songFields.compactArtists &&
+        compactQuery.includes(songFields.compactArtists)
+    );
+    const queryWantsDerivative = containsDerivativeKeyword(normalizedQuery);
 
-    let matches = 0;
+    let titleHits = 0;
+    let artistHits = 0;
     for (const term of queryTerms) {
         if (!term) continue;
-        if (title.includes(term) || artistText.includes(term)) matches += 1;
+        if (title.includes(term)) {
+            titleHits += 1;
+        } else if (artistText.includes(term)) {
+            artistHits += 1;
+        }
     }
 
-    return clamp01(matches / queryTerms.length);
+    const totalHits = titleHits + artistHits;
+    let score = clamp01((titleHits + artistHits * 0.85) / queryTerms.length);
+
+    if (
+        titlePhraseInQuery &&
+        (primaryArtistPhraseInQuery || artistPhraseInQuery || artistHits > 0)
+    ) {
+        score = Math.max(score, 0.98);
+    } else if (titlePhraseInQuery) {
+        score = Math.max(score, 0.9);
+    } else if (titleHits > 0 && artistHits > 0) {
+        score = Math.max(score, 0.86);
+    } else if (totalHits === queryTerms.length) {
+        score = Math.max(score, 0.8);
+    }
+
+    if (songFields.isDerivative && !queryWantsDerivative) {
+        score *= 0.72;
+    } else if (!songFields.isDerivative && queryWantsDerivative) {
+        score *= 0.82;
+    }
+
+    return clamp01(score);
 }
 
 function resolveLexicalPrecisionScore(normalizedQuery, queryTerms, songFields) {
@@ -374,13 +469,38 @@ function resolveLexicalPrecisionScore(normalizedQuery, queryTerms, songFields) {
 
     const title = songFields.title || '';
     const artistText = songFields.artists.join(' ');
-    const haystack = `${title} ${artistText}`.trim();
-    const compactTitle = normalizeCompact(title);
+    const haystack = songFields.haystack || `${title} ${artistText}`.trim();
+    const compactTitle = songFields.compactTitle || normalizeCompact(title);
     const compactQuery = normalizeCompact(normalizedQuery);
-    const haystackTokens = tokenize(haystack);
+    const haystackTokens = Array.isArray(songFields.haystackTokens)
+        ? songFields.haystackTokens
+        : tokenize(haystack);
+    const titlePhraseInQuery = Boolean(
+        compactQuery &&
+        compactTitle &&
+        compactQuery.includes(compactTitle)
+    );
+    const primaryArtistPhraseInQuery = Boolean(
+        compactQuery &&
+        songFields.compactPrimaryArtist &&
+        compactQuery.includes(songFields.compactPrimaryArtist)
+    );
+    const artistPhraseInQuery = Boolean(
+        compactQuery &&
+        songFields.compactArtists &&
+        compactQuery.includes(songFields.compactArtists)
+    );
+    const queryWantsDerivative = containsDerivativeKeyword(normalizedQuery);
 
     if (normalizedQuery && (title === normalizedQuery || (compactQuery && compactTitle === compactQuery))) {
         return 1;
+    }
+
+    if (
+        titlePhraseInQuery &&
+        (primaryArtistPhraseInQuery || artistPhraseInQuery)
+    ) {
+        return songFields.isDerivative && !queryWantsDerivative ? 0.88 : 0.995;
     }
 
     if (normalizedQuery && (
@@ -397,6 +517,8 @@ function resolveLexicalPrecisionScore(normalizedQuery, queryTerms, songFields) {
     let weightedHits = 0;
     let directHits = 0;
     let fuzzyHits = 0;
+    let titleHits = 0;
+    let artistHits = 0;
 
     for (const term of queryTerms) {
         if (!term) continue;
@@ -404,11 +526,13 @@ function resolveLexicalPrecisionScore(normalizedQuery, queryTerms, songFields) {
         if (title.includes(term)) {
             weightedHits += 1.25;
             directHits += 1;
+            titleHits += 1;
             continue;
         }
         if (artistText.includes(term)) {
             weightedHits += 0.95;
             directHits += 1;
+            artistHits += 1;
             continue;
         }
         if (hasFuzzyTokenMatch(term, haystackTokens)) {
@@ -427,13 +551,55 @@ function resolveLexicalPrecisionScore(normalizedQuery, queryTerms, songFields) {
     if (directHits === queryTerms.length) {
         score = Math.max(score, 0.9);
     }
+    if (
+        titlePhraseInQuery &&
+        (primaryArtistPhraseInQuery || artistPhraseInQuery || artistHits > 0)
+    ) {
+        score = Math.max(score, 0.98);
+    } else if (titleHits > 0 && artistHits > 0) {
+        score = Math.max(score, 0.92);
+    }
 
     // Strongly suppress unrelated songs for multi-term queries.
     if (queryTerms.length >= 2 && directHits === 0 && fuzzyHits === 0) {
         score = Math.min(score, 0.12);
     }
 
+    if (songFields.isDerivative && !queryWantsDerivative) {
+        score *= titlePhraseInQuery && artistHits > 0 ? 0.88 : 0.62;
+    } else if (!songFields.isDerivative && queryWantsDerivative) {
+        score *= 0.8;
+    }
+
     return clamp01(score);
+}
+
+function compareSearchRankedSongs(a, b) {
+    const aRanking = a?._ranking || {};
+    const bRanking = b?._ranking || {};
+
+    const bucketDiff = (aRanking.searchBucket ?? 99) - (bRanking.searchBucket ?? 99);
+    if (bucketDiff !== 0) return bucketDiff;
+
+    const lexicalDiff = (bRanking.lexicalScore ?? 0) - (aRanking.lexicalScore ?? 0);
+    if (lexicalDiff !== 0) return lexicalDiff;
+
+    const intentDiff = (bRanking.queryIntentScore ?? 0) - (aRanking.queryIntentScore ?? 0);
+    if (intentDiff !== 0) return intentDiff;
+
+    const finalDiff = (bRanking.finalScore ?? 0) - (aRanking.finalScore ?? 0);
+    if (finalDiff !== 0) return finalDiff;
+
+    return (bRanking.textRankScore ?? 0) - (aRanking.textRankScore ?? 0);
+}
+
+function resolveSearchBucket({ lexicalScore, queryIntentScore }) {
+    if (lexicalScore >= 0.985) return 0;
+    if (lexicalScore >= 0.94 && queryIntentScore >= 0.9) return 1;
+    if (lexicalScore >= 0.86) return 2;
+    if (lexicalScore >= 0.74) return 3;
+    if (lexicalScore >= 0.58) return 4;
+    return 5;
 }
 
 function forwardNeuralRanker(features) {
@@ -479,11 +645,36 @@ function normalizeCompact(value) {
     return normalizeText(value).replace(/[^\p{L}\p{N}]/gu, '');
 }
 
+function containsDerivativeKeyword(value) {
+    const normalized = normalizeText(value);
+    if (!normalized) return false;
+
+    for (const rawKeyword of DERIVATIVE_KEYWORDS) {
+        const keyword = normalizeText(rawKeyword);
+        if (!keyword) continue;
+
+        if (keyword.includes(' ')) {
+            if (normalized.includes(keyword)) return true;
+            continue;
+        }
+
+        if (new RegExp(`\\b${escapeRegex(keyword)}\\b`, 'u').test(normalized)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 function normalizeText(value) {
     return String(value ?? '')
         .toLowerCase()
         .trim()
         .replace(/\s+/g, ' ');
+}
+
+function escapeRegex(value) {
+    return String(value ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function signedHash(value) {

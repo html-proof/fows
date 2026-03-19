@@ -55,6 +55,36 @@ const QUERY_NOISE_WORDS = new Set([
     'bgm',
     'ost',
 ]);
+const DERIVATIVE_KEYWORDS = [
+    'cover',
+    'remix',
+    'remixed',
+    'karaoke',
+    'instrumental',
+    'reprise',
+    'unplugged',
+    'acoustic',
+    'acoustic version',
+    'live',
+    'live version',
+    'live performance',
+    'lofi',
+    'lo-fi',
+    'lo fi',
+    'slowed',
+    'reverb',
+    'slowed reverb',
+    'slowed and reverb',
+    'mashup',
+    'mash-up',
+    'mash up',
+    'female version',
+    'male version',
+    'duet version',
+    'stripped',
+    'dj version',
+    'edit version',
+];
 
 async function requestJsonWithTimeout(url, { timeoutMs, label }) {
     const controller = new AbortController();
@@ -790,6 +820,12 @@ function extractSongSearchFields(song) {
         song?.artists?.primary?.map(artist => artist?.name ?? '').join(' ') ??
         ''
     );
+    const primaryArtist = normalizeQuery(
+        song?.artists?.primary?.[0]?.name ??
+        song?.artist ??
+        artists.split(',')[0] ??
+        ''
+    );
     const album = normalizeQuery(
         typeof song?.album === 'object' ? (song?.album?.name ?? '') : (song?.album ?? '')
     );
@@ -798,11 +834,18 @@ function extractSongSearchFields(song) {
     return {
         name,
         artists,
+        primaryArtist,
         album,
         haystack,
         compactName: normalizeCompact(name),
+        compactArtists: normalizeCompact(artists),
+        compactPrimaryArtist: normalizeCompact(primaryArtist),
         compactHaystack: normalizeCompact(haystack),
+        nameTokens: tokenize(name),
+        artistTokens: tokenize(artists),
+        albumTokens: tokenize(album),
         haystackTokens: tokenize(haystack),
+        isDerivative: containsDerivativeKeyword(`${name} ${album}`),
     };
 }
 
@@ -847,15 +890,23 @@ function scoreSongMatch({
     const {
         name,
         artists,
+        primaryArtist,
         album,
         haystack,
         compactName,
+        compactArtists,
+        compactPrimaryArtist,
         compactHaystack,
+        nameTokens,
+        artistTokens,
+        albumTokens,
         haystackTokens,
+        isDerivative,
     } = extractSongSearchFields(song);
     const compactQuery = normalizeCompact(query);
     const queryTerms = tokenize(query).filter(token => !QUERY_NOISE_WORDS.has(token));
     const effectiveTerms = queryTerms.length > 0 ? queryTerms : tokenize(query);
+    const queryWantsDerivative = containsDerivativeKeyword(query);
     // For short queries (1-2 tokens), require ALL tokens to match. For longer, allow 1 miss.
     const maxMissingTerms = effectiveTerms.length > 2 ? 1 : 0;
     const minimumTermMatches = effectiveTerms.length === 0
@@ -887,15 +938,50 @@ function scoreSongMatch({
     const directMatches = nameMatches + artistMatches + albumMatches;
     const totalMatches = directMatches + fuzzyMatches;
     const hasTermCoverage = effectiveTerms.length === 0 || totalMatches >= minimumTermMatches;
+    const titlePhraseInQuery = Boolean(compactQuery && compactName && compactQuery.includes(compactName));
+    const primaryArtistPhraseInQuery = Boolean(
+        compactQuery &&
+        compactPrimaryArtist &&
+        compactQuery.includes(compactPrimaryArtist)
+    );
+    const artistPhraseInQuery = Boolean(
+        compactQuery &&
+        compactArtists &&
+        compactQuery.includes(compactArtists)
+    );
+    const hasBalancedTitleArtistCoverage =
+        nameMatches > 0 &&
+        artistMatches > 0 &&
+        directMatches >= minimumTermMatches;
+    const hasStrongTitleArtistIntent =
+        titlePhraseInQuery &&
+        (primaryArtistPhraseInQuery || artistPhraseInQuery || artistMatches > 0) &&
+        directMatches >= minimumTermMatches;
     // Bonus for having ALL terms match directly (precision signal)
     if (effectiveTerms.length > 0 && directMatches === effectiveTerms.length) {
         score += 30;
+    }
+    if (titlePhraseInQuery) {
+        score += 22;
+    }
+    if (primaryArtistPhraseInQuery) {
+        score += 38;
+    } else if (artistPhraseInQuery) {
+        score += 24;
+    } else if (artistMatches > 0) {
+        score += Math.min(24, artistMatches * 10);
     }
 
     let matchTier = null;
     if (name === query || (compactQuery && compactName === compactQuery)) {
         matchTier = MATCH_TIERS.EXACT;
         score += 300;
+    } else if (hasStrongTitleArtistIntent) {
+        matchTier = MATCH_TIERS.EXACT;
+        score += 285;
+    } else if (hasBalancedTitleArtistCoverage) {
+        matchTier = MATCH_TIERS.STARTS_WITH;
+        score += 235;
     } else if (
         name.startsWith(query) ||
         (compactQuery && compactName.startsWith(compactQuery))
@@ -964,6 +1050,28 @@ function scoreSongMatch({
             score += 32;
         } else {
             score -= 4;
+        }
+    }
+
+    if (isDerivative) {
+        if (!queryWantsDerivative) {
+            score -= 90;
+            if (matchTier >= MATCH_TIERS.CONTAINS) {
+                score -= 20;
+            }
+        } else {
+            score += 18;
+        }
+    } else if (queryWantsDerivative) {
+        score -= 22;
+    }
+
+    // Prefer clean original titles when the query is simple and the candidate
+    // title adds a lot of extra descriptor words.
+    if (!queryWantsDerivative && titlePhraseInQuery) {
+        const extraNameTerms = Math.max(0, nameTokens.length - effectiveTerms.length);
+        if (extraNameTerms >= 3) {
+            score -= Math.min(18, extraNameTerms * 4);
         }
     }
 
@@ -1047,6 +1155,7 @@ function searchLocalSongIndex(query) {
     const compactQuery = normalizeCompact(normalizedQuery);
     const queryTerms = tokenize(normalizedQuery).filter(token => !QUERY_NOISE_WORDS.has(token));
     const effectiveTerms = queryTerms.length > 0 ? queryTerms : tokenize(normalizedQuery);
+    const queryWantsDerivative = containsDerivativeKeyword(normalizedQuery);
     const maxMissingTerms = effectiveTerms.length > 1 ? 1 : 0;
     const minimumMatches = effectiveTerms.length === 0
         ? 0
@@ -1058,13 +1167,21 @@ function searchLocalSongIndex(query) {
         const {
             song,
             name,
+            artists,
+            primaryArtist,
             haystack,
             compactName,
+            compactArtists,
+            compactPrimaryArtist,
             compactHaystack,
+            isDerivative,
+            nameTokens,
             haystackTokens,
         } = entry;
         let score = 0;
         let matches = 0;
+        let nameMatches = 0;
+        let artistMatches = 0;
 
         if (name === normalizedQuery || (compactQuery && compactName === compactQuery)) {
             score += 180;
@@ -1082,7 +1199,15 @@ function searchLocalSongIndex(query) {
         }
 
         for (const term of effectiveTerms) {
-            if (name.includes(term) || haystack.includes(term)) {
+            if (name.includes(term)) {
+                matches += 1;
+                nameMatches += 1;
+                score += 14;
+            } else if (artists.includes(term) || primaryArtist.includes(term)) {
+                matches += 1;
+                artistMatches += 1;
+                score += 10;
+            } else if (haystack.includes(term)) {
                 matches += 1;
                 score += 10;
             } else if (hasFuzzyTokenMatch(term, haystackTokens)) {
@@ -1091,8 +1216,57 @@ function searchLocalSongIndex(query) {
             }
         }
 
+        const titlePhraseInQuery = Boolean(
+            compactQuery &&
+            compactName &&
+            compactQuery.includes(compactName)
+        );
+        const primaryArtistPhraseInQuery = Boolean(
+            compactQuery &&
+            compactPrimaryArtist &&
+            compactQuery.includes(compactPrimaryArtist)
+        );
+        const artistPhraseInQuery = Boolean(
+            compactQuery &&
+            compactArtists &&
+            compactQuery.includes(compactArtists)
+        );
+        const hasStrongTitleArtistIntent =
+            titlePhraseInQuery &&
+            (primaryArtistPhraseInQuery || artistPhraseInQuery || artistMatches > 0) &&
+            matches >= minimumMatches;
+        const hasBalancedTitleArtistCoverage =
+            nameMatches > 0 &&
+            artistMatches > 0 &&
+            matches >= minimumMatches;
+
+        if (hasStrongTitleArtistIntent) {
+            score += 150;
+        } else if (hasBalancedTitleArtistCoverage) {
+            score += 110;
+        }
+        if (titlePhraseInQuery) {
+            score += 20;
+        }
+        if (primaryArtistPhraseInQuery) {
+            score += 26;
+        } else if (artistPhraseInQuery) {
+            score += 16;
+        }
+
         if (minimumMatches > 0 && matches < minimumMatches && score < 70) {
             continue;
+        }
+        if (isDerivative && !queryWantsDerivative) {
+            score -= 80;
+        } else if (!isDerivative && queryWantsDerivative) {
+            score -= 18;
+        }
+        if (!queryWantsDerivative && titlePhraseInQuery) {
+            const extraNameTerms = Math.max(0, nameTokens.length - effectiveTerms.length);
+            if (extraNameTerms >= 3) {
+                score -= Math.min(18, extraNameTerms * 4);
+            }
         }
         if (score <= 0) continue;
 
@@ -1104,6 +1278,30 @@ function searchLocalSongIndex(query) {
         .sort((a, b) => b.score - a.score)
         .slice(0, LOCAL_INDEX_MAX_CANDIDATES)
         .map(entry => entry.song);
+}
+
+function containsDerivativeKeyword(value) {
+    const normalized = normalizeQuery(value);
+    if (!normalized) return false;
+
+    for (const rawKeyword of DERIVATIVE_KEYWORDS) {
+        const keyword = normalizeQuery(rawKeyword);
+        if (!keyword) continue;
+
+        if (keyword.includes(' ')) {
+            if (normalized.includes(keyword)) return true;
+            continue;
+        }
+
+        const pattern = new RegExp(`\\b${escapeRegex(keyword)}\\b`, 'u');
+        if (pattern.test(normalized)) return true;
+    }
+
+    return false;
+}
+
+function escapeRegex(value) {
+    return String(value ?? '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function upsertLocalSongIndex(song) {
