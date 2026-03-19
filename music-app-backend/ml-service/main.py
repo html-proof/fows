@@ -24,18 +24,24 @@ class RecommendRequest(BaseModel):
     topK: int = Field(default=20, ge=1, le=100)
 
 
-@app.api_route("/health", methods=["GET", "HEAD"])
-def health(request: Request) -> Dict[str, str] | Response:
-    if request.method == "HEAD":
-        return Response(status_code=200)
+@app.get("/health")
+def health() -> Dict[str, str]:
     return {"status": "ok", "service": "ml-service"}
 
 
-@app.api_route("/", methods=["GET", "HEAD"])
-def root(request: Request) -> Dict[str, str] | Response:
-    if request.method == "HEAD":
-        return Response(status_code=200)
+@app.head("/health", include_in_schema=False)
+def health_head() -> Response:
+    return Response(status_code=200)
+
+
+@app.get("/")
+def root() -> Dict[str, str]:
     return {"message": "ML Service is healthy"}
+
+
+@app.head("/", include_in_schema=False)
+def root_head() -> Response:
+    return Response(status_code=200)
 
 
 def verify_api_key(request: Request, x_api_key: str | None = Header(default=None)) -> None:
