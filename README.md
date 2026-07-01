@@ -1,0 +1,54 @@
+# music-hub-backend
+
+## Render sleep mode: what is possible
+
+A sleeping Render web service cannot wake itself from code running inside that same service.
+If the process is asleep, timers and in-process jobs are also asleep.
+
+Working automatic options:
+1. Keep the service always-on by using a paid Render instance.
+2. Ping it from an external scheduler (GitHub Actions, Render Cron Job, UptimeRobot, etc.).
+3. Run a separate worker/cron process that pings your web service.
+
+## Health endpoint
+
+This API exposes a lightweight health endpoint for keepalive probes:
+- `GET /healthz`
+- `GET /health` (redirects to `/healthz`)
+
+Use this endpoint for all keepalive traffic.
+
+## GitHub Actions keepalive
+
+Workflow file: `.github/workflows/render-keepalive.yml`
+
+Setup:
+1. Open `Settings -> Secrets and variables -> Actions` in GitHub.
+2. Add secret `RENDER_BACKEND_URL`.
+3. Set it to either:
+   - `https://your-service-name.onrender.com`
+   - or `https://your-service-name.onrender.com/healthz`
+
+The workflow runs every 5 minutes and pings `/healthz`.
+
+## Backend keepalive worker (for Render Cron/Worker)
+
+A keepalive worker script is available at `scripts/keepalive-worker.js`.
+
+Run locally:
+```bash
+KEEPALIVE_URL=https://your-service-name.onrender.com npm run keepalive:worker
+```
+
+Environment variables:
+- `KEEPALIVE_URL` (required)
+- `KEEPALIVE_INTERVAL_MS` (optional, default `240000`)
+- `KEEPALIVE_TIMEOUT_MS` (optional, default `10000`)
+
+Recommended on Render:
+1. Create a separate **Background Worker** or **Cron Job** service.
+2. Point it to this same repo.
+3. Start command: `npm run keepalive:worker`
+4. Set env `KEEPALIVE_URL=https://your-service-name.onrender.com`
+
+This keeps the web service warm more reliably than in-process timers.

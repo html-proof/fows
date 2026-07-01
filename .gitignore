@@ -1,0 +1,10 @@
+node_modules/
+.env
+*firebase-adminsdk-*.json
+serviceAccountKey.json
+.DS_Store
+dist/
+build/
+.next/
+music_hub/
+
