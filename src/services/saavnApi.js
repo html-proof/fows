@@ -411,8 +411,10 @@ export async function getSongById(id) {
                 }
             );
         } catch (innerError) {
+            // FALLBACK_BASE_URL only supports the path-style endpoint
+            // (/api/songs/:id), not the ?id= query form.
             const fallbackData = await requestJsonWithTimeout(
-                `${FALLBACK_BASE_URL}/api/songs?id=${encodeURIComponent(id)}`,
+                `${FALLBACK_BASE_URL}/api/songs/${encodeURIComponent(id)}`,
                 {
                     timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
                     label: 'Fallback song fetch',
@@ -450,8 +452,10 @@ export async function getAlbumById(id) {
                 }
             );
         } catch (innerError) {
+            // Same path-vs-query mismatch as getSongById — use the path form
+            // for the fallback provider.
             const fallbackData = await requestJsonWithTimeout(
-                `${FALLBACK_BASE_URL}/api/albums?id=${encodeURIComponent(id)}`,
+                `${FALLBACK_BASE_URL}/api/albums/${encodeURIComponent(id)}`,
                 {
                     timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
                     label: 'Fallback album fetch',
