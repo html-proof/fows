@@ -411,20 +411,43 @@ export async function getSongById(id) {
                 }
             );
         } catch (innerError) {
-            // FALLBACK_BASE_URL only supports the path-style endpoint
-            // (/api/songs/:id), not the ?id= query form.
-            const fallbackData = await requestJsonWithTimeout(
-                `${FALLBACK_BASE_URL}/api/songs/${encodeURIComponent(id)}`,
-                {
-                    timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
-                    label: 'Fallback song fetch',
-                }
-            );
+            const fallbackData = await fetchSongFromFallback(id);
             return {
                 success: true,
                 data: fallbackData?.data ?? [],
             };
         }
+    }
+}
+
+/**
+ * Fetch a song by ID from the fallback provider.
+ * Different forks/deployments of the JioSaavn API expose this either as
+ * a path segment (`/api/songs/:id`) or a query string (`/api/songs?id=`).
+ * The fallback deployment used here (jiosaavn-api-murex) rejects the
+ * query form with a 400, so try the path form first and only fall back
+ * to the query form if that fails.
+ *
+ * @param {string} id
+ * @returns {Promise<object>}
+ */
+async function fetchSongFromFallback(id) {
+    try {
+        return await requestJsonWithTimeout(
+            `${FALLBACK_BASE_URL}/api/songs/${encodeURIComponent(id)}`,
+            {
+                timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
+                label: 'Fallback song fetch (path)',
+            }
+        );
+    } catch (pathError) {
+        return requestJsonWithTimeout(
+            `${FALLBACK_BASE_URL}/api/songs?id=${encodeURIComponent(id)}`,
+            {
+                timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
+                label: 'Fallback song fetch (query)',
+            }
+        );
     }
 }
 
@@ -452,10 +475,8 @@ export async function getAlbumById(id) {
                 }
             );
         } catch (innerError) {
-            // Same path-vs-query mismatch as getSongById — use the path form
-            // for the fallback provider.
             const fallbackData = await requestJsonWithTimeout(
-                `${FALLBACK_BASE_URL}/api/albums/${encodeURIComponent(id)}`,
+                `${FALLBACK_BASE_URL}/api/albums?id=${encodeURIComponent(id)}`,
                 {
                     timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
                     label: 'Fallback album fetch',
