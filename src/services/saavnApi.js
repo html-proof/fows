@@ -10,23 +10,14 @@ const SEARCH_CACHE_STALE_TTL_MS = 20 * 60 * 1000;
 const SEARCH_CACHE_MAX_ENTRIES = 300;
 const SMART_SEARCH_MAX_VARIANTS = 3;
 const SMART_SEARCH_MAX_LATENCY_MS = 3200;
-// Increased timeouts to handle network latency and DNS resolution delays
-const PRIMARY_SEARCH_TIMEOUT_MS = 4000;
-const FALLBACK_SEARCH_TIMEOUT_MS = 3500;
-const CATALOG_SEARCH_TIMEOUT_MS = 4000;
+const PRIMARY_SEARCH_TIMEOUT_MS = 2200;
+const FALLBACK_SEARCH_TIMEOUT_MS = 1800;
+const CATALOG_SEARCH_TIMEOUT_MS = 1500;
 const LOCAL_INDEX_MAX_ENTRIES = 6000;
 const LOCAL_INDEX_MAX_CANDIDATES = 120;
-// Retry configuration for resilience
-const MAX_RETRIES = 3;
-const INITIAL_RETRY_DELAY_MS = 100;
-const MAX_RETRY_DELAY_MS = 1000;
-// Stream URL cache to reduce API calls (URLs have ~5-10 minute TTL from Saavn)
-const STREAM_CACHE_TTL_MS = 4 * 60 * 1000; // 4 minutes
-const STREAM_CACHE_MAX_ENTRIES = 500;
 const smartSearchCache = new Map();
 const smartSearchInFlight = new Map();
 const localSongIndex = new Map();
-const streamUrlCache = new Map();
 const MATCH_TIERS = Object.freeze({
     EXACT: 0,
     STARTS_WITH: 1,
@@ -96,73 +87,29 @@ const DERIVATIVE_KEYWORDS = [
 ];
 
 async function requestJsonWithTimeout(url, { timeoutMs, label }) {
-    let lastError = null;
-    let retryDelay = INITIAL_RETRY_DELAY_MS;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-        try {
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const { statusCode, body } = await request(url, {
+            signal: controller.signal,
+            headersTimeout: timeoutMs,
+            bodyTimeout: timeoutMs,
+        });
 
-            try {
-                const { statusCode, body, headers } = await request(url, {
-                    signal: controller.signal,
-                    headersTimeout: timeoutMs,
-                    bodyTimeout: timeoutMs,
-                    // Keep-alive to reuse connections
-                    keepAliveTimeout: 60000,
-                });
-
-                // Handle rate limiting - retry with backoff
-                if (statusCode === 429) {
-                    const retryAfter = parseInt(headers['retry-after'] || retryDelay, 10);
-                    throw new Error(`Rate limited (429), retry after ${retryAfter}ms`);
-                }
-
-                if (statusCode !== 200) {
-                    throw new Error(`${label} failed with status ${statusCode}`);
-                }
-
-                return body.json();
-            } finally {
-                clearTimeout(timeout);
-            }
-        } catch (error) {
-            lastError = error;
-
-            // Determine if this is a retryable error
-            const isTimeout = error?.name === 'AbortError' || 
-                            error?.code === 'UND_ERR_ABORTED' ||
-                            error?.message?.includes('timed out');
-            const isNetworkError = error?.code === 'ECONNREFUSED' ||
-                                 error?.code === 'ECONNRESET' ||
-                                 error?.code === 'ETIMEDOUT' ||
-                                 error?.code === 'EHOSTUNREACH' ||
-                                 error?.message?.includes('Connection') ||
-                                 error?.message?.includes('Rate limited');
-            const isRetryable = isTimeout || isNetworkError;
-
-            // Don't retry on non-retryable errors
-            if (!isRetryable) {
-                throw error;
-            }
-
-            // Don't retry if we've exhausted retries
-            if (attempt >= MAX_RETRIES) {
-                if (isTimeout) {
-                    throw new Error(`${label} timed out after ${timeoutMs}ms (attempt ${attempt + 1}/${MAX_RETRIES + 1})`);
-                }
-                throw error;
-            }
-
-            // Exponential backoff with jitter
-            const jitter = Math.random() * 100;
-            await new Promise(resolve => setTimeout(resolve, retryDelay + jitter));
-            retryDelay = Math.min(retryDelay * 1.5, MAX_RETRY_DELAY_MS);
+        if (statusCode !== 200) {
+            throw new Error(`${label} failed with status ${statusCode}`);
         }
-    }
 
-    throw lastError || new Error(`${label} failed after ${MAX_RETRIES + 1} attempts`);
+        return body.json();
+    } catch (error) {
+        if (error?.name === 'AbortError' || error?.code === 'UND_ERR_ABORTED') {
+            throw new Error(`${label} timed out after ${timeoutMs}ms`);
+        }
+        throw error;
+    } finally {
+        clearTimeout(timeout);
+    }
 }
 
 export async function searchSongs(query, page = 1) {
@@ -441,51 +388,13 @@ async function computeSmartSearchResults({
 }
 
 /**
- * Cache helpers for stream URLs
- */
-function getStreamUrlCached(songId) {
-    const entry = streamUrlCache.get(songId);
-    if (!entry) return null;
-    if (Date.now() > entry.expiresAt) {
-        streamUrlCache.delete(songId);
-        return null;
-    }
-    return entry.data;
-}
-
-function setStreamUrlCached(songId, data) {
-    // Prune cache if it exceeds max entries
-    if (streamUrlCache.size >= STREAM_CACHE_MAX_ENTRIES) {
-        const entriesToDelete = Math.ceil(STREAM_CACHE_MAX_ENTRIES * 0.1);
-        let deleted = 0;
-        for (const [key, value] of streamUrlCache.entries()) {
-            if (Date.now() > value.expiresAt || deleted >= entriesToDelete) {
-                streamUrlCache.delete(key);
-                deleted++;
-            }
-        }
-    }
-    streamUrlCache.set(songId, {
-        data,
-        expiresAt: Date.now() + STREAM_CACHE_TTL_MS,
-    });
-}
-
-/**
  * Get song details by ID.
  * @param {string} id - Song ID
  * @returns {Promise<object>} Song details
  */
 export async function getSongById(id) {
-    // Check stream URL cache first
-    const cached = getStreamUrlCached(id);
-    if (cached) {
-        return cached;
-    }
-
-    let result = null;
     try {
-        result = await requestJsonWithTimeout(
+        return await requestJsonWithTimeout(
             `${BASE_URL}/api/songs/${encodeURIComponent(id)}`,
             {
                 timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
@@ -494,7 +403,7 @@ export async function getSongById(id) {
         );
     } catch (error) {
         try {
-            result = await requestJsonWithTimeout(
+            return await requestJsonWithTimeout(
                 `${BASE_URL}/api/songs?id=${encodeURIComponent(id)}`,
                 {
                     timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
@@ -511,19 +420,12 @@ export async function getSongById(id) {
                     label: 'Fallback song fetch',
                 }
             );
-            result = {
+            return {
                 success: true,
                 data: fallbackData?.data ?? [],
             };
         }
     }
-
-    // Cache the result for future requests
-    if (result) {
-        setStreamUrlCached(id, result);
-    }
-
-    return result;
 }
 
 /**
@@ -532,15 +434,8 @@ export async function getSongById(id) {
  * @returns {Promise<object>} Album details
  */
 export async function getAlbumById(id) {
-    // Check cache first
-    const cached = getStreamUrlCached(id);
-    if (cached) {
-        return cached;
-    }
-
-    let result = null;
     try {
-        result = await requestJsonWithTimeout(
+        return await requestJsonWithTimeout(
             `${BASE_URL}/api/albums/${encodeURIComponent(id)}`,
             {
                 timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
@@ -549,7 +444,7 @@ export async function getAlbumById(id) {
         );
     } catch (error) {
         try {
-            result = await requestJsonWithTimeout(
+            return await requestJsonWithTimeout(
                 `${BASE_URL}/api/albums?id=${encodeURIComponent(id)}`,
                 {
                     timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
@@ -566,19 +461,12 @@ export async function getAlbumById(id) {
                     label: 'Fallback album fetch',
                 }
             );
-            result = {
+            return {
                 success: true,
                 data: fallbackData?.data ?? null,
             };
         }
     }
-
-    // Cache the result
-    if (result) {
-        setStreamUrlCached(id, result);
-    }
-
-    return result;
 }
 
 /**
