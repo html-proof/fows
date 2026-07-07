@@ -130,13 +130,13 @@ export async function searchSongsOnly(query, page = 1) {
         primaryPayload = await searchSongsOnlyPrimary(query, pageNumber);
     } catch (_primaryError) {
         if (pageNumber > 1) {
-            const fallbackSongs = await searchSongsOnlyFallback(query);
+            const fallbackSongs = await searchSongsOnlyFallback(query).catch(() => []);
             return wrapSongsOnlyResponse(fallbackSongs);
         }
     }
 
     if (!primaryPayload) {
-        const fallbackSongs = await searchSongsOnlyFallback(query);
+        const fallbackSongs = await searchSongsOnlyFallback(query).catch(() => []);
         return wrapSongsOnlyResponse(fallbackSongs);
     }
 
@@ -411,13 +411,15 @@ export async function getSongById(id) {
                 }
             );
         } catch (innerError) {
+            // FALLBACK_BASE_URL only supports the path-style endpoint
+            // (/api/songs/:id), not the ?id= query form.
             const fallbackData = await requestJsonWithTimeout(
-                `${FALLBACK_BASE_URL}/api/songs?id=${encodeURIComponent(id)}`,
+                `${FALLBACK_BASE_URL}/api/songs/${encodeURIComponent(id)}`,
                 {
                     timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
                     label: 'Fallback song fetch',
                 }
-            );
+            ).catch(() => null);
             return {
                 success: true,
                 data: fallbackData?.data ?? [],
@@ -450,13 +452,15 @@ export async function getAlbumById(id) {
                 }
             );
         } catch (innerError) {
+            // Same path-vs-query mismatch as getSongById — use the path form
+            // for the fallback provider.
             const fallbackData = await requestJsonWithTimeout(
-                `${FALLBACK_BASE_URL}/api/albums?id=${encodeURIComponent(id)}`,
+                `${FALLBACK_BASE_URL}/api/albums/${encodeURIComponent(id)}`,
                 {
                     timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
                     label: 'Fallback album fetch',
                 }
-            );
+            ).catch(() => null);
             return {
                 success: true,
                 data: fallbackData?.data ?? null,
@@ -487,7 +491,7 @@ export async function searchAlbums(query) {
                 timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
                 label: 'Fallback album search',
             }
-        );
+        ).catch(() => null);
         return {
             success: true,
             data: {
@@ -519,7 +523,7 @@ export async function searchArtists(query) {
                 timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
                 label: 'Fallback artist search',
             }
-        );
+        ).catch(() => null);
         return {
             success: true,
             data: {
@@ -608,7 +612,7 @@ export async function getArtistById(artistId) {
                 timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
                 label: 'Fallback artist fetch',
             }
-        );
+        ).catch(() => ({ success: false, data: null }));
     }
 }
 
