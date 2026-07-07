@@ -130,13 +130,13 @@ export async function searchSongsOnly(query, page = 1) {
         primaryPayload = await searchSongsOnlyPrimary(query, pageNumber);
     } catch (_primaryError) {
         if (pageNumber > 1) {
-            const fallbackSongs = await searchSongsOnlyFallback(query);
+            const fallbackSongs = await searchSongsOnlyFallback(query).catch(() => []);
             return wrapSongsOnlyResponse(fallbackSongs);
         }
     }
 
     if (!primaryPayload) {
-        const fallbackSongs = await searchSongsOnlyFallback(query);
+        const fallbackSongs = await searchSongsOnlyFallback(query).catch(() => []);
         return wrapSongsOnlyResponse(fallbackSongs);
     }
 
@@ -419,7 +419,7 @@ export async function getSongById(id) {
                     timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
                     label: 'Fallback song fetch',
                 }
-            );
+            ).catch(() => null);
             return {
                 success: true,
                 data: fallbackData?.data ?? [],
@@ -460,7 +460,7 @@ export async function getAlbumById(id) {
                     timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
                     label: 'Fallback album fetch',
                 }
-            );
+            ).catch(() => null);
             return {
                 success: true,
                 data: fallbackData?.data ?? null,
@@ -491,7 +491,7 @@ export async function searchAlbums(query) {
                 timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
                 label: 'Fallback album search',
             }
-        );
+        ).catch(() => null);
         return {
             success: true,
             data: {
@@ -523,7 +523,7 @@ export async function searchArtists(query) {
                 timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
                 label: 'Fallback artist search',
             }
-        );
+        ).catch(() => null);
         return {
             success: true,
             data: {
@@ -612,7 +612,7 @@ export async function getArtistById(artistId) {
                 timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
                 label: 'Fallback artist fetch',
             }
-        );
+        ).catch(() => ({ success: false, data: null }));
     }
 }
 
