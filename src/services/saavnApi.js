@@ -172,14 +172,18 @@ async function searchSongsOnlyPrimary(query, page = 1) {
  * @returns {Promise<object[]>}
  */
 export async function searchSongsOnlyFallback(query) {
-    const payload = await requestJsonWithTimeout(
-        `${FALLBACK_BASE_URL}/api/search/songs?query=${encodeURIComponent(query)}`,
-        {
-            timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
-            label: 'Fallback song search',
-        }
-    );
-    return payload?.data?.results ?? [];
+    try {
+        const payload = await requestJsonWithTimeout(
+            `${FALLBACK_BASE_URL}/api/search/songs?query=${encodeURIComponent(query)}`,
+            {
+                timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
+                label: 'Fallback song search',
+            }
+        );
+        return payload?.data?.results ?? [];
+    } catch (error) {
+        return [];
+    }
 }
 
 /**
@@ -462,25 +466,17 @@ export async function getAlbumById(id) {
         } catch (innerError) {
             // Same path-vs-query mismatch as getSongById — use the path form
             // for the fallback provider.
-            try {
-                const fallbackData = await requestJsonWithTimeout(
-                    `${FALLBACK_BASE_URL}/api/albums/${encodeURIComponent(id)}`,
-                    {
-                        timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
-                        label: 'Fallback album fetch',
-                    }
-                );
-                return {
-                    success: true,
-                    data: fallbackData?.data ?? null,
-                };
-            } catch (fallbackError) {
-                return {
-                    success: false,
-                    error: fallbackError.message,
-                    data: null,
-                };
-            }
+            const fallbackData = await requestJsonWithTimeout(
+                `${FALLBACK_BASE_URL}/api/albums/${encodeURIComponent(id)}`,
+                {
+                    timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
+                    label: 'Fallback album fetch',
+                }
+            );
+            return {
+                success: true,
+                data: fallbackData?.data ?? null,
+            };
         }
     }
 }
