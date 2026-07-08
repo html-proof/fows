@@ -172,14 +172,18 @@ async function searchSongsOnlyPrimary(query, page = 1) {
  * @returns {Promise<object[]>}
  */
 export async function searchSongsOnlyFallback(query) {
-    const payload = await requestJsonWithTimeout(
-        `${FALLBACK_BASE_URL}/api/search/songs?query=${encodeURIComponent(query)}`,
-        {
-            timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
-            label: 'Fallback song search',
-        }
-    );
-    return payload?.data?.results ?? [];
+    try {
+        const payload = await requestJsonWithTimeout(
+            `${FALLBACK_BASE_URL}/api/search/songs?query=${encodeURIComponent(query)}`,
+            {
+                timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
+                label: 'Fallback song search',
+            }
+        );
+        return payload?.data?.results ?? [];
+    } catch (error) {
+        return [];
+    }
 }
 
 /**
@@ -411,17 +415,25 @@ export async function getSongById(id) {
                 }
             );
         } catch (innerError) {
-            const fallbackData = await requestJsonWithTimeout(
-                `${FALLBACK_BASE_URL}/api/songs?id=${encodeURIComponent(id)}`,
-                {
-                    timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
-                    label: 'Fallback song fetch',
-                }
-            );
-            return {
-                success: true,
-                data: fallbackData?.data ?? [],
-            };
+            try {
+                const fallbackData = await requestJsonWithTimeout(
+                    `${FALLBACK_BASE_URL}/api/songs?id=${encodeURIComponent(id)}`,
+                    {
+                        timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
+                        label: 'Fallback song fetch',
+                    }
+                );
+                return {
+                    success: true,
+                    data: fallbackData?.data ?? [],
+                };
+            } catch (fallbackError) {
+                return {
+                    success: false,
+                    error: fallbackError.message,
+                    data: [],
+                };
+            }
         }
     }
 }
@@ -450,17 +462,25 @@ export async function getAlbumById(id) {
                 }
             );
         } catch (innerError) {
-            const fallbackData = await requestJsonWithTimeout(
-                `${FALLBACK_BASE_URL}/api/albums?id=${encodeURIComponent(id)}`,
-                {
-                    timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
-                    label: 'Fallback album fetch',
-                }
-            );
-            return {
-                success: true,
-                data: fallbackData?.data ?? null,
-            };
+            try {
+                const fallbackData = await requestJsonWithTimeout(
+                    `${FALLBACK_BASE_URL}/api/albums?id=${encodeURIComponent(id)}`,
+                    {
+                        timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
+                        label: 'Fallback album fetch',
+                    }
+                );
+                return {
+                    success: true,
+                    data: fallbackData?.data ?? null,
+                };
+            } catch (fallbackError) {
+                return {
+                    success: false,
+                    error: fallbackError.message,
+                    data: null,
+                };
+            }
         }
     }
 }
@@ -480,20 +500,29 @@ export async function searchAlbums(query) {
             }
         );
     } catch (error) {
-        // Fallback for album search
-        const fallbackData = await requestJsonWithTimeout(
-            `${FALLBACK_BASE_URL}/api/search/albums?query=${encodeURIComponent(query)}`,
-            {
-                timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
-                label: 'Fallback album search',
-            }
-        );
-        return {
-            success: true,
-            data: {
-                results: fallbackData?.data?.results ?? [],
-            },
-        };
+        try {
+            const fallbackData = await requestJsonWithTimeout(
+                `${FALLBACK_BASE_URL}/api/search/albums?query=${encodeURIComponent(query)}`,
+                {
+                    timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
+                    label: 'Fallback album search',
+                }
+            );
+            return {
+                success: true,
+                data: {
+                    results: fallbackData?.data?.results ?? [],
+                },
+            };
+        } catch (fallbackError) {
+            return {
+                success: false,
+                error: fallbackError.message,
+                data: {
+                    results: [],
+                },
+            };
+        }
     }
 }
 
@@ -512,20 +541,29 @@ export async function searchArtists(query) {
             }
         );
     } catch (error) {
-        // Fallback for artist search
-        const fallbackData = await requestJsonWithTimeout(
-            `${FALLBACK_BASE_URL}/api/search/artists?query=${encodeURIComponent(query)}`,
-            {
-                timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
-                label: 'Fallback artist search',
-            }
-        );
-        return {
-            success: true,
-            data: {
-                results: fallbackData?.data?.results ?? [],
-            },
-        };
+        try {
+            const fallbackData = await requestJsonWithTimeout(
+                `${FALLBACK_BASE_URL}/api/search/artists?query=${encodeURIComponent(query)}`,
+                {
+                    timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
+                    label: 'Fallback artist search',
+                }
+            );
+            return {
+                success: true,
+                data: {
+                    results: fallbackData?.data?.results ?? [],
+                },
+            };
+        } catch (fallbackError) {
+            return {
+                success: false,
+                error: fallbackError.message,
+                data: {
+                    results: [],
+                },
+            };
+        }
     }
 }
 
@@ -602,13 +640,21 @@ export async function getArtistById(artistId) {
             }
         );
     } catch (error) {
-        return await requestJsonWithTimeout(
-            `${FALLBACK_BASE_URL}/api/artists/${encodeURIComponent(artistId)}`,
-            {
-                timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
-                label: 'Fallback artist fetch',
-            }
-        );
+        try {
+            return await requestJsonWithTimeout(
+                `${FALLBACK_BASE_URL}/api/artists/${encodeURIComponent(artistId)}`,
+                {
+                    timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
+                    label: 'Fallback artist fetch',
+                }
+            );
+        } catch (fallbackError) {
+            return {
+                success: false,
+                error: fallbackError.message,
+                data: null,
+            };
+        }
     }
 }
 
