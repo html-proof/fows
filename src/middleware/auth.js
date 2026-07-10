@@ -6,7 +6,7 @@ import { auth } from '../config/firebase.js';
  * On success, attaches user info to req.user.
  */
 export const authenticateUser = async (req, res, next) => {
-    const authHeader = req.headers.authorization;
+    const authHeader = req.headers.authorization; //header to get the data
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
         return res.status(401).json({
