@@ -15,7 +15,7 @@ export const authenticateUser = async (req, res, next) => {
         });
     }
 
-    const idToken = authHeader.split('Bearer ')[1];
+    const idToken = authHeader.slice('Bearer '.length).trim();
 
     try {
         const decodedToken = await auth.verifyIdToken(idToken);

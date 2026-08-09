@@ -129,9 +129,10 @@ export async function searchSongsOnly(query, page = 1) {
     try {
         primaryPayload = await searchSongsOnlyPrimary(query, pageNumber);
     } catch (_primaryError) {
+        // Fallback has no pagination support — returning page 1 data for page 2+
+        // would cause duplicate results on the client, so return empty instead.
         if (pageNumber > 1) {
-            const fallbackSongs = await searchSongsOnlyFallback(query);
-            return wrapSongsOnlyResponse(fallbackSongs);
+            return wrapSongsOnlyResponse([]);
         }
     }
 
@@ -430,7 +431,7 @@ export async function getSongById(id) {
             } catch (fallbackError) {
                 return {
                     success: false,
-                    error: fallbackError.message,
+                    error: 'Service temporarily unavailable',
                     data: [],
                 };
             }
@@ -477,7 +478,7 @@ export async function getAlbumById(id) {
             } catch (fallbackError) {
                 return {
                     success: false,
-                    error: fallbackError.message,
+                    error: 'Service temporarily unavailable',
                     data: null,
                 };
             }
@@ -1369,20 +1370,12 @@ function upsertLocalSongIndex(song) {
 }
 
 function trimLocalSongIndex() {
+    // JS Map preserves insertion order — delete the first key (oldest inserted)
+    // when over capacity. O(1) per eviction instead of O(n).
     while (localSongIndex.size > LOCAL_INDEX_MAX_ENTRIES) {
-        let oldestKey = null;
-        let oldestAccess = Number.POSITIVE_INFINITY;
-
-        for (const [key, value] of localSongIndex.entries()) {
-            const access = value?.lastAccessAt ?? value?.updatedAt ?? 0;
-            if (access < oldestAccess) {
-                oldestAccess = access;
-                oldestKey = key;
-            }
-        }
-
-        if (!oldestKey) break;
-        localSongIndex.delete(oldestKey);
+        const firstKey = localSongIndex.keys().next().value;
+        if (firstKey === undefined) break;
+        localSongIndex.delete(firstKey);
     }
 }
 
@@ -1470,19 +1463,7 @@ function setCachedSmartSearch(query, data) {
 
 function trimSmartSearchCache() {
     if (smartSearchCache.size <= SEARCH_CACHE_MAX_ENTRIES) return;
-
-    let oldestKey = null;
-    let oldestAccess = Number.POSITIVE_INFINITY;
-
-    for (const [key, value] of smartSearchCache.entries()) {
-        const access = value?.lastAccessAt ?? value?.updatedAt ?? 0;
-        if (access < oldestAccess) {
-            oldestAccess = access;
-            oldestKey = key;
-        }
-    }
-
-    if (oldestKey) {
-        smartSearchCache.delete(oldestKey);
-    }
+    // O(1): delete the oldest inserted entry (Map preserves insertion order)
+    const firstKey = smartSearchCache.keys().next().value;
+    if (firstKey !== undefined) smartSearchCache.delete(firstKey);
 }

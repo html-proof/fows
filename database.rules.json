@@ -10,6 +10,24 @@
                     ]
                 }
             }
+        },
+        "global_trending": {
+            ".read": false,
+            ".write": false
+        },
+        "co_listen_pairs": {
+            ".read": false,
+            ".write": false
+        },
+        "user_activity": {
+            "$uid": {
+                ".read": "$uid === auth.uid",
+                ".write": "$uid === auth.uid"
+            }
+        },
+        "$other": {
+            ".read": false,
+            ".write": false
         }
     }
 }

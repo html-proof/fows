@@ -105,7 +105,16 @@ export async function rerankSongsForUser({
 
         // ── NEW: Trending and Mood context for AI reranking ──
         const trendingScore = song._trending ? clamp01((song._trendingPlayCount || 0) / 50) : 0;
-        const moodMatchScore = (song._sessionMood === song._timeMood) ? 0.35 : 0.15;
+        const songGenreLabel = ((song.genre || song.label || song.language || '')).toLowerCase();
+        const moodGenreKeywords = {
+            party: ['party', 'dance', 'edm', 'pop', 'upbeat', 'remix'],
+            calm: ['classical', 'ambient', 'devotional', 'instrumental', 'soft'],
+            sad: ['sad', 'emotional', 'heartbreak', 'blues', 'melancholy'],
+            energetic: ['hip-hop', 'rock', 'metal', 'workout', 'motivational'],
+            romantic: ['romantic', 'love', 'ghazal', 'sufi', 'r&b'],
+        };
+        const moodKeywords = moodGenreKeywords[song._sessionMood] ?? [];
+        const moodMatchScore = moodKeywords.some(kw => songGenreLabel.includes(kw)) ? 0.35 : 0.15;
 
         const nnScore = forwardNeuralRanker([
             textRankScore,

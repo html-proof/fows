@@ -4,6 +4,16 @@ import { logActivity, getRecentActivity } from '../services/database.js';
 
 const router = Router();
 
+const MAX_QUERY_LEN = 200;
+const MAX_FIELD_LEN = 100;
+const MAX_HISTORY_LIMIT = 300;
+const ALLOWED_ACTIVITY_TYPES = new Set(['search', 'play', 'skip', 'search_click']);
+
+function truncate(value, maxLen) {
+    if (typeof value !== 'string') return value;
+    return value.slice(0, maxLen);
+}
+
 /**
  * POST /api/activity/search
  * Record a search event.
@@ -11,10 +21,13 @@ const router = Router();
 router.post('/search', authenticateUser, async (req, res) => {
     try {
         const { query } = req.body;
-        if (!query) {
+        if (!query || typeof query !== 'string') {
             return res.status(400).json({ error: '"query" is required' });
         }
-        const result = await logActivity(req.user.uid, 'search', { query });
+        if (query.length > MAX_QUERY_LEN) {
+            return res.status(400).json({ error: `"query" must be ${MAX_QUERY_LEN} characters or fewer` });
+        }
+        const result = await logActivity(req.user.uid, 'search', { query: truncate(query, MAX_QUERY_LEN) });
         res.json({ success: true, data: result });
     } catch (error) {
         console.error('Log search activity error:', error.message);
@@ -29,17 +42,19 @@ router.post('/search', authenticateUser, async (req, res) => {
 router.post('/play', authenticateUser, async (req, res) => {
     try {
         const { songId, songName, artist, language, genre, duration, totalDuration } = req.body;
-        if (!songId) {
+        if (!songId || typeof songId !== 'string') {
             return res.status(400).json({ error: '"songId" is required' });
         }
 
-        const payload = { songId };
-        if (songName) payload.songName = songName;
-        if (artist) payload.artist = artist;
-        if (language) payload.language = language;
-        if (genre) payload.genre = genre;
-        if (duration != null) payload.duration = Number(duration);
-        if (totalDuration != null) payload.totalDuration = Number(totalDuration);
+        const payload = { songId: truncate(songId, MAX_FIELD_LEN) };
+        if (songName) payload.songName = truncate(String(songName), MAX_FIELD_LEN);
+        if (artist) payload.artist = truncate(String(artist), MAX_FIELD_LEN);
+        if (language) payload.language = truncate(String(language), MAX_FIELD_LEN);
+        if (genre) payload.genre = truncate(String(genre), MAX_FIELD_LEN);
+        const parsedDuration = Number(duration);
+        if (duration != null && Number.isFinite(parsedDuration)) payload.duration = parsedDuration;
+        const parsedTotalDuration = Number(totalDuration);
+        if (totalDuration != null && Number.isFinite(parsedTotalDuration)) payload.totalDuration = parsedTotalDuration;
 
         const result = await logActivity(req.user.uid, 'play', payload);
         res.json({ success: true, data: result });
@@ -56,17 +71,19 @@ router.post('/play', authenticateUser, async (req, res) => {
 router.post('/skip', authenticateUser, async (req, res) => {
     try {
         const { songId, songName, artist, language, genre, skipTime, totalDuration } = req.body;
-        if (!songId) {
+        if (!songId || typeof songId !== 'string') {
             return res.status(400).json({ error: '"songId" is required' });
         }
 
-        const payload = { songId };
-        if (songName) payload.songName = songName;
-        if (artist) payload.artist = artist;
-        if (language) payload.language = language;
-        if (genre) payload.genre = genre;
-        if (skipTime != null) payload.skipTime = Number(skipTime);
-        if (totalDuration != null) payload.totalDuration = Number(totalDuration);
+        const payload = { songId: truncate(songId, MAX_FIELD_LEN) };
+        if (songName) payload.songName = truncate(String(songName), MAX_FIELD_LEN);
+        if (artist) payload.artist = truncate(String(artist), MAX_FIELD_LEN);
+        if (language) payload.language = truncate(String(language), MAX_FIELD_LEN);
+        if (genre) payload.genre = truncate(String(genre), MAX_FIELD_LEN);
+        const parsedSkipTime = Number(skipTime);
+        if (skipTime != null && Number.isFinite(parsedSkipTime)) payload.skipTime = parsedSkipTime;
+        const parsedSkipTotal = Number(totalDuration);
+        if (totalDuration != null && Number.isFinite(parsedSkipTotal)) payload.totalDuration = parsedSkipTotal;
 
         const result = await logActivity(req.user.uid, 'skip', payload);
         res.json({ success: true, data: result });
@@ -83,16 +100,16 @@ router.post('/skip', authenticateUser, async (req, res) => {
 router.post('/search-click', authenticateUser, async (req, res) => {
     try {
         const { songId, songName, artist, language, genre, query, position } = req.body;
-        if (!songId) {
+        if (!songId || typeof songId !== 'string') {
             return res.status(400).json({ error: '"songId" is required' });
         }
 
-        const payload = { songId };
-        if (songName) payload.songName = songName;
-        if (artist) payload.artist = artist;
-        if (language) payload.language = language;
-        if (genre) payload.genre = genre;
-        if (query) payload.query = query;
+        const payload = { songId: truncate(songId, MAX_FIELD_LEN) };
+        if (songName) payload.songName = truncate(String(songName), MAX_FIELD_LEN);
+        if (artist) payload.artist = truncate(String(artist), MAX_FIELD_LEN);
+        if (language) payload.language = truncate(String(language), MAX_FIELD_LEN);
+        if (genre) payload.genre = truncate(String(genre), MAX_FIELD_LEN);
+        if (query) payload.query = truncate(String(query), MAX_QUERY_LEN);
         if (position != null) payload.position = Number(position);
 
         const result = await logActivity(req.user.uid, 'search_click', payload);
@@ -109,10 +126,21 @@ router.post('/search-click', authenticateUser, async (req, res) => {
 router.get('/history', authenticateUser, async (req, res) => {
     try {
         const { type, limit } = req.query;
+
+        // Validate type against known values to prevent unexpected filter strings
+        if (type && !ALLOWED_ACTIVITY_TYPES.has(type)) {
+            return res.status(400).json({ error: 'Invalid activity type' });
+        }
+
+        const parsedLimit = limit ? parseInt(limit, 10) : 50;
+        if (isNaN(parsedLimit) || parsedLimit < 1) {
+            return res.status(400).json({ error: '"limit" must be a positive integer' });
+        }
+
         const activities = await getRecentActivity(
             req.user.uid,
             type || null,
-            limit ? parseInt(limit, 10) : 50
+            Math.min(parsedLimit, MAX_HISTORY_LIMIT)
         );
         res.json({ success: true, data: activities });
     } catch (error) {

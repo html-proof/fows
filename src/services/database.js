@@ -97,7 +97,9 @@ export async function getRecentActivity(uid, type = null, limit = DEFAULT_ACTIVI
  * Get play counts grouped by artist for a user.
  */
 export async function getArtistPlayCounts(uid, limit = 20) {
-    const plays = await getRecentActivity(uid, 'play', 250);
+    // Query only play events — pass a large window so we don't under-count
+    // behind hundreds of search/skip events in the raw activity log.
+    const plays = await getRecentActivity(uid, 'play', PROFILE_ACTIVITY_SAMPLE_SIZE);
     const artistCounts = {};
 
     for (const play of plays) {
@@ -370,19 +372,22 @@ async function updateListeningHistory(uid, type, payload, timestamp) {
         return next;
     });
 
+    // Write secondary index paths in a single multi-path update so both paths
+    // either succeed together or fail together (no partial TOCTOU state).
+    const secondaryData = {
+        songId,
+        songName: payload.songName || '',
+        artist: payload.artist || '',
+        updatedAt: timestamp,
+    };
+
     if (type === 'play') {
-        await db.ref(`users/${uid}/liked_songs/${songId}`).set({
-            songId,
-            songName: payload.songName || '',
-            artist: payload.artist || '',
-            updatedAt: timestamp,
+        await db.ref().update({
+            [`users/${uid}/recently_played/${songId}`]: secondaryData,
         });
     } else if (type === 'skip') {
-        await db.ref(`users/${uid}/skipped_songs/${songId}`).set({
-            songId,
-            songName: payload.songName || '',
-            artist: payload.artist || '',
-            updatedAt: timestamp,
+        await db.ref().update({
+            [`users/${uid}/skipped_songs/${songId}`]: secondaryData,
         });
     }
 }
@@ -517,12 +522,13 @@ async function updateCoListenPairs(uid, payload, timestamp) {
 
     // Create a canonical pair key (alphabetically sorted to avoid duplicates)
     const pairKey = [lastPlayed.songId, songId].sort().join('__');
+    const sortedPair = [lastPlayed.songId, songId].sort();
     const pairRef = db.ref(`co_listen_pairs/${pairKey}`);
     await pairRef.transaction((current) => {
         const value = current && typeof current === 'object' ? current : {};
         return {
-            songA: [lastPlayed.songId, songId].sort()[0],
-            songB: [lastPlayed.songId, songId].sort()[1],
+            songA: sortedPair[0],
+            songB: sortedPair[1],
             count: (Number.parseInt(value.count, 10) || 0) + 1,
             lastSeen: timestamp,
         };

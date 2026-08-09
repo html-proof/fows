@@ -210,10 +210,10 @@ function pickBestMatch(songs, targetTitle, targetArtist) {
         }
     }
 
-    // Only return if score passes threshold
+    // Without an artist signal, require a higher title-only score to reduce false positives.
     const threshold = normalizedArtist
         ? MIN_FUZZY_SIMILARITY * 100
-        : MIN_FUZZY_SIMILARITY * 60;
+        : MIN_FUZZY_SIMILARITY * 120;
 
     return bestScore >= threshold ? bestSong : null;
 }
@@ -367,9 +367,10 @@ function extractTracksFromSpotifyJson(data) {
             }
         }
         if (items.length > 0) {
+            // JSON-LD from Apple Music / generic sources may omit artist — don't discard valid titles
             return sanitizePlaylistItems(items, {
                 dedupe: true,
-                requireArtist: true,
+                requireArtist: false,
             });
         }
     }

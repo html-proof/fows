@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { authenticateUser } from '../middleware/auth.js';
 import {
     matchPlaylistItems,
     parsePlaylistText,
@@ -9,8 +10,50 @@ import {
 
 const router = Router();
 
-const MAX_ITEMS = 1000000;
+const MAX_ITEMS = 500;
 const SCRAPE_TIMEOUT_MS = 7000;
+
+// Only these hostnames may be fetched server-side (SSRF allowlist)
+const ALLOWED_FETCH_HOSTS = new Set([
+    'open.spotify.com',
+    'spotify.link',
+    'www.youtube.com',
+    'youtube.com',
+    'youtu.be',
+    'music.youtube.com',
+    'music.apple.com',
+]);
+
+// Block RFC-1918, loopback, and link-local targets
+function isPrivateHost(hostname) {
+    if (hostname === 'localhost') return true;
+    if (hostname === '0.0.0.0') return true;
+    // IPv4 loopback / private / link-local / APIPA
+    if (/^127\./.test(hostname)) return true;
+    if (/^10\./.test(hostname)) return true;
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(hostname)) return true;
+    if (/^192\.168\./.test(hostname)) return true;
+    if (/^169\.254\./.test(hostname)) return true;
+    // IPv6 loopback / link-local / IPv4-mapped
+    if (hostname === '::1') return true;
+    if (/^fe80:/i.test(hostname)) return true;
+    if (/^::ffff:/i.test(hostname)) return true; // IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1)
+    // Cloud metadata endpoints
+    if (hostname === '100.100.100.200') return true; // Alibaba Cloud
+    return false;
+}
+
+function assertAllowedUrl(url) {
+    let parsed;
+    try {
+        parsed = new URL(url);
+    } catch {
+        throw new Error('Invalid URL');
+    }
+    if (parsed.protocol !== 'https:') throw new Error('Only HTTPS URLs are allowed');
+    if (!ALLOWED_FETCH_HOSTS.has(parsed.hostname)) throw new Error('Host not allowed');
+    if (isPrivateHost(parsed.hostname)) throw new Error('Host not allowed');
+}
 
 /**
  * POST /api/playlist/import
@@ -32,7 +75,7 @@ const SCRAPE_TIMEOUT_MS = 7000;
  *    stats: { total, matchedCount, unmatchedCount, matchRate }
  *  }
  */
-router.post('/import', async (req, res) => {
+router.post('/import', authenticateUser, async (req, res) => {
     try {
         const { type, content, playlistName, preferredLanguages } = req.body ?? {};
 
@@ -104,7 +147,7 @@ router.post('/import', async (req, res) => {
  * Body: same as /import
  * Response: { success, items: [{ title, artist }] }
  */
-router.post('/parse', async (req, res) => {
+router.post('/parse', authenticateUser, async (req, res) => {
     try {
         const { type, content } = req.body ?? {};
 
@@ -166,6 +209,16 @@ async function parsePlaylistUrl(url) {
             items: [],
             name: '',
             error: 'Please enter a valid playlist URL.',
+        };
+    }
+
+    try {
+        assertAllowedUrl(normalizedUrl);
+    } catch {
+        return {
+            items: [],
+            name: '',
+            error: 'Only Spotify, YouTube, and Apple Music URLs are supported.',
         };
     }
 
@@ -240,9 +293,13 @@ function normalizeIncomingUrl(rawUrl) {
     }
 }
 
-async function fetchPageHtml(url) {
+async function fetchPageHtml(url, depth = 0) {
+    if (depth > 5) throw new Error('Too many redirects');
+    // Validate before every fetch (including recursive calls)
+    assertAllowedUrl(url);
+
     let lastError;
-    const maxRetries = 1;
+    const maxRetries = 2;
     for (let i = 0; i < maxRetries; i++) {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), SCRAPE_TIMEOUT_MS);
@@ -257,17 +314,28 @@ async function fetchPageHtml(url) {
                     'Cache-Control': 'no-cache',
                     'Pragma': 'no-cache',
                 },
-                redirect: 'follow',
+                redirect: 'manual', // Validate redirect targets before following
             });
 
-            const html = await response.text();
-            if (!html) {
-                throw new Error(`Empty response body (HTTP ${response.status})`);
+            // Handle redirects manually so each hop is validated
+            if (response.status >= 300 && response.status < 400) {
+                const location = response.headers.get('location');
+                if (location) {
+                    const redirectUrl = new URL(location, url).toString();
+                    assertAllowedUrl(redirectUrl);
+                    return fetchPageHtml(redirectUrl, depth + 1);
+                }
             }
+
+            const html = await response.text();
 
             if (!response.ok) {
                 console.warn(`Received HTTP ${response.status} from ${url}`);
             }
+
+            // Empty body is valid (e.g. Spotify unavailable page) — return it
+            // so the caller's parser returns an empty item list instead of retrying.
+            if (!html) return '';
 
             // Handle spotify.link redirection if returned as meta refresh
             if (url.includes('spotify.link') && html.includes('open.spotify.com')) {
@@ -349,7 +417,7 @@ async function parseSpotifyPage(html, url) {
         const playlistId = extractSpotifyPlaylistId(url, html);
         if (playlistId) {
             try {
-                const embedHtml = await fetchPageHtml(toSpotifyEmbedUrl(playlistId));
+                const embedHtml = await fetchPageHtml(toSpotifyEmbedUrl(playlistId), 0);
                 if (!name) {
                     name = extractMetaContent(embedHtml, 'og:title')
                         || extractMetaContent(embedHtml, 'twitter:title');

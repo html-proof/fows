@@ -67,9 +67,14 @@ router.get('/', authenticateUser, async (req, res) => {
 router.post('/next', authenticateUser, async (req, res) => {
     try {
         const limit = Math.min(parseInt(req.body?.limit, 10) || 10, 20);
-        const currentSong = req.body?.currentSong ?? req.body ?? {};
-        const hasSongIdentity = currentSong?.songId || currentSong?.id;
-        if (!hasSongIdentity && !currentSong?.language) {
+        const currentSong = req.body?.currentSong;
+        if (!currentSong || typeof currentSong !== 'object') {
+            return res.status(400).json({
+                error: '"currentSong" object is required',
+            });
+        }
+        const hasSongIdentity = currentSong.songId || currentSong.id;
+        if (!hasSongIdentity && !currentSong.language) {
             return res.status(400).json({
                 error: 'currentSong.songId (or id) or currentSong.language is required',
             });

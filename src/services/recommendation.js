@@ -83,7 +83,8 @@ export async function generateRecommendations(userPrefs, uid) {
 
     // From favorite artists
     for (const artist of favoriteArtists.slice(0, 5)) {
-        seedQueries.add(artist.name || artist);
+        const artistName = (typeof artist === 'string' ? artist : artist?.name) || '';
+        if (artistName) seedQueries.add(artistName);
     }
 
     // From top played artists
@@ -135,7 +136,6 @@ export async function generateRecommendations(userPrefs, uid) {
         .filter(Boolean)
         .slice(0, 10);
 
-    let coListenResults = [];
     try {
         const coListenPromises = recentlyPlayedSongIds.slice(0, 5).map(id =>
             getCoListenedSongs(id, 10).catch(() => [])
@@ -154,16 +154,14 @@ export async function generateRecommendations(userPrefs, uid) {
 
     // Fetch songs from Saavn for each seed (in parallel, limited)
     const queries = Array.from(seedQueries).slice(0, 15);
-    const results = await Promise.allSettled(
+    const results = await Promise.all(
         queries.map(q => searchSongsOnly(q).catch(() => ({ data: { results: [] } })))
     );
 
     // Collect all candidate songs
     const songMap = new Map();
 
-    for (const result of results) {
-        if (result.status !== 'fulfilled') continue;
-        const data = result.value;
+    for (const data of results) {
 
         const songs = data?.data?.results || data?.results || [];
         for (const song of songs) {
@@ -415,15 +413,20 @@ export async function generateNextSongRecommendations({ uid, currentSong, limit 
         mode: 'recommendation',
     }).catch(() => filtered.slice(0, safeLimit * 4));
 
-    return reranked.slice(0, safeLimit).map(song => ({
-        ...song,
-        _nextReason: {
-            sameLanguage: true,
-            differentArtist: true,
-            differentAlbum: true,
-            filteredRecent: true,
-        },
-    }));
+    return reranked.slice(0, safeLimit).map(song => {
+        const songId = String(song?.id || '').trim();
+        return {
+            ...song,
+            _nextReason: {
+                sameLanguage: context.language
+                    ? normalizeText(song?.language) === context.language
+                    : null,
+                differentArtist: !isSameArtist(song, context),
+                differentAlbum: !isSameAlbum(song, context),
+                filteredRecent: !recentSongIds.has(songId),
+            },
+        };
+    });
 }
 
 // ══════════════════════════════════════════════════════
@@ -755,7 +758,10 @@ function isSameAlbum(song, context) {
     const albumId = String(song?.album?.id || song?.albumId || '').trim();
     if (context.albumId && albumId && context.albumId === albumId) return true;
 
-    const albumName = normalizeText(song?.album?.name || song?.album || '');
+    const rawAlbum = song?.album;
+    const albumName = normalizeText(
+        (typeof rawAlbum === 'object' ? rawAlbum?.name : rawAlbum) || ''
+    );
     if (context.albumName && albumName && context.albumName === albumName) return true;
 
     return false;

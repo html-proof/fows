@@ -7,7 +7,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const projectRoot = resolve(__dirname, '..', '..');
 
-const databaseURL = process.env.FIREBASE_DATABASE_URL || 'https://music-16f5c-default-rtdb.asia-southeast1.firebasedatabase.app';
+const databaseURL = process.env.FIREBASE_DATABASE_URL;
+if (!databaseURL) {
+    throw new Error('FIREBASE_DATABASE_URL environment variable is required');
+}
 const serviceAccountEnv = process.env.FIREBASE_SERVICE_ACCOUNT;
 
 let serviceAccount = null;

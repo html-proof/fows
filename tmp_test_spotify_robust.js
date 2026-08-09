@@ -1,6 +1,6 @@
 import { parseSpotifyEmbedHtml } from './src/services/playlistMatcher.js';
 import fs from 'fs';
-// this are the updated libary
+// these are the updated libraries
 async function testUrl(url) {
     console.log(`\nTesting URL: ${url}`);
     try {

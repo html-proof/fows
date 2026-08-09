@@ -1,5 +1,7 @@
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 
 import saavnRoutes from './routes/saavn.js';
 import userRoutes from './routes/user.js';
@@ -10,6 +12,9 @@ import { isShuttingDown } from './runtimeState.js';
 
 const app = express();
 
+// Security headers
+app.use(helmet());
+
 const allowedOrigins = (process.env.CORS_ORIGINS || '')
     .split(',')
     .map(origin => origin.trim())
@@ -17,8 +22,13 @@ const allowedOrigins = (process.env.CORS_ORIGINS || '')
 
 const corsOptions = {
     origin: (origin, callback) => {
-        if (!origin) return callback(null, true);
+        // No origin = server-to-server or curl; allow only in non-production
+        if (!origin) {
+            if (process.env.NODE_ENV === 'production') return callback(null, false);
+            return callback(null, true);
+        }
         if (allowedOrigins.length === 0) {
+            // Deny all browser cross-origin requests when no allowlist is configured
             return callback(null, false);
         }
         return callback(null, allowedOrigins.includes(origin));
@@ -32,13 +42,35 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
-app.use(express.json());
+
+// Limit request body size
+app.use(express.json({ limit: '50kb' }));
+
+// Global rate limit: 120 requests/minute per IP
+const globalLimiter = rateLimit({
+    windowMs: 60_000,
+    max: 120,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests, please try again later.' },
+});
+
+// Tighter limit for write-heavy / scraping endpoints
+const strictLimiter = rateLimit({
+    windowMs: 60_000,
+    max: 15,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests, please try again later.' },
+});
+
+app.use(globalLimiter);
 
 app.use('/api', saavnRoutes);
 app.use('/api/user', userRoutes);
 app.use('/api/activity', activityRoutes);
 app.use('/api/recommendations', recommendationRoutes);
-app.use('/api/playlist', playlistImportRoutes);
+app.use('/api/playlist', strictLimiter, playlistImportRoutes);
 
 // Lightweight health routes for keepalive probes.
 app.get('/healthz', (_req, res) => {
