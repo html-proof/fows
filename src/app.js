@@ -8,6 +8,7 @@ import userRoutes from './routes/user.js';
 import activityRoutes from './routes/activity.js';
 import recommendationRoutes from './routes/recommendations.js';
 import playlistImportRoutes from './routes/playlistImport.js';
+import catalogRoutes from './routes/catalog.js';
 import { isShuttingDown } from './runtimeState.js';
 
 const app = express();
@@ -71,6 +72,7 @@ app.use('/api/user', userRoutes);
 app.use('/api/activity', activityRoutes);
 app.use('/api/recommendations', recommendationRoutes);
 app.use('/api/playlist', strictLimiter, playlistImportRoutes);
+app.use('/v1', catalogRoutes);
 
 // Lightweight health routes for keepalive probes.
 app.get('/healthz', (_req, res) => {

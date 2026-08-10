@@ -23,6 +23,7 @@ import {
 import { getUserPreferences } from '../services/database.js';
 import { rerankSongsForUser } from '../services/personalizationModel.js';
 import { searchItunes, enrichSongsWithItunes } from '../services/itunesService.js';
+import { attachCanonicalIds } from '../services/identityResolver.js';
 
 const router = Router();
 const DEFAULT_LIMIT = 20;
@@ -155,7 +156,7 @@ router.get('/search', async (req, res) => {
             })
             : songsBeforePersonalization;
 
-        const songsOut = rankedSongs.slice(0, limit);
+        const songsOut = attachCanonicalIds(rankedSongs.slice(0, limit));
 
         const albumsOut = albumsData.status === 'fulfilled'
             ? (albumsData.value?.data?.results ?? []).slice(0, limit)
