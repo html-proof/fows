@@ -154,6 +154,13 @@ export function buildSearchVariants(analysis) {
         push(titleWords.slice(0, 2).join(' '));
     }
 
+    // Movie/album name search: when the query is short (≤ 3 tokens) and has no
+    // explicit movie detected, also try it as a movie title so JioSaavn's album
+    // search returns songs from that film (e.g. "perumazhakkalam songs").
+    if (!movie && titleWords.length <= 3) {
+        push(`${cleanTitle} songs`);
+    }
+
     return variants.slice(0, 5);
 }
 
@@ -267,13 +274,30 @@ export function scoreSong(song, analysis) {
     }
 
     // ── Movie/Album match ────────────────────────────────────────────────
-    if (movie) {
-        const movieNorm = normText(movie);
+    // When the user typed an explicit movie ("malare premam"), use that.
+    // When they didn't (bare "perumazhakkalam"), still check if the album
+    // name matches the cleanTitle — this handles "user searched a movie name"
+    // without explicit movie syntax.
+    const movieNorm = movie ? normText(movie) : null;
+    const implicitMovieNorm = !movie && cleanTitle ? normText(cleanTitle) : null;
+
+    if (movieNorm) {
         if (albumName === movieNorm || albumName.includes(movieNorm) || movieNorm.includes(albumName)) {
             score += 25;
         } else {
             const movieSim = bigramSimilarity(albumName, movieNorm);
             if (movieSim > 0.5) score += movieSim * 20;
+        }
+    } else if (implicitMovieNorm && albumName && albumName !== songName) {
+        // Only apply implicit album boost when the query doesn't already match
+        // the song title well (avoids double-counting on actual song title searches).
+        const titleMatchScore = songName === implicitMovieNorm ? 100
+            : (songName.startsWith(implicitMovieNorm) ? 70 : 0);
+        if (titleMatchScore < 50) {
+            const albumSim = bigramSimilarity(albumName, implicitMovieNorm);
+            if (albumSim >= 0.85) score += 30;        // very strong album match
+            else if (albumSim >= 0.65) score += 18;   // good album match
+            else if (albumSim >= 0.45) score += 8;    // weak — small nudge
         }
     }
 

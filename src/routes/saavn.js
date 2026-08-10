@@ -156,7 +156,28 @@ router.get('/search', async (req, res) => {
             })
             : songsBeforePersonalization;
 
-        const songsOut = attachCanonicalIds(rankedSongs.slice(0, limit));
+        let finalRanked = rankedSongs;
+
+        // ── Album-song injection ─────────────────────────────────────────────
+        // When results are sparse (< 5 songs) and an album matches the query,
+        // pull that album's songs in. Handles queries like "perumazhakkalam"
+        // where the user typed a movie/album name rather than a song title.
+        if (finalRanked.length < 5 && albumsData.status === 'fulfilled') {
+            const topAlbum = (albumsData.value?.data?.results ?? [])[0];
+            if (topAlbum?.id) {
+                try {
+                    const albumDetail = await getAlbumById(topAlbum.id);
+                    const albumSongs = albumDetail?.data?.songs ?? albumDetail?.data?.list ?? [];
+                    if (albumSongs.length > 0) {
+                        const enrichedAlbumSongs = enrichSongsWithItunes(albumSongs, itunesTracks);
+                        const ranked = rankSongs(deduplicateSongs([...enrichedAlbumSongs, ...finalRanked]), analysis);
+                        finalRanked = ranked;
+                    }
+                } catch (_) { /* album fetch is best-effort */ }
+            }
+        }
+
+        const songsOut = attachCanonicalIds(finalRanked.slice(0, limit));
 
         const albumsOut = albumsData.status === 'fulfilled'
             ? (albumsData.value?.data?.results ?? []).slice(0, limit)
