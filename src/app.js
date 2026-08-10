@@ -14,6 +14,9 @@ import { isShuttingDown } from './runtimeState.js';
 
 const app = express();
 
+// Trust the first proxy hop (nginx / cloud LB sets X-Forwarded-For)
+app.set('trust proxy', 1);
+
 // Security headers
 app.use(helmet());
 
