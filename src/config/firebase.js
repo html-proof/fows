@@ -18,6 +18,12 @@ let serviceAccount = null;
 if (serviceAccountEnv) {
     try {
         serviceAccount = JSON.parse(serviceAccountEnv);
+        // Some platforms (Render, Railway, Heroku) double-escape newlines in env vars,
+        // turning the PEM "-----BEGIN PRIVATE KEY-----\n..." into literal \\n.
+        // Fix it before handing the key to the Admin SDK.
+        if (serviceAccount?.private_key) {
+            serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+        }
         console.log('✅ Firebase service account loaded from FIREBASE_SERVICE_ACCOUNT environment variable.');
     } catch (e) {
         console.error('❌ Failed to parse FIREBASE_SERVICE_ACCOUNT environment variable. Ensure it is valid JSON.');
@@ -55,10 +61,24 @@ admin.initializeApp({
     databaseURL: databaseURL
 });
 
-
-const db = admin.database(); // Realtime Database
-const firestore = admin.firestore(); // Keep firestore for compatibility or transition if needed
+const db = admin.database();
+const firestore = admin.firestore();
 const auth = admin.auth();
+
+// Probe the credential at startup so a bad key surfaces immediately as a clear
+// error instead of an opaque @firebase/database WARNING on the first request.
+admin.app().options.credential.getAccessToken()
+    .then(() => console.log('✅ Firebase Admin credential verified (OAuth2 token obtained).'))
+    .catch(err => {
+        console.error(
+            '❌ Firebase Admin credential FAILED to obtain an OAuth2 token.',
+            '\n   Likely causes:',
+            '\n   1. FIREBASE_SERVICE_ACCOUNT private_key has escaped \\\\n — check Render env var encoding.',
+            '\n   2. The service account has been deleted or its key revoked in GCP Console.',
+            '\n   3. Render cannot reach oauth2.googleapis.com (transient network issue — will retry automatically).',
+            '\n   Error:', err?.message ?? err,
+        );
+    });
 
 export { admin, db, firestore, auth };
 export default admin;
