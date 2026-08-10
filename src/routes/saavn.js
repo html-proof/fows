@@ -224,22 +224,24 @@ router.get('/search', async (req, res) => {
 });
 
 // Trending searches endpoint (used by search home screen)
+// Returns actual trending artists/queries from activity data, with hardcoded fallback.
+const _TRENDING_FALLBACK = [
+    'Arijit Singh', 'Sid Sriram', 'Anirudh', 'AP Dhillon',
+    'Pritam', 'A.R. Rahman', 'Shreya Ghoshal', 'Diljit Dosanjh',
+    'New Malayalam hits', 'New Tamil releases',
+];
+
 router.get('/search/trending', async (_req, res) => {
-    res.json({
-        success: true,
-        trending: [
-            'Aavesham songs',
-            'Sid Sriram',
-            'New Malayalam hits',
-            'Arijit Singh',
-            'Anirudh',
-            'KGF 2',
-            'Believer',
-            'New Tamil releases',
-            'AP Dhillon',
-            'Pritam',
-        ],
-    });
+    try {
+        const trending = await getGlobalTrending(10);
+        const queries = trending.length >= 3
+            ? [...new Set(trending.map(t => t.artist || t.songName).filter(Boolean))].slice(0, 10)
+            : _TRENDING_FALLBACK;
+
+        res.json({ success: true, trending: queries.length ? queries : _TRENDING_FALLBACK });
+    } catch {
+        res.json({ success: true, trending: _TRENDING_FALLBACK });
+    }
 });
 
 // ── Common artist-name typo corrections ──────────────────────────────────────
