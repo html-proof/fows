@@ -1,4 +1,8 @@
 import { request } from 'undici';
+import {
+    searchSongsOnlyDirect,
+    getSongDirect,
+} from './jiosaavnDirect.js';
 
 const BASE_URL = 'https://saavn.sumit.co';
 const FALLBACK_BASE_URL = 'https://jiosaavn-api-murex.vercel.app';
@@ -136,17 +140,42 @@ export async function searchSongsOnly(query, page = 1) {
         }
     }
 
+    // Check if primary returned useful results (with download URLs)
+    const primarySongs = primaryPayload?.data?.results ?? [];
+    const primaryHasUrls = primarySongs.some(s => s.downloadUrl?.length > 0);
+
+    if (primarySongs.length >= SMART_SEARCH_MIN_RESULTS && primaryHasUrls && pageNumber > 1) {
+        return primaryPayload;
+    }
+
+    // Try proxy fallback
+    const fallbackSongs = primaryPayload
+        ? await searchSongsOnlyFallback(query).catch(() => [])
+        : await searchSongsOnlyFallback(query);
+
+    const fallbackHasUrls = fallbackSongs.some(s => s.downloadUrl?.length > 0);
+
+    // Try direct JioSaavn API when both proxies either fail or return songs without download URLs
+    if ((!primaryHasUrls && !fallbackHasUrls) || (!primaryPayload && fallbackSongs.length === 0)) {
+        try {
+            const directPayload = await searchSongsOnlyDirect(query, 25);
+            if (directPayload?.data?.results?.length > 0) {
+                console.info(`[saavnApi] Direct fallback resolved ${directPayload.data.results.length} songs for "${query}"`);
+                return directPayload;
+            }
+        } catch (directErr) {
+            console.warn(`[saavnApi] Direct JioSaavn fallback failed: ${directErr?.message}`);
+        }
+    }
+
     if (!primaryPayload) {
-        const fallbackSongs = await searchSongsOnlyFallback(query);
         return wrapSongsOnlyResponse(fallbackSongs);
     }
 
-    const primarySongs = primaryPayload?.data?.results ?? [];
     if (primarySongs.length >= SMART_SEARCH_MIN_RESULTS || pageNumber > 1) {
         return primaryPayload;
     }
 
-    const fallbackSongs = await searchSongsOnlyFallback(query).catch(() => []);
     if (fallbackSongs.length === 0) {
         return primaryPayload;
     }
@@ -424,11 +453,22 @@ export async function getSongById(id) {
                         label: 'Fallback song fetch',
                     }
                 );
-                return {
-                    success: true,
-                    data: fallbackData?.data ?? [],
-                };
-            } catch (fallbackError) {
+                const songs = fallbackData?.data ?? [];
+                // If proxy returned song but without download URL, try direct
+                const hasDlUrl = (Array.isArray(songs) ? songs : [songs]).some(s => s?.downloadUrl?.length > 0);
+                if (!hasDlUrl) throw new Error('no downloadUrl in proxy response');
+                return { success: true, data: songs };
+            } catch (_proxyErr) {
+                // Final resort: official JioSaavn API with decryption
+                try {
+                    const directSong = await getSongDirect(id);
+                    if (directSong) {
+                        console.info(`[saavnApi] Direct fallback resolved song ${id}`);
+                        return { success: true, data: [directSong] };
+                    }
+                } catch (directErr) {
+                    console.warn(`[saavnApi] Direct getSong fallback failed for ${id}: ${directErr?.message}`);
+                }
                 return {
                     success: false,
                     error: 'Service temporarily unavailable',
