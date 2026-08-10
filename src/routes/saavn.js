@@ -24,6 +24,7 @@ import { getUserPreferences } from '../services/database.js';
 import { rerankSongsForUser } from '../services/personalizationModel.js';
 import { searchItunes, enrichSongsWithItunes, buildItunesQueries } from '../services/itunesService.js';
 import { attachCanonicalIds } from '../services/identityResolver.js';
+import { resolveItunesCountry } from '../services/regionResolver.js';
 
 const router = Router();
 const DEFAULT_LIMIT = 20;
@@ -60,6 +61,7 @@ router.get('/search', async (req, res) => {
         }
 
         const { uid, preferredLanguages } = await resolveUserContext(req);
+        const itunesCountry = resolveItunesCountry(req);
         const parsedPage = parseInt(req.query.page, 10);
         const page = Number.isNaN(parsedPage) ? 1 : Math.max(parsedPage, 1);
         const parsedLimit = parseInt(req.query.limit, 10);
@@ -117,7 +119,7 @@ router.get('/search', async (req, res) => {
         // Cap at 2 to stay well under Apple's ~20 req/min rate limit.
         const itunesQueries = buildItunesQueries(analysis);
         const itunesFetch = Promise.all(
-            itunesQueries.map(q => searchItunes(q, { limit: 25, country: 'IN' }).catch(() => []))
+            itunesQueries.map(q => searchItunes(q, { limit: 25, country: itunesCountry }).catch(() => []))
         ).then(results => results.flat());
 
         const [songResults, albumsData, artistsData, itunesResults] = await Promise.allSettled([

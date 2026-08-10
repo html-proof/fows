@@ -40,6 +40,7 @@ import {
     PlaybackResolveError,
 } from '../services/playbackResolver.js';
 import { getUserPreferences } from '../services/database.js';
+import { resolveItunesCountry } from '../services/regionResolver.js';
 import { rerankSongsForUser } from '../services/personalizationModel.js';
 
 const router = Router();
@@ -111,9 +112,10 @@ router.get('/catalog/search', async (req, res) => {
         const primaryQ = analysis.cleanTitle || rawQ;
 
         // Build targeted iTunes queries (0–2, never mood/genre queries)
+        const itunesCountry = resolveItunesCountry(req);
         const itunesQueries = buildItunesQueries(analysis);
         const itunesFetch = Promise.all(
-            itunesQueries.map(q => searchItunes(q, { limit: 25, country: 'IN' }).catch(() => []))
+            itunesQueries.map(q => searchItunes(q, { limit: 25, country: itunesCountry }).catch(() => []))
         ).then(results => results.flat());
 
         // Fan-out: JioSaavn + iTunes in parallel
