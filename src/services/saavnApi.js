@@ -973,6 +973,18 @@ function scoreSongMatch({
     } = extractSongSearchFields(song);
     const compactQuery = normalizeCompact(query);
     const queryTerms = tokenize(query).filter(token => !QUERY_NOISE_WORDS.has(token));
+    // A query such as "Malayalam songs" is a browse request, not a title
+    // lookup. Treating its language and generic words as required title terms
+    // rejects nearly every valid result before it reaches the client.
+    const isLanguageBrowseQuery = Boolean(languageHint) && queryTerms.length === 0;
+    if (isLanguageBrowseQuery) {
+        const language = normalizeQuery(song.language ?? '');
+        if (language !== languageHint) return null;
+        return {
+            score: 180 + sourceWeight - (variantIndex * 15),
+            matchTier: MATCH_TIERS.CONTAINS,
+        };
+    }
     const effectiveTerms = queryTerms.length > 0 ? queryTerms : tokenize(query);
     const queryWantsDerivative = containsDerivativeKeyword(query);
     // For short queries (1-2 tokens), require ALL tokens to match. For longer, allow 1 miss.
