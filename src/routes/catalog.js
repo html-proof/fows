@@ -99,12 +99,16 @@ router.get('/catalog/search', async (req, res) => {
         const analysis = analyzeQuery(rawQ);
         const primaryQ = analysis.cleanTitle || rawQ;
 
-        // JioSaavn search
-        const saavnRaw = await searchSongsSmart(primaryQ, { page, limit: limit + 10, preferredLanguages: [] })
-            .catch(() => searchSongsOnly(primaryQ, page, limit + 10).catch(() => []));
+        // JioSaavn search — searchSongsSmart returns Song[], searchSongsOnly returns payload
+        const saavnRaw = await searchSongsSmart(primaryQ, { preferredLanguages: [], waitForFresh: true })
+            .catch(async () => {
+                const payload = await searchSongsOnly(primaryQ, page).catch(() => null);
+                return payload?.data?.results ?? [];
+            });
 
         // Deduplicate → rank
-        let songs = rankSongs(deduplicateSongs(saavnRaw ?? []), analysis).slice(0, limit);
+        const rawSongs = Array.isArray(saavnRaw) ? saavnRaw : (saavnRaw?.data?.results ?? []);
+        let songs = rankSongs(deduplicateSongs(rawSongs), analysis).slice(0, limit);
 
         // Personalise if user is known
         if (uid) {
@@ -296,7 +300,7 @@ async function _fetchRecommended(uid, languages) {
             const langs = languages.length ? languages : (prefs?.languages ?? ['hindi']);
             const lang = langs[Math.floor(Math.random() * langs.length)] ?? 'hindi';
             const raw = await searchSongsOnly(`top ${lang} songs`, 1, 25);
-            return attachCanonicalIds(raw ?? []).map(shapeSong);
+            return attachCanonicalIds(raw?.data?.results ?? []).map(shapeSong);
         } catch {
             return [];
         }
@@ -329,7 +333,7 @@ async function _fetchTrending(languages) {
     try {
         const lang = languages[0] ?? 'hindi';
         const raw = await searchSongsOnly(`trending ${lang}`, 1, 20);
-        return attachCanonicalIds(raw ?? []).map(shapeSong);
+        return attachCanonicalIds(raw?.data?.results ?? []).map(shapeSong);
     } catch {
         return [];
     }
