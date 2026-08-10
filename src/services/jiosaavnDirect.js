@@ -36,15 +36,26 @@ function _decryptMediaUrl(encrypted) {
 }
 
 function _buildDownloadUrls(encrypted, has320) {
-    const base96 = _decryptMediaUrl(encrypted);
-    if (!base96) return [];
+    const baseUrl = _decryptMediaUrl(encrypted);
+    if (!baseUrl) return [];
+
+    // Detect the bitrate token in the URL (e.g. _96, _160, _320, _48, _12)
+    // Pattern: _(digits)(optional suffix like _p or _v4).mp4
+    const bitrateMatch = baseUrl.match(/_(12|48|96|160|320)(?:_[^./]*)?\.mp4/);
+    const detectedBitrate = bitrateMatch ? bitrateMatch[1] : '96';
+
+    const _swap = (kbps) =>
+        baseUrl.replace(
+            new RegExp(`_${detectedBitrate}((?:_[^./]*)?\\.mp4)$`),
+            `_${kbps}$1`,
+        );
 
     const urls = [];
-    if (has320) {
-        urls.push({ quality: '320kbps', url: base96.replace('_96.mp4', '_320.mp4') });
-    }
-    urls.push({ quality: '160kbps', url: base96.replace('_96.mp4', '_160.mp4') });
-    urls.push({ quality:  '96kbps', url: base96 });
+    if (has320) urls.push({ quality: '320kbps', url: _swap('320') });
+    urls.push({ quality: '160kbps', url: _swap('160') });
+    urls.push({ quality:  '96kbps', url: _swap('96')  });
+    urls.push({ quality:  '48kbps', url: _swap('48')  });
+    urls.push({ quality:  '12kbps', url: _swap('12')  });
     return urls;
 }
 
