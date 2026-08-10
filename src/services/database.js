@@ -75,8 +75,15 @@ export async function getRecentActivity(uid, type = null, limit = DEFAULT_ACTIVI
     const safeLimit = Number.isFinite(limit)
         ? Math.max(1, Math.min(Math.floor(limit), PROFILE_ACTIVITY_SAMPLE_SIZE))
         : DEFAULT_ACTIVITY_LIMIT;
+
+    // When filtering by type, fetch a larger window so the post-filter result
+    // isn't starved by other event types (search, skip, etc.).
+    const fetchLimit = type
+        ? Math.min(safeLimit * 6, PROFILE_ACTIVITY_SAMPLE_SIZE)
+        : safeLimit;
+
     const query = db.ref(`users/${uid}/activity`).orderByChild('timestamp');
-    const snapshot = await query.limitToLast(safeLimit).get();
+    const snapshot = await query.limitToLast(fetchLimit).get();
     if (!snapshot.exists()) return [];
 
     let activities = [];
@@ -90,7 +97,8 @@ export async function getRecentActivity(uid, type = null, limit = DEFAULT_ACTIVI
         activities = activities.filter(activity => activity.type === type);
     }
 
-    return activities;
+    // Trim to the originally requested limit after filtering
+    return activities.slice(0, safeLimit);
 }
 
 /**
