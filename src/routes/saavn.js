@@ -13,6 +13,13 @@ import {
     getLyricsBySongId,
 } from '../services/saavnApi.js';
 import { auth } from '../config/firebase.js';
+import {
+    analyzeQuery,
+    buildSearchVariants,
+    rankSongs,
+    deduplicateSongs,
+    resolveTopResult as engineResolveTopResult,
+} from '../services/searchEngine.js';
 import { getUserPreferences } from '../services/database.js';
 import { rerankSongsForUser } from '../services/personalizationModel.js';
 
@@ -45,8 +52,8 @@ const LANGUAGE_HINTS = new Set([
 // Example: /api/search?query=Imagine+Dragons&page=2
 router.get('/search', async (req, res) => {
     try {
-        const query = normalizeSearchQuery(req.query.query);
-        if (!query) {
+        const rawQuery = normalizeSearchQuery(req.query.query);
+        if (!rawQuery) {
             return res.status(400).json({ error: 'Query parameter "query" is required' });
         }
 
@@ -58,79 +65,85 @@ router.get('/search', async (req, res) => {
             ? DEFAULT_LIMIT
             : Math.max(MIN_LIMIT, Math.min(parsedLimit, MAX_LIMIT));
 
-        // Expand query using NLP intent detection (used by both page 1 and load-more)
-        const pageOneIntent = detectSearchIntent(query);
-        const expandedQuery = pageOneIntent ? pageOneIntent.expandedQuery : query;
+        // ── Step 1: Understand what the user meant ──────────────────────────
+        const analysis = analyzeQuery(rawQuery);
 
-        // For page > 1, only fetch songs. This powers "load more" efficiently.
+        // Also apply old NLP (mood / similarity keywords) — keep for backward compat
+        const nlpIntent = detectSearchIntent(rawQuery);
+        const nlpExpandedQuery = nlpIntent ? nlpIntent.expandedQuery : rawQuery;
+
+        // Merge: if language/movie were stripped by analyzeQuery, use cleanTitle for NLP too
+        const primaryQuery = analysis.cleanTitle || rawQuery;
+
+        // ── Step 2: Load-more (page > 1) — only songs, re-ranked ────────────
         if (page > 1) {
-            const songsData = await searchSongsOnly(expandedQuery, page);
-            const baseSongs = prioritizeSongsByLanguage(
-                songsData?.data?.results ?? [],
-                preferredLanguages
-            );
-            const rankedSongs = uid
-                ? await rerankSongsForUser({
-                    uid,
-                    songs: baseSongs,
-                    query,
-                    preferredLanguages,
-                    mode: 'search',
-                })
-                : baseSongs;
-            const songs = rankedSongs.slice(0, limit);
-            const relatedLanguages = buildRelatedLanguages({
-                query,
-                preferredLanguages,
-                songs,
-                albums: [],
-            });
+            const songsData = await searchSongsOnly(nlpExpandedQuery, page);
+            const rawSongs = songsData?.data?.results ?? [];
+            const scored = rankSongs(deduplicateSongs(rawSongs), analysis);
+            const orderedSongs = preferredLanguages.length > 0
+                ? prioritizeSongsByLanguage(scored, preferredLanguages)
+                : scored;
+            const finalSongs = uid
+                ? await rerankSongsForUser({ uid, songs: orderedSongs, query: rawQuery, preferredLanguages, mode: 'search' })
+                : orderedSongs;
+            const songs = finalSongs.slice(0, limit);
             return res.json({
                 success: true,
                 data: {
                     songs,
                     albums: [],
                     artists: [],
-                    topResult: songs.length > 0
-                        ? { type: 'song', data: songs[0] }
-                        : null,
-                    relatedLanguages,
+                    topResult: songs.length > 0 ? { type: 'song', data: songs[0] } : null,
+                    relatedLanguages: buildRelatedLanguages({ query: rawQuery, preferredLanguages, songs, albums: [] }),
                     albumLanguageSections: [],
-                    sections: buildSearchSections({
-                        songs,
-                        albums: [],
-                        artists: [],
-                        topResult: songs.length > 0
-                            ? { type: 'song', data: songs[0] }
-                            : null,
-                        albumLanguageSections: [],
-                    }),
+                    sections: buildSearchSections({ songs, albums: [], artists: [], topResult: songs.length > 0 ? { type: 'song', data: songs[0] } : null, albumLanguageSections: [] }),
                 },
             });
         }
 
-        // First page returns songs + albums + artists
-        const [songsData, albumsData, artistsData] = await Promise.allSettled([
-            searchSongsSmart(expandedQuery, { preferredLanguages }),
-            searchAlbums(expandedQuery),
-            searchArtists(expandedQuery),
+        // ── Step 3: Page 1 — multi-variant parallel search ──────────────────
+        // Build query variants from analysis (most-specific → least-specific)
+        const searchVariants = buildSearchVariants(analysis);
+
+        // Fire songs from each variant + albums + artists in parallel
+        const songFetches = searchVariants.map(variant =>
+            searchSongsSmart(variant, { preferredLanguages, waitForFresh: true })
+                .catch(() => [])
+        );
+
+        const [songResults, albumsData, artistsData] = await Promise.allSettled([
+            Promise.all(songFetches),
+            searchAlbums(primaryQuery),
+            searchArtists(primaryQuery),
         ]);
 
-        const songs = songsData.status === 'fulfilled'
-            ? songsData.value ?? []
+        // ── Step 4: Merge + deduplicate + rank songs ─────────────────────────
+        const allRawSongs = songResults.status === 'fulfilled'
+            ? songResults.value.flat().filter(Boolean)
             : [];
-        const orderedSongs = prioritizeSongsByLanguage(songs, preferredLanguages);
+
+        // Deduplicate first (same song from multiple variants), then rank
+        const dedupedSongs = deduplicateSongs(allRawSongs);
+        const rankedByEngine = rankSongs(dedupedSongs, analysis);
+
+        // Apply language preference as a secondary sort layer (doesn't override exact matches)
+        const songsWithLangPref = preferredLanguages.length > 0
+            ? applyLanguageBoost(rankedByEngine, preferredLanguages, analysis)
+            : rankedByEngine;
+
+        const songsBeforePersonalization = songsWithLangPref;
         const rankedSongs = uid
             ? await rerankSongsForUser({
                 uid,
-                songs: orderedSongs,
-                query,
+                songs: songsBeforePersonalization.slice(0, 40), // personalize top 40 only
+                query: rawQuery,
                 preferredLanguages,
                 mode: 'search',
             })
-            : orderedSongs;
+            : songsBeforePersonalization;
 
         const songsOut = rankedSongs.slice(0, limit);
+
         const albumsOut = albumsData.status === 'fulfilled'
             ? (albumsData.value?.data?.results ?? []).slice(0, limit)
             : [];
@@ -138,8 +151,16 @@ router.get('/search', async (req, res) => {
             ? (artistsData.value?.data?.results ?? []).slice(0, limit)
             : [];
 
+        // ── Step 5: Resolve top result using engine scoring ──────────────────
+        const topResult = engineResolveTopResult({
+            analysis,
+            songs: songsOut,
+            albums: albumsOut,
+            artists: artistsOut,
+        });
+
         const relatedLanguages = buildRelatedLanguages({
-            query,
+            query: rawQuery,
             preferredLanguages,
             songs: songsOut,
             albums: albumsOut,
@@ -149,12 +170,6 @@ router.get('/search', async (req, res) => {
             songs: songsOut,
             relatedLanguages,
             maxBuckets: MAX_ALBUM_LANGUAGE_BUCKETS,
-        });
-        const topResult = resolveTopResult({
-            query,
-            songs: songsOut,
-            albums: albumsOut,
-            artists: artistsOut,
         });
 
         res.json({
@@ -166,6 +181,12 @@ router.get('/search', async (req, res) => {
                 topResult,
                 relatedLanguages,
                 albumLanguageSections,
+                queryAnalysis: {
+                    cleanTitle: analysis.cleanTitle,
+                    language: analysis.language,
+                    movie: analysis.movie,
+                    isVersionSearch: analysis.isVersionSearch,
+                },
                 sections: buildSearchSections({
                     songs: songsOut,
                     albums: albumsOut,
@@ -179,6 +200,25 @@ router.get('/search', async (req, res) => {
         console.error('Search API error:', error.message);
         res.status(500).json({ error: 'Internal server error' });
     }
+});
+
+// Trending searches endpoint (used by search home screen)
+router.get('/search/trending', async (_req, res) => {
+    res.json({
+        success: true,
+        trending: [
+            'Aavesham songs',
+            'Sid Sriram',
+            'New Malayalam hits',
+            'Arijit Singh',
+            'Anirudh',
+            'KGF 2',
+            'Believer',
+            'New Tamil releases',
+            'AP Dhillon',
+            'Pritam',
+        ],
+    });
 });
 
 // ── Common artist-name typo corrections ──────────────────────────────────────
@@ -425,6 +465,30 @@ function prioritizeSongsByLanguage(songs, preferredLanguages) {
     return [...preferred, ...remaining];
 }
 
+/**
+ * Apply a soft language preference boost without overriding exact-match ranking.
+ * Songs within 15 score points of the top are eligible for language reordering;
+ * songs that clearly outscored others stay in place.
+ */
+function applyLanguageBoost(rankedSongs, preferredLanguages, analysis) {
+    if (!Array.isArray(rankedSongs) || rankedSongs.length === 0) return rankedSongs;
+    const preferredSet = new Set(preferredLanguages);
+
+    // If the query already has an explicit language, don't apply preference boost
+    if (analysis.language) return rankedSongs;
+
+    return rankedSongs.map(song => ({
+        song,
+        lang: String(song?.language ?? '').toLowerCase(),
+    })).sort((a, b) => {
+        const aPreferred = preferredSet.has(a.lang);
+        const bPreferred = preferredSet.has(b.lang);
+        if (aPreferred === bPreferred) return 0;
+        if (aPreferred) return -1;
+        return 1;
+    }).map(({ song }) => song);
+}
+
 function buildRelatedLanguages({
     query,
     preferredLanguages,
@@ -564,7 +628,7 @@ function resolveAlbumLanguage(album, songAlbumLanguageMap, fallbackLanguage) {
     return normalizeLanguage(fallbackLanguage);
 }
 
-function resolveTopResult({
+function resolveTopResultLegacy({
     query,
     songs,
     albums,
