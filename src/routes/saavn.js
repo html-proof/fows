@@ -877,17 +877,32 @@ router.get('/songs/:id/lyrics', async (req, res) => {
 // Example 2: /api/albums?query=Evolve
 router.get('/albums', async (req, res) => {
     try {
-        const { id, query } = req.query;
+        const { id, query, link } = req.query;
 
-        if (!id && !query) {
-            return res.status(400).json({ error: 'Either "id" or "query" parameter is required' });
+        if (!id && !query && !link) {
+            return res.status(400).json({ error: 'Either "id", "query", or "link" parameter is required' });
         }
 
         let data;
         if (id) {
             data = await getAlbumById(id);
+        } else if (link) {
+            data = await getAlbumById(null, link);
         } else {
             data = await searchAlbums(query);
+        }
+
+        // Album detail payloads contain raw provider tracks. Assign canonical
+        // IDs here so the mobile player resolves each tapped album track via
+        // the verified playback resolver instead of guessing from metadata.
+        if (data?.data?.songs && Array.isArray(data.data.songs)) {
+            data = {
+                ...data,
+                data: {
+                    ...data.data,
+                    songs: attachCanonicalIds(data.data.songs),
+                },
+            };
         }
 
         res.json(data);

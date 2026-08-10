@@ -206,13 +206,17 @@ export async function searchAlbumsDirect(query, limit = 10) {
     });
 
     const results = (data?.results ?? []).map(r => ({
-        id:             String(r.id ?? ''),
+        // search.getAlbumResults uses `albumid` rather than `id`. Returning
+        // an empty ID makes the mobile client unable to fetch the album tracks.
+        id:             String(r.id ?? r.albumid ?? r.more_info?.album_id ?? ''),
         name:           _htmlDecode(r.title ?? r.name ?? ''),
         language:       (r.language ?? '').toLowerCase(),
         year:           r.year ?? null,
         url:            r.perma_url ?? null,
         image:          r.image ? [{ quality: '150x150', url: r.image }] : [],
-        primaryArtists: _htmlDecode(r.subtitle ?? r.more_info?.music ?? ''),
+        primaryArtists: _htmlDecode(
+            r.primary_artists ?? r.subtitle ?? r.music ?? r.more_info?.music ?? ''
+        ),
         songCount:      parseInt(r.more_info?.song_count ?? 0, 10),
     }));
 
