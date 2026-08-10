@@ -22,8 +22,12 @@ const BODY_TIMEOUT    = 5000;
 
 function _decryptMediaUrl(encrypted) {
     try {
-        const key      = Buffer.from('38346591');          // 8-byte DES key
-        const decipher = crypto.createDecipheriv('des-ecb', key, Buffer.alloc(0));
+        const desKey = Buffer.from('38346591');
+        // OpenSSL 3 (used by current Node releases) no longer exposes single
+        // DES.  3DES with the same 8-byte key repeated three times is exactly
+        // equivalent to DES-EDE/ECB, which is what JioSaavn uses here.
+        const key = Buffer.concat([desKey, desKey, desKey]);
+        const decipher = crypto.createDecipheriv('des-ede3-ecb', key, null);
         decipher.setAutoPadding(false);
         const decoded   = Buffer.from((encrypted ?? '').trim(), 'base64');
         const decrypted = Buffer.concat([decipher.update(decoded), decipher.final()]);
@@ -62,7 +66,10 @@ function _buildDownloadUrls(encrypted, has320) {
 // ─── Response normalisation ───────────────────────────────────────────────────
 
 function _normalise(raw) {
-    const info = raw.more_info ?? {};
+    // Search and detail endpoints return the same fields in two different
+    // layouts. Search currently puts them at the top level, while some older
+    // endpoints nest them under `more_info`.
+    const info = { ...(raw ?? {}), ...(raw?.more_info ?? {}) };
     const encrypted = info.encrypted_media_url ?? '';
     const has320    = info['320kbps'] === 'true' || info['320kbps'] === true;
     const downloadUrl = encrypted ? _buildDownloadUrls(encrypted, has320) : [];
@@ -76,9 +83,9 @@ function _normalise(raw) {
         { quality: '500x500', url: imgBase.replace('{q}', '500x500') },
     ] : [{ quality: '150x150', url: imgRaw }];
 
-    const name    = _htmlDecode(raw.title ?? raw.name ?? '');
+    const name    = _htmlDecode(raw.song ?? raw.title ?? raw.name ?? '');
     const artist  = _htmlDecode(info.primary_artists ?? info.singers ?? raw.subtitle?.split(' - ')[0] ?? '');
-    const albumNm = _htmlDecode(info.album ?? '');
+    const albumNm = _htmlDecode(info.album ?? raw.album ?? '');
 
     return {
         id:             String(raw.id ?? ''),
@@ -86,11 +93,11 @@ function _normalise(raw) {
         title:          name,
         primaryArtists: artist,
         artists: { primary: artist ? [{ id: null, name: artist }] : [] },
-        album:   { id: String(info.album_id ?? ''), name: albumNm },
-        albumId: String(info.album_id ?? ''),
+        album:   { id: String(info.album_id ?? info.albumid ?? ''), name: albumNm },
+        albumId: String(info.album_id ?? info.albumid ?? ''),
         duration: String(info.duration ?? raw.duration ?? ''),
         language: info.language ?? '',
-        year:    info.release_date ? String(info.release_date).slice(0, 4) : '',
+        year:    info.release_date ? String(info.release_date).slice(0, 4) : String(info.year ?? raw.year ?? ''),
         label:   info.label ?? '',
         image,
         downloadUrl,
@@ -147,7 +154,8 @@ export async function searchSongsDirect(query, limit = 20) {
 
     const results = (data?.results ?? []).filter(r =>
         // Only songs — type '1' or entries with an encrypted_media_url
-        String(r.type) === 'song' || String(r.j_object_type) === '1' || r.more_info?.encrypted_media_url
+        String(r.type) === 'song' || String(r.j_object_type) === '1' ||
+        r.encrypted_media_url || r.more_info?.encrypted_media_url
     );
 
     return results.map(_normalise);
