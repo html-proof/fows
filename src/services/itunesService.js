@@ -2,286 +2,365 @@
  * iTunes Search API — metadata enrichment provider.
  *
  * iTunes is used ONLY for catalog metadata (title, artist, artwork, genre,
- * duration, ISRC). It is never used as an audio source. All playback goes
- * through JioSaavn or other licensed providers.
+ * duration). It is NEVER used as an audio source.
  *
- * Design principles:
- *  - iTunes is additive. If it fails, search still works via JioSaavn.
- *  - Circuit breaker: after FAIL_THRESHOLD consecutive failures, skip iTunes
- *    for COOLDOWN_MS to avoid hammering a blocked/rate-limited endpoint.
- *  - 429 handling: back off immediately, don't retry, serve from cache.
- *  - 1–2 high-quality queries per user search, never a fan-out of 5+.
- *  - Cache all successful responses (5 min TTL).
- *  - Structured logs: every outcome is classified and logged consistently.
+ * Call discipline:
+ *   - Only called for real song/artist/movie queries (never mood/genre/playlist)
+ *   - Max 2 high-quality queries per user search (never raw JioSaavn metadata)
+ *   - In-flight deduplication: concurrent identical queries share one HTTP call
+ *   - Sliding-window circuit breaker: opens when ≥60% of last 10 requests fail
+ *   - Single retry on ETIMEDOUT (transient, not a rate-limit signal)
+ *   - 429 → 2 min backoff, no retry
  */
 
 import { request } from 'undici';
 import { normText, bigramSimilarity } from './searchEngine.js';
 
 const ITUNES_BASE = 'https://itunes.apple.com/search';
+const CONNECT_TIMEOUT_MS  = 2000;
+const BODY_TIMEOUT_MS     = 3000;
 
-// ─── Timeouts ─────────────────────────────────────────────────────────────────
-const CONNECT_TIMEOUT_MS = 3000;
-const BODY_TIMEOUT_MS    = 4000;
-
-// ─── Cache (5 min TTL, max 500 entries) ──────────────────────────────────────
-const _cache = new Map();
-const CACHE_TTL_MS  = 5 * 60 * 1000;
-const CACHE_MAX     = 500;
+// ─── Cache ────────────────────────────────────────────────────────────────────
+const _cache    = new Map();
+const CACHE_TTL = 5 * 60 * 1000;
+const CACHE_MAX = 500;
 
 function _cacheGet(key) {
-    const entry = _cache.get(key);
-    if (!entry) return null;
-    if (Date.now() - entry.ts > CACHE_TTL_MS) { _cache.delete(key); return null; }
-    return entry.value;
+    const e = _cache.get(key);
+    if (!e) return null;
+    if (Date.now() - e.ts > CACHE_TTL) { _cache.delete(key); return null; }
+    return e.value;
 }
-
 function _cacheSet(key, value) {
     if (_cache.size >= CACHE_MAX) {
-        // evict oldest 10%
-        const evict = [..._cache.keys()].slice(0, Math.ceil(CACHE_MAX * 0.1));
-        for (const k of evict) _cache.delete(k);
+        for (const k of [..._cache.keys()].slice(0, 50)) _cache.delete(k);
     }
     _cache.set(key, { ts: Date.now(), value });
 }
 
-// ─── Circuit breaker ──────────────────────────────────────────────────────────
-const FAIL_THRESHOLD  = 3;
-const COOLDOWN_MS     = 10 * 60 * 1000;  // 10 min
-const RATE_LIMIT_BACKOFF_MS = 60 * 1000; // 1 min on 429
+// ─── In-flight deduplication ──────────────────────────────────────────────────
+const _inFlight = new Map(); // cacheKey → Promise<ItunesTrack[]>
+
+// ─── Sliding-window circuit breaker ──────────────────────────────────────────
+// Tracks last CB_WINDOW outcomes ('ok'|'fail').
+// Opens when ≥CB_FAIL_RATE of outcomes are 'fail' AND window is ≥CB_MIN_SAMPLE.
+const CB_WINDOW      = 10;
+const CB_FAIL_RATE   = 0.6;   // open at 60% failure rate
+const CB_MIN_SAMPLE  = 4;     // need at least 4 samples before opening
+const CB_COOLDOWN_MS = 5 * 60 * 1000;  // 5 min when circuit opens normally
+const CB_429_MS      = 2 * 60 * 1000;  // 2 min backoff on rate-limit
 
 const _cb = {
-    state:        'HEALTHY',   // HEALTHY | DEGRADED | OPEN
-    failCount:    0,
+    outcomes:     [],   // 'ok' | 'fail'
+    state:        'HEALTHY',
     openUntil:    0,
     lastError:    null,
-    successCount: 0,
+    totalSuccess: 0,
+    totalFail:    0,
 };
 
 function _cbIsOpen() {
-    if (_cb.state === 'OPEN') {
-        if (Date.now() < _cb.openUntil) return true;
-        // cooldown expired — move to DEGRADED and allow one probe
-        _cb.state     = 'DEGRADED';
-        _cb.failCount = 0;
+    if (_cb.state !== 'OPEN') return false;
+    if (Date.now() >= _cb.openUntil) {
+        _cb.state = 'DEGRADED';
+        _cb.outcomes = [];
         console.info('[iTunes] circuit HALF-OPEN — probing');
+        return false;
     }
-    return false;
+    return true;
 }
 
-function _cbOnSuccess() {
-    _cb.failCount    = 0;
-    _cb.successCount++;
-    _cb.lastError    = null;
-    if (_cb.state !== 'HEALTHY') {
-        _cb.state = 'HEALTHY';
-        console.info('[iTunes] circuit CLOSED — provider healthy again');
-    }
-}
+function _cbRecord(ok, cooldownMs = CB_COOLDOWN_MS) {
+    _cb.outcomes.push(ok ? 'ok' : 'fail');
+    if (_cb.outcomes.length > CB_WINDOW) _cb.outcomes.shift();
 
-function _cbOnFailure(reason, extraMs = COOLDOWN_MS) {
-    _cb.failCount++;
-    _cb.lastError = reason;
-    if (_cb.failCount >= FAIL_THRESHOLD) {
+    if (ok) {
+        _cb.totalSuccess++;
+        _cb.lastError = null;
+        if (_cb.state !== 'HEALTHY') {
+            _cb.state = 'HEALTHY';
+            console.info('[iTunes] circuit HEALTHY — provider recovered');
+        }
+        return;
+    }
+
+    _cb.totalFail++;
+    const fails   = _cb.outcomes.filter(o => o === 'fail').length;
+    const rate    = fails / _cb.outcomes.length;
+    const enough  = _cb.outcomes.length >= CB_MIN_SAMPLE;
+
+    if (enough && rate >= CB_FAIL_RATE && _cb.state !== 'OPEN') {
         _cb.state     = 'OPEN';
-        _cb.openUntil = Date.now() + extraMs;
+        _cb.openUntil = Date.now() + cooldownMs;
+        const mins    = Math.round(cooldownMs / 60000);
         console.warn(
-            `[iTunes] circuit OPEN — disabled for ${Math.round(extraMs / 60000)} min` +
-            ` after ${_cb.failCount} failures. Last: ${reason}`
+            `[iTunes] circuit OPEN — ${fails}/${_cb.outcomes.length} recent requests failed` +
+            ` (${Math.round(rate * 100)}%). Cooldown ${mins} min. Last: ${_cb.lastError}`
         );
-    } else {
+    } else if (_cb.state === 'HEALTHY') {
         _cb.state = 'DEGRADED';
     }
 }
 
+// ─── Query guards ─────────────────────────────────────────────────────────────
+
+// Words that indicate a mood/genre/playlist query — useless for iTunes catalog search.
+const MOOD_WORDS = new Set([
+    'songs', 'music', 'hits', 'playlist', 'top', 'best', 'latest', 'trending',
+    'popular', 'party', 'chill', 'sad', 'happy', 'romantic', 'workout',
+    'evergreen', 'chartbuster', 'classics', 'classic', 'today', 'now',
+    'new', 'most', 'played', 'releases', 'Tamil', 'Malayalam', 'Telugu',
+    'Hindi', 'Kannada', 'Punjabi', 'Bengali', 'Marathi',
+]);
+// lowercase version for matching
+const _moodLower = new Set([...MOOD_WORDS].map(w => w.toLowerCase()));
+
+/**
+ * Returns true if the query is a mood/genre/playlist search that iTunes
+ * cannot meaningfully answer (e.g. "tamil party songs", "trending now").
+ */
+function _isMoodQuery(query) {
+    const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
+    if (tokens.length > 5) return false; // long queries are probably real song titles
+    const moodCount = tokens.filter(t => _moodLower.has(t)).length;
+    // Mood if >50% of tokens are mood words
+    return moodCount / tokens.length > 0.5;
+}
+
+/**
+ * Sanitize a query before sending to iTunes:
+ *  - Strip parenthetical suffixes "(Original Motion Picture Soundtrack)" etc.
+ *  - Remove obvious JioSaavn noise words
+ *  - Cap at 5 tokens (iTunes doesn't improve with longer queries)
+ */
+function _sanitize(query) {
+    let q = query
+        .replace(/\s*\([^)]{8,}\)/g, '')   // remove long parentheticals
+        .replace(/\s*\[[^\]]{8,}\]/g, '')   // remove long bracket groups
+        .replace(/\b(instrumental|official|audio|video|full\s+song|hd|4k|lyrics?)\b/gi, '')
+        .replace(/\s{2,}/g, ' ')
+        .trim();
+
+    const tokens = q.split(/\s+/).filter(Boolean);
+    if (tokens.length > 5) q = tokens.slice(0, 5).join(' ');
+    return q.trim();
+}
+
 // ─── Error classification ─────────────────────────────────────────────────────
-function _classifyError(err, statusCode) {
+function _classify(err, statusCode) {
     if (statusCode === 429) return 'HTTP_429_RATE_LIMITED';
     if (statusCode === 403) return 'HTTP_403_FORBIDDEN';
-    if (statusCode === 404) return 'HTTP_404_NOT_FOUND';
     if (statusCode >= 500)  return `HTTP_${statusCode}_SERVER_ERROR`;
     if (statusCode >= 400)  return `HTTP_${statusCode}_CLIENT_ERROR`;
 
     const code = err?.code || err?.cause?.code || '';
-    if (code === 'UND_ERR_CONNECT_TIMEOUT' || code === 'ETIMEDOUT') return 'TIMEOUT';
-    if (code === 'ECONNREFUSED')  return 'NETWORK_CONNECTION_REFUSED';
-    if (code === 'ENOTFOUND')     return 'NETWORK_DNS_FAILURE';
-    if (code === 'ECONNRESET')    return 'NETWORK_CONNECTION_RESET';
-    if (code.startsWith('UND_'))  return `NETWORK_${code}`;
+    if (code === 'ETIMEDOUT' || code === 'UND_ERR_CONNECT_TIMEOUT') return 'ETIMEDOUT';
+    if (code === 'ECONNREFUSED')  return 'ECONNREFUSED';
+    if (code === 'ENOTFOUND')     return 'DNS_FAILURE';
+    if (code === 'ECONNRESET')    return 'ECONNRESET';
+    if (code.startsWith('UND_'))  return code;
 
     const msg = err?.message || err?.cause?.message || String(err);
+    if (/timeout/i.test(msg)) return 'ETIMEDOUT';
     if (/json/i.test(msg))    return 'INVALID_JSON';
-    if (/timeout/i.test(msg)) return 'TIMEOUT';
-    if (/abort/i.test(msg))   return 'ABORTED';
-    return `UNKNOWN(${msg.slice(0, 60)})`;
+    return `UNKNOWN(${msg.slice(0, 80)})`;
 }
 
-// ─── Core HTTP request ────────────────────────────────────────────────────────
-
-async function _itunesRequest(params) {
-    const url = new URL(ITUNES_BASE);
-    for (const [k, v] of Object.entries(params)) {
-        if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
-    }
-    const urlStr = url.toString();
-    const startedAt = Date.now();
-
+// ─── Core HTTP request (single attempt) ──────────────────────────────────────
+async function _httpRequest(urlStr) {
+    const t0 = Date.now();
     let statusCode = null;
-    let rawBody    = null;
 
-    try {
-        const resp = await request(urlStr, {
-            method: 'GET',
-            headers: {
-                'Accept':     'application/json',
-                'User-Agent': 'MusicHubBackend/2.0',
-            },
-            connectTimeout:  CONNECT_TIMEOUT_MS,
-            bodyTimeout:     BODY_TIMEOUT_MS,
-            headersTimeout:  CONNECT_TIMEOUT_MS,
-        });
+    const resp = await request(urlStr, {
+        method: 'GET',
+        headers: { 'Accept': 'application/json', 'User-Agent': 'MusicHubBackend/2.0' },
+        connectTimeout:  CONNECT_TIMEOUT_MS,
+        bodyTimeout:     BODY_TIMEOUT_MS,
+        headersTimeout:  CONNECT_TIMEOUT_MS,
+    });
 
-        statusCode = resp.statusCode;
-        const latency = Date.now() - startedAt;
+    statusCode = resp.statusCode;
+    const latency = Date.now() - t0;
 
-        if (statusCode === 429) {
-            rawBody = await resp.body.text().catch(() => '');
-            const errType = 'HTTP_429_RATE_LIMITED';
-            console.warn(`[iTunes] SEARCH FAILED | status=${statusCode} | latency=${latency}ms | reason=${errType} | action=cooldown`);
-            _cbOnFailure(errType, RATE_LIMIT_BACKOFF_MS);
-            return null;
-        }
-
-        if (statusCode !== 200) {
-            rawBody = await resp.body.text().catch(() => '');
-            const errType = _classifyError(null, statusCode);
-            console.warn(`[iTunes] SEARCH FAILED | url=${urlStr} | status=${statusCode} | latency=${latency}ms | reason=${errType}`);
-            _cbOnFailure(errType);
-            return null;
-        }
-
-        let json;
-        try {
-            json = await resp.body.json();
-        } catch (jsonErr) {
-            const errType = 'INVALID_JSON';
-            console.warn(`[iTunes] SEARCH FAILED | url=${urlStr} | status=${statusCode} | latency=${latency}ms | reason=${errType}`);
-            _cbOnFailure(errType);
-            return null;
-        }
-
-        const count = json?.resultCount ?? (json?.results?.length ?? 0);
-        console.info(`[iTunes] HTTP ${statusCode} | results=${count} | latency=${latency}ms | query="${params.term}"`);
-
-        _cbOnSuccess();
-        return json;
-
-    } catch (err) {
-        const latency  = Date.now() - startedAt;
-        const errType  = _classifyError(err, statusCode);
-        const detail   = err?.code || err?.cause?.code || err?.message || err?.cause?.message || String(err);
-        console.warn(`[iTunes] SEARCH FAILED | url=${urlStr} | latency=${latency}ms | reason=${errType} | detail=${detail}`);
-        _cbOnFailure(errType);
-        return null;
+    if (statusCode !== 200) {
+        await resp.body.text().catch(() => null); // drain body
+        const reason = _classify(null, statusCode);
+        return { ok: false, statusCode, latency, reason };
     }
+
+    const json = await resp.body.json();
+    return { ok: true, statusCode, latency, json };
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
+// ─── Fetch with single ETIMEDOUT retry ───────────────────────────────────────
+async function _fetch(urlStr, queryLabel) {
+    let attempt = 0;
+    while (attempt < 2) {
+        attempt++;
+        try {
+            const r = await _httpRequest(urlStr);
+            if (!r.ok) {
+                const isCooldown = r.statusCode === 429 ? CB_429_MS : CB_COOLDOWN_MS;
+                console.warn(
+                    `[iTunes] SEARCH FAILED | status=${r.statusCode} | latency=${r.latency}ms` +
+                    ` | reason=${r.reason} | query="${queryLabel}"`
+                );
+                _cb.lastError = r.reason;
+                _cbRecord(false, isCooldown);
+                return null;
+            }
+            console.info(
+                `[iTunes] HTTP ${r.statusCode} | results=${r.json?.resultCount ?? 0}` +
+                ` | latency=${r.latency}ms | query="${queryLabel}"`
+            );
+            _cbRecord(true);
+            return r.json;
+        } catch (err) {
+            const reason = _classify(err, null);
+            const detail = err?.code || err?.cause?.code || err?.message || err?.cause?.message || String(err);
+            console.warn(
+                `[iTunes] SEARCH FAILED | attempt=${attempt} | latency=${Date.now()}ms` +
+                ` | reason=${reason} | detail=${detail} | query="${queryLabel}"`
+            );
+            _cb.lastError = reason;
+
+            // Retry once on transient connection failures
+            if (attempt < 2 && (reason === 'ETIMEDOUT' || reason === 'ECONNRESET')) {
+                console.info(`[iTunes] retrying once after ${reason}…`);
+                continue;
+            }
+
+            _cbRecord(false);
+            return null;
+        }
+    }
+    return null;
+}
+
+// ─── Public: searchItunes ─────────────────────────────────────────────────────
 
 /**
  * Search iTunes for songs.
- * Constructs a clean, targeted query rather than passing raw user input.
  *
- * @param {string} query        - already-cleaned title (from analyzeQuery.cleanTitle)
+ * @param {string} query   - clean song/artist/movie name (NOT raw user input)
  * @param {{ limit?, country?, entity? }} opts
  * @returns {Promise<ItunesTrack[]>}
  */
 export async function searchItunes(query, { limit = 25, country = 'IN', entity = 'song' } = {}) {
-    if (!query?.trim()) return [];
-    if (_cbIsOpen()) return [];
+    const clean = _sanitize(query ?? '');
+    if (!clean) return [];
 
-    const cacheKey = `${entity}:${country}:${limit}:${query.trim().toLowerCase()}`;
-    const cached   = _cacheGet(cacheKey);
-    if (cached) {
-        console.info(`[iTunes] CACHE HIT | query="${query}" | results=${cached.length}`);
-        return cached;
-    }
-
-    console.info(`[iTunes] SEARCH START | query="${query}" | country=${country} | entity=${entity} | limit=${limit}`);
-
-    const json = await _itunesRequest({
-        term:    query.trim(),
-        limit:   Math.min(limit, 50),
-        country,
-        entity,
-        media:   'music',
-    });
-
-    if (!json) return [];
-
-    const results = json.results ?? [];
-    if (results.length === 0) {
-        console.info(`[iTunes] EMPTY RESULTS | query="${query}" — not an error, no match in iTunes catalog`);
-        // Cache empty too (avoid hammering for same query)
-        _cacheSet(cacheKey, []);
+    // Skip mood/genre queries entirely
+    if (_isMoodQuery(clean)) {
+        console.info(`[iTunes] SKIPPED mood query: "${clean}"`);
         return [];
     }
 
-    const tracks = results.map(normaliseItunesTrack);
-    _cacheSet(cacheKey, tracks);
-    return tracks;
+    // Circuit breaker
+    if (_cbIsOpen()) return [];
+
+    const cacheKey = `${entity}:${country}:${limit}:${clean.toLowerCase()}`;
+
+    // Cache hit
+    const cached = _cacheGet(cacheKey);
+    if (cached !== null) {
+        console.info(`[iTunes] CACHE HIT | query="${clean}" | results=${cached.length}`);
+        return cached;
+    }
+
+    // In-flight dedup: if same query is already running, share the promise
+    if (_inFlight.has(cacheKey)) {
+        console.info(`[iTunes] IN-FLIGHT DEDUP | query="${clean}"`);
+        return _inFlight.get(cacheKey);
+    }
+
+    const url = new URL(ITUNES_BASE);
+    url.searchParams.set('term',   clean);
+    url.searchParams.set('limit',  String(Math.min(limit, 50)));
+    url.searchParams.set('country', country);
+    url.searchParams.set('entity', entity);
+    url.searchParams.set('media',  'music');
+    const urlStr = url.toString();
+
+    console.info(`[iTunes] SEARCH START | query="${clean}" | country=${country} | entity=${entity} | limit=${limit}`);
+
+    const promise = _fetch(urlStr, clean).then(json => {
+        _inFlight.delete(cacheKey);
+
+        if (!json) {
+            _cacheSet(cacheKey, []); // cache failure too (5 min) to avoid hammering
+            return [];
+        }
+
+        const results = json.results ?? [];
+        if (results.length === 0) {
+            console.info(`[iTunes] EMPTY RESULTS | query="${clean}" — no catalog match`);
+            _cacheSet(cacheKey, []);
+            return [];
+        }
+
+        const tracks = results.map(_normalise);
+        _cacheSet(cacheKey, tracks);
+        return tracks;
+    }).catch(err => {
+        _inFlight.delete(cacheKey);
+        console.warn('[iTunes] unexpected error:', err?.message ?? String(err));
+        return [];
+    });
+
+    _inFlight.set(cacheKey, promise);
+    return promise;
 }
 
 export async function searchItunesAlbums(query, { limit = 10, country = 'IN' } = {}) {
     return searchItunes(query, { limit, country, entity: 'album' });
 }
-
 export async function searchItunesArtists(query, { limit = 10, country = 'IN' } = {}) {
     return searchItunes(query, { limit, country, entity: 'musicArtist' });
 }
 
+// ─── Query builder ────────────────────────────────────────────────────────────
+
 /**
- * Build the best 1–2 iTunes search queries for a given query analysis.
- * Never fan out to 5+ queries — Apple rate-limits at ~20 req/min.
+ * Build 1–2 targeted iTunes queries from analyzeQuery output.
+ * Never passes raw user input or JioSaavn metadata to iTunes.
  *
- * @param {{ cleanTitle, artist?, movie?, language? }} analysis
- * @returns {string[]}  ordered list of queries (most specific first)
+ * Returns [] for mood/genre queries so the caller skips iTunes entirely.
+ *
+ * @param {{ cleanTitle, movie, language, isMoodSearch }} analysis
+ * @returns {string[]}
  */
 export function buildItunesQueries(analysis) {
-    const { cleanTitle, movie, language } = analysis;
+    const { cleanTitle, movie, isMoodSearch } = analysis;
+
+    // No iTunes for mood/discovery queries
+    if (isMoodSearch) return [];
+    if (!cleanTitle) return [];
+
+    const title = _sanitize(cleanTitle);
+    if (!title || _isMoodQuery(title)) return [];
+
     const queries = [];
 
-    // Most specific: title + movie (strong signal for Indian film music)
-    if (movie && cleanTitle && movie.toLowerCase() !== cleanTitle.toLowerCase()) {
-        queries.push(`${cleanTitle} ${movie}`);
+    // Most specific: title + movie (strong for Indian film music)
+    if (movie) {
+        const movieClean = _sanitize(movie);
+        if (movieClean && movieClean.toLowerCase() !== title.toLowerCase()) {
+            queries.push(`${title} ${movieClean}`);
+        }
     }
 
-    // Title alone (always include)
-    if (cleanTitle) queries.push(cleanTitle);
+    queries.push(title);
 
-    // Cap at 2 to stay comfortably under rate limit
+    // Deduplicate, cap at 2
     return [...new Set(queries)].slice(0, 2);
 }
 
 // ─── Normalisation ────────────────────────────────────────────────────────────
 
-/**
- * @typedef {Object} ItunesTrack
- * @property {string}  itunesId
- * @property {string}  title
- * @property {string}  artist
- * @property {string}  album
- * @property {string}  genre
- * @property {number}  year
- * @property {number}  durationMs
- * @property {string}  artworkUrl      - 3000×3000
- * @property {string}  artworkUrl300   - 300×300
- * @property {boolean} isExplicit
- * @property {number}  trackNumber
- * @property {string}  country
- */
-function normaliseItunesTrack(raw) {
-    const artworkBase = (raw.artworkUrl100 ?? '').replace('100x100bb', '{w}x{h}bb');
+/** @typedef {{ itunesId,title,artist,album,genre,year,durationMs,artworkUrl,artworkUrl300,isExplicit,trackNumber,country }} ItunesTrack */
+function _normalise(raw) {
+    const base = (raw.artworkUrl100 ?? '').replace('100x100bb', '{w}x{h}bb');
     return {
         itunesId:      String(raw.trackId ?? raw.collectionId ?? ''),
         title:         raw.trackName      ?? raw.collectionName ?? '',
@@ -290,7 +369,7 @@ function normaliseItunesTrack(raw) {
         genre:         raw.primaryGenreName ?? '',
         year:          raw.releaseDate ? new Date(raw.releaseDate).getFullYear() : 0,
         durationMs:    raw.trackTimeMillis ?? 0,
-        artworkUrl:    artworkBase.replace('{w}x{h}', '3000x3000'),
+        artworkUrl:    base.replace('{w}x{h}', '3000x3000'),
         artworkUrl300: (raw.artworkUrl100 ?? '').replace('100x100bb', '300x300bb'),
         isExplicit:    raw.trackExplicitness === 'explicit',
         trackNumber:   raw.trackNumber ?? 0,
@@ -300,10 +379,6 @@ function normaliseItunesTrack(raw) {
 
 // ─── Matching ─────────────────────────────────────────────────────────────────
 
-/**
- * Find the best-matching iTunes track for a JioSaavn song.
- * Returns { track, score } or null if no confident match.
- */
 export function matchSaavnToItunes(saavnSong, candidates) {
     if (!candidates?.length) return null;
 
@@ -316,33 +391,24 @@ export function matchSaavnToItunes(saavnSong, candidates) {
         ?? ''
     );
     const saavnAlbum  = normText(
-        typeof saavnSong?.album === 'string' ? saavnSong.album
-        : (saavnSong?.album?.name ?? '')
+        typeof saavnSong?.album === 'string'
+            ? saavnSong.album
+            : (saavnSong?.album?.name ?? '')
     );
     const saavnDurSec = parseInt(saavnSong?.duration ?? 0, 10);
 
     let best = null, bestScore = -Infinity;
 
     for (const track of candidates) {
-        const itTitle  = normText(track.title);
-        const itArtist = normText(track.artist);
-        const itAlbum  = normText(track.album);
-        const itDurSec = Math.round(track.durationMs / 1000);
+        const ts = bigramSimilarity(saavnTitle, normText(track.title));
+        const as = bigramSimilarity(saavnArtist, normText(track.artist));
+        const al = bigramSimilarity(saavnAlbum,  normText(track.album));
 
-        let score = 0;
+        let score = ts * 60 + as * 30 + al * 15;
+        if (saavnTitle === normText(track.title)) score += 20;
 
-        const titleSim = bigramSimilarity(saavnTitle, itTitle);
-        score += titleSim * 60;
-        if (saavnTitle === itTitle) score += 20;
-
-        const artistSim = bigramSimilarity(saavnArtist, itArtist);
-        score += artistSim * 30;
-
-        const albumSim = bigramSimilarity(saavnAlbum, itAlbum);
-        score += albumSim * 15;
-
-        if (saavnDurSec > 0 && itDurSec > 0) {
-            const diff = Math.abs(saavnDurSec - itDurSec);
+        if (saavnDurSec > 0 && track.durationMs) {
+            const diff = Math.abs(saavnDurSec - track.durationMs / 1000);
             if (diff <= 10)      score += 15;
             else if (diff <= 30) score += 8;
             else if (diff > 90)  score -= 10;
@@ -354,10 +420,6 @@ export function matchSaavnToItunes(saavnSong, candidates) {
     return (!best || best.score < 30) ? null : best;
 }
 
-/**
- * Enrich a list of JioSaavn songs with iTunes metadata.
- * Songs without a confident match get itunesMeta: null.
- */
 export function enrichSongsWithItunes(songs, itunes) {
     if (!itunes?.length) return songs.map(s => ({ ...s, itunesMeta: null, itunesBoost: 0 }));
 
@@ -397,14 +459,16 @@ export function buildItunesArtistMeta(itunesArtists) {
     }));
 }
 
-/** Circuit breaker status — useful for a /healthz endpoint. */
 export function itunesHealthStatus() {
+    const recent   = _cb.outcomes.length;
+    const fails    = _cb.outcomes.filter(o => o === 'fail').length;
     return {
         state:        _cb.state,
-        failCount:    _cb.failCount,
-        successCount: _cb.successCount,
+        failRate:     recent ? `${fails}/${recent}` : '0/0',
         lastError:    _cb.lastError,
         openUntil:    _cb.openUntil > Date.now() ? new Date(_cb.openUntil).toISOString() : null,
+        totalSuccess: _cb.totalSuccess,
+        totalFail:    _cb.totalFail,
     };
 }
 

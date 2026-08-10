@@ -26,6 +26,7 @@ import {
     getAlbumById,
 } from '../services/saavnApi.js';
 import {
+    buildItunesQueries,
     searchItunes,
     enrichSongsWithItunes,
 } from '../services/itunesService.js';
@@ -109,12 +110,18 @@ router.get('/catalog/search', async (req, res) => {
         const analysis = analyzeQuery(rawQ);
         const primaryQ = analysis.cleanTitle || rawQ;
 
+        // Build targeted iTunes queries (0–2, never mood/genre queries)
+        const itunesQueries = buildItunesQueries(analysis);
+        const itunesFetch = Promise.all(
+            itunesQueries.map(q => searchItunes(q, { limit: 25, country: 'IN' }).catch(() => []))
+        ).then(results => results.flat());
+
         // Fan-out: JioSaavn + iTunes in parallel
         const [saavnRaw, itunesTracks] = await Promise.all([
             searchSongsSmart(primaryQ, { page, limit: limit + 10, preferredLanguages: [] }).catch(() =>
                 searchSongsOnly(primaryQ, page, limit + 10).catch(() => [])
             ),
-            searchItunes(primaryQ, { limit: 30, country: 'IN' }).catch(() => []),
+            itunesFetch,
         ]);
 
         // Deduplicate → iTunes enrich → rank
