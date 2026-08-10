@@ -120,8 +120,9 @@ export async function resolveStream(canonicalId, opts = {}) {
     // 4. JioSaavn proxy search fallback
     const query = `${track.title} ${track.artist_name ?? ''}`.trim();
     try {
-        const results = await searchSongsOnly(query, 1, 10);
-        for (const song of results ?? []) {
+        const payload = await searchSongsOnly(query, 1, 10);
+        const results = payload?.data?.results ?? [];
+        for (const song of results) {
             const score = _scoreMatch(track, song);
             if (score < IDENTITY_CONFIDENCE_MIN) continue;
             const stream = _bestStreamUrl(song);
@@ -140,7 +141,7 @@ export async function resolveStream(canonicalId, opts = {}) {
         const jiosaavnId = getProviderTrackId(canonicalId, 'jiosaavn');
         if (jiosaavnId) {
             const direct = await getSongDirect(jiosaavnId);
-            const song = direct?.data?.[0] ?? direct?.data ?? null;
+            const song = direct ?? null;
             if (song) {
                 const stream = _bestStreamUrl(song);
                 if (stream) {
