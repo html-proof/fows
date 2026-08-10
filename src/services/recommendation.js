@@ -152,10 +152,15 @@ export async function generateRecommendations(userPrefs, uid) {
         // Collaborative filtering is best-effort
     }
 
-    // Fetch songs from Saavn for each seed (in parallel, limited)
-    const queries = Array.from(seedQueries).slice(0, 15);
+    // Smart search aggregates providers and returns a full result set. The
+    // old single-provider call often yielded only ten candidates per seed,
+    // which collapsed a recommendation rail to just a few unique songs.
+    const queries = Array.from(seedQueries).slice(0, 8);
     const results = await Promise.all(
-        queries.map(q => searchSongsOnly(q).catch(() => ({ data: { results: [] } })))
+        queries.map(q => searchSongsSmart(q, {
+            preferredLanguages: languages,
+            waitForFresh: true,
+        }).catch(() => []))
     );
 
     // Collect all candidate songs
@@ -163,7 +168,9 @@ export async function generateRecommendations(userPrefs, uid) {
 
     for (const data of results) {
 
-        const songs = data?.data?.results || data?.results || [];
+        const songs = Array.isArray(data)
+            ? data
+            : (data?.data?.results || data?.results || []);
         for (const song of songs) {
             const songId = song.id;
             if (!songId || songMap.has(songId)) continue;
