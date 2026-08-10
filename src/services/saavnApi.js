@@ -451,56 +451,33 @@ async function computeSmartSearchResults({
  * @returns {Promise<object>} Song details
  */
 export async function getSongById(id) {
+    // Primary: direct JioSaavn API — most reliable, no proxy dependency
+    try {
+        const directSong = await getSongDirect(id);
+        if (directSong) {
+            return { success: true, data: [directSong] };
+        }
+    } catch (_) {}
+
+    // Fallback: proxy
     try {
         return await requestJsonWithTimeout(
             `${BASE_URL}/api/songs/${encodeURIComponent(id)}`,
-            {
-                timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
-                label: 'Saavn song fetch',
-            }
+            { timeoutMs: CATALOG_SEARCH_TIMEOUT_MS, label: 'Saavn song fetch' }
         );
-    } catch (error) {
-        try {
-            return await requestJsonWithTimeout(
-                `${BASE_URL}/api/songs?id=${encodeURIComponent(id)}`,
-                {
-                    timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
-                    label: 'Saavn song fetch (query fallback)',
-                }
-            );
-        } catch (innerError) {
-            try {
-                const fallbackData = await requestJsonWithTimeout(
-                    `${FALLBACK_BASE_URL}/api/songs?id=${encodeURIComponent(id)}`,
-                    {
-                        timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
-                        label: 'Fallback song fetch',
-                    }
-                );
-                const songs = fallbackData?.data ?? [];
-                // If proxy returned song but without download URL, try direct
-                const hasDlUrl = (Array.isArray(songs) ? songs : [songs]).some(s => s?.downloadUrl?.length > 0);
-                if (!hasDlUrl) throw new Error('no downloadUrl in proxy response');
-                return { success: true, data: songs };
-            } catch (_proxyErr) {
-                // Final resort: official JioSaavn API with decryption
-                try {
-                    const directSong = await getSongDirect(id);
-                    if (directSong) {
-                        console.info(`[saavnApi] Direct fallback resolved song ${id}`);
-                        return { success: true, data: [directSong] };
-                    }
-                } catch (directErr) {
-                    console.warn(`[saavnApi] Direct getSong fallback failed for ${id}: ${directErr?.message}`);
-                }
-                return {
-                    success: false,
-                    error: 'Service temporarily unavailable',
-                    data: [],
-                };
-            }
-        }
-    }
+    } catch (_) {}
+
+    try {
+        const fallbackData = await requestJsonWithTimeout(
+            `${FALLBACK_BASE_URL}/api/songs?id=${encodeURIComponent(id)}`,
+            { timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS, label: 'Fallback song fetch' }
+        );
+        const songs = fallbackData?.data ?? [];
+        const hasDlUrl = (Array.isArray(songs) ? songs : [songs]).some(s => s?.downloadUrl?.length > 0);
+        if (hasDlUrl) return { success: true, data: songs };
+    } catch (_) {}
+
+    return { success: false, error: 'Service temporarily unavailable', data: [] };
 }
 
 /**
