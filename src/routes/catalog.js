@@ -26,11 +26,6 @@ import {
     getAlbumById,
 } from '../services/saavnApi.js';
 import {
-    buildItunesQueries,
-    searchItunes,
-    enrichSongsWithItunes,
-} from '../services/itunesService.js';
-import {
     attachCanonicalIds,
     getTrack,
     getProviderTrackId,
@@ -40,8 +35,6 @@ import {
     PlaybackResolveError,
 } from '../services/playbackResolver.js';
 import { getUserPreferences } from '../services/database.js';
-import { resolveItunesCountry } from '../services/regionResolver.js';
-import { enrichSongsWithDeezer } from '../services/deezerService.js';
 import { rerankSongsForUser } from '../services/personalizationModel.js';
 
 const router = Router();
@@ -62,13 +55,9 @@ async function resolveUid(req) {
 // ─── Shape a canonical song for API responses ─────────────────────────────────
 
 function shapeSong(song) {
-    const artwork =
-        song.itunesMeta?.artwork
-        ?? (Array.isArray(song.image)
-            ? (song.image.find(i => i.quality === '500x500')?.url ?? song.image.slice(-1)[0]?.url)
-            : null)
-        ?? song.image
-        ?? null;
+    const artwork = Array.isArray(song.image)
+        ? (song.image.find(i => i.quality === '500x500')?.url ?? song.image.slice(-1)[0]?.url)
+        : (song.image ?? null);
 
     const artist = Array.isArray(song.artists?.primary)
         ? song.artists.primary.map(a => ({ id: a.id, name: a.name }))
@@ -78,25 +67,20 @@ function shapeSong(song) {
         : (song.album?.name ?? song.albumName ?? '');
 
     return {
-        type:           'song',
-        id:             song.canonicalId ?? song.id,   // canonical first
-        providerId:     song.id,                        // JioSaavn ID (for client caching)
-        title:          song.name ?? song.title ?? '',
+        type:          'song',
+        id:            song.canonicalId ?? song.id,
+        providerId:    song.id,
+        title:         song.name ?? song.title ?? '',
         artist,
         album: {
-            id:         song.album?.id ?? song.albumId ?? null,
-            name:       albumName,
+            id:        song.album?.id ?? song.albumId ?? null,
+            name:      albumName,
         },
-        artwork:        song.deezerMeta?.artworkLg ?? artwork,
-        durationMs:     (parseInt(song.duration ?? 0, 10) || 0) * 1000,
-        language:       song.language ?? null,
-        genre:          song.itunesMeta?.genre ?? null,
-        isExplicit:     song.itunesMeta?.isExplicit ?? song.deezerMeta?.explicit ?? false,
-        itunesVerified: !!song.itunesMeta,
-        deezerVerified: !!song.deezerMeta,
-        isrc:           song.deezerMeta?.isrc ?? null,   // canonical identity key
+        artwork,
+        durationMs:    (parseInt(song.duration ?? 0, 10) || 0) * 1000,
+        language:      song.language ?? null,
         hasDownloadUrl: !!(song.downloadUrl?.length || song.streamUrl?.length),
-        year:           song.itunesMeta?.year ?? (song.year ? parseInt(song.year, 10) : null),
+        year:          song.year ? parseInt(song.year, 10) : null,
     };
 }
 
@@ -114,26 +98,12 @@ router.get('/catalog/search', async (req, res) => {
         const analysis = analyzeQuery(rawQ);
         const primaryQ = analysis.cleanTitle || rawQ;
 
-        // Build targeted iTunes queries (0–2, never mood/genre queries)
-        const itunesCountry = resolveItunesCountry(req);
-        const itunesQueries = buildItunesQueries(analysis);
-        const itunesFetch = Promise.all(
-            itunesQueries.map(q => searchItunes(q, { limit: 25, country: itunesCountry }).catch(() => []))
-        ).then(results => results.flat());
+        // JioSaavn search
+        const saavnRaw = await searchSongsSmart(primaryQ, { page, limit: limit + 10, preferredLanguages: [] })
+            .catch(() => searchSongsOnly(primaryQ, page, limit + 10).catch(() => []));
 
-        // Fan-out: JioSaavn + iTunes in parallel
-        const [saavnRaw, itunesTracks] = await Promise.all([
-            searchSongsSmart(primaryQ, { page, limit: limit + 10, preferredLanguages: [] }).catch(() =>
-                searchSongsOnly(primaryQ, page, limit + 10).catch(() => [])
-            ),
-            itunesFetch,
-        ]);
-
-        // Deduplicate → iTunes enrich → Deezer enrich (ISRC) → rank
-        let songs = deduplicateSongs(saavnRaw ?? []);
-        songs = enrichSongsWithItunes(songs, itunesTracks);
-        songs = await enrichSongsWithDeezer(songs, primaryQ);
-        songs = rankSongs(songs, analysis).slice(0, limit);
+        // Deduplicate → rank
+        let songs = rankSongs(deduplicateSongs(saavnRaw ?? []), analysis).slice(0, limit);
 
         // Personalise if user is known
         if (uid) {
@@ -148,10 +118,7 @@ router.get('/catalog/search', async (req, res) => {
             query:   rawQ,
             page,
             results: songs.map(shapeSong),
-            meta: {
-                itunesEnriched: itunesTracks.length > 0,
-                total:          songs.length,
-            },
+            meta: { total: songs.length },
         });
     } catch (err) {
         console.error('[catalog/search]', err);

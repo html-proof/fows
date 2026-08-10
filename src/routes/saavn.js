@@ -22,10 +22,7 @@ import {
 } from '../services/searchEngine.js';
 import { getUserPreferences } from '../services/database.js';
 import { rerankSongsForUser } from '../services/personalizationModel.js';
-import { searchItunes, enrichSongsWithItunes, buildItunesQueries } from '../services/itunesService.js';
-import { enrichSongsWithDeezer } from '../services/deezerService.js';
 import { attachCanonicalIds } from '../services/identityResolver.js';
-import { resolveItunesCountry } from '../services/regionResolver.js';
 
 const router = Router();
 const DEFAULT_LIMIT = 20;
@@ -62,7 +59,6 @@ router.get('/search', async (req, res) => {
         }
 
         const { uid, preferredLanguages } = await resolveUserContext(req);
-        const itunesCountry = resolveItunesCountry(req);
         const parsedPage = parseInt(req.query.page, 10);
         const page = Number.isNaN(parsedPage) ? 1 : Math.max(parsedPage, 1);
         const parsedLimit = parseInt(req.query.limit, 10);
@@ -110,45 +106,24 @@ router.get('/search', async (req, res) => {
         // Build query variants from analysis (most-specific → least-specific)
         const searchVariants = buildSearchVariants(analysis);
 
-        // Fire songs from each variant + albums + artists + iTunes in parallel
+        // Fire songs from each variant + albums + artists in parallel
         const songFetches = searchVariants.map(variant =>
             searchSongsSmart(variant, { preferredLanguages, waitForFresh: true })
                 .catch(() => [])
         );
 
-        // Build 1–2 targeted iTunes queries from intent (never raw user input).
-        // Cap at 2 to stay well under Apple's ~20 req/min rate limit.
-        const itunesQueries = buildItunesQueries(analysis);
-        const itunesFetch = Promise.all(
-            itunesQueries.map(q => searchItunes(q, { limit: 25, country: itunesCountry }).catch(() => []))
-        ).then(results => results.flat());
-
-        const [songResults, albumsData, artistsData, itunesResults] = await Promise.allSettled([
+        const [songResults, albumsData, artistsData] = await Promise.allSettled([
             Promise.all(songFetches),
             searchAlbums(primaryQuery),
             searchArtists(primaryQuery),
-            itunesFetch,
         ]);
-
-        const itunesTracks = itunesResults.status === 'fulfilled' ? itunesResults.value : [];
 
         // ── Step 4: Merge + deduplicate + rank songs ─────────────────────────
         const allRawSongs = songResults.status === 'fulfilled'
             ? songResults.value.flat().filter(Boolean)
             : [];
 
-        // Deduplicate first (same song from multiple variants), then rank
-        const dedupedSongs = deduplicateSongs(allRawSongs);
-
-        // Enrich with iTunes metadata (adds itunesBoost) and Deezer metadata
-        // (adds deezerMeta.isrc for canonical identity) in parallel.
-        const [enrichedSongs] = await Promise.all([
-            Promise.resolve(enrichSongsWithItunes(dedupedSongs, itunesTracks)).then(songs =>
-                enrichSongsWithDeezer(songs, primaryQuery)
-            ),
-        ]);
-
-        const rankedByEngine = rankSongs(enrichedSongs, analysis);
+        const rankedByEngine = rankSongs(deduplicateSongs(allRawSongs), analysis);
 
         // Apply language preference as a secondary sort layer (doesn't override exact matches)
         const songsWithLangPref = preferredLanguages.length > 0
