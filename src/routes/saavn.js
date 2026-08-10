@@ -165,8 +165,10 @@ router.get('/search', async (req, res) => {
             const topAlbum = (albumsData.value?.data?.results ?? [])[0];
             const albumNameNorm = normText(topAlbum?.name ?? '');
             const titleNorm = normText(analysis.cleanTitle);
-            const albumMatchesQuery = albumNameNorm && titleNorm &&
-                (albumNameNorm.includes(titleNorm) || titleNorm.includes(albumNameNorm));
+            const albumMatchesQuery = areSearchTermsSimilar(
+                albumNameNorm,
+                titleNorm,
+            );
 
             if ((topAlbum?.id || topAlbum?.url) && albumMatchesQuery) {
                 try {
@@ -359,6 +361,40 @@ const SIMILARITY_PREFIXES = [
     'music like ',
     'artists like ',
 ];
+
+/// Returns true for exact, partial, and tightly bounded typo matches between
+/// a query and a provider-supplied album title. The caller already requires
+/// this to be the provider's top album, so a small edit-distance allowance is
+/// useful without broadening unrelated album matches.
+function areSearchTermsSimilar(left, right) {
+    if (!left || !right) return false;
+    if (left === right || left.includes(right) || right.includes(left)) return true;
+
+    const longestLength = Math.max(left.length, right.length);
+    const shortestLength = Math.min(left.length, right.length);
+    if (shortestLength < 5) return false;
+
+    const maximumDistance = longestLength >= 12 ? 2 : 1;
+    if (Math.abs(left.length - right.length) > maximumDistance) return false;
+    return levenshteinDistance(left, right) <= maximumDistance;
+}
+
+function levenshteinDistance(left, right) {
+    let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+    for (let row = 1; row <= left.length; row += 1) {
+        const current = [row];
+        for (let column = 1; column <= right.length; column += 1) {
+            const substitution = previous[column - 1] + (left[row - 1] === right[column - 1] ? 0 : 1);
+            current[column] = Math.min(
+                previous[column] + 1,
+                current[column - 1] + 1,
+                substitution,
+            );
+        }
+        previous = current;
+    }
+    return previous[right.length];
+}
 
 /**
  * Normalise, typo-correct, and expand a raw search query.
