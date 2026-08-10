@@ -148,7 +148,9 @@ export async function searchSongsDirect(query, limit = 20) {
     const data = await _apiCall({
         '__call': 'search.getResults',
         'q':      query,
-        'N':      String(Math.min(limit, 40)),
+        // JioSaavn accepts lowercase `n`. Uppercase `N` is ignored and the
+        // provider silently falls back to ten results.
+        'n':      String(Math.min(limit, 40)),
         'p':      '1',
     });
 
@@ -201,7 +203,7 @@ export async function searchAlbumsDirect(query, limit = 10) {
     const data = await _apiCall({
         '__call': 'search.getAlbumResults',
         'q':      query,
-        'N':      String(Math.min(limit, 20)),
+        'n':      String(Math.min(limit, 20)),
         'p':      '1',
     });
 

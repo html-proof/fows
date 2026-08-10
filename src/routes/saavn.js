@@ -28,9 +28,9 @@ import { rerankSongsForUser } from '../services/personalizationModel.js';
 import { attachCanonicalIds } from '../services/identityResolver.js';
 
 const router = Router();
-const DEFAULT_LIMIT = 20;
+const DEFAULT_LIMIT = 40;
 const MIN_LIMIT = 10;
-const MAX_LIMIT = 20;
+const MAX_LIMIT = 40;
 const MAX_RELATED_LANGUAGES = 5;
 const MAX_ALBUM_LANGUAGE_BUCKETS = 4;
 const USER_LANGUAGE_CACHE_TTL_MS = 5 * 60 * 1000;

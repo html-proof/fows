@@ -93,7 +93,7 @@ router.get('/catalog/search', async (req, res) => {
 
     const uid   = await resolveUid(req);
     const page  = Math.max(1, parseInt(req.query.page ?? '1', 10) || 1);
-    const limit = Math.min(20, Math.max(5, parseInt(req.query.limit ?? '20', 10) || 20));
+    const limit = Math.min(40, Math.max(5, parseInt(req.query.limit ?? '40', 10) || 40));
 
     try {
         const analysis = analyzeQuery(rawQ);

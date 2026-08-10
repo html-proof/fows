@@ -9,7 +9,9 @@ const BASE_URL = 'https://saavn.sumit.co';
 const FALLBACK_BASE_URL = 'https://jiosaavn-api-murex.vercel.app';
 const MAX_SMART_RESULTS = 40;
 const BIGRAM_MIN_OVERLAP = 0.35;
-const SMART_SEARCH_MIN_RESULTS = 8;
+// Ten provider results are not enough after duplicate removal and client-side
+// quality filtering. Keep collecting until there is a useful browseable set.
+const SMART_SEARCH_MIN_RESULTS = 24;
 const SEARCH_CACHE_FRESH_TTL_MS = 2 * 60 * 1000;
 const SEARCH_CACHE_STALE_TTL_MS = 20 * 60 * 1000;
 const SEARCH_CACHE_MAX_ENTRIES = 300;
@@ -159,7 +161,7 @@ export async function searchSongsOnly(query, page = 1) {
     // Try direct JioSaavn API when both proxies either fail or return songs without download URLs
     if ((!primaryHasUrls && !fallbackHasUrls) || (!primaryPayload && fallbackSongs.length === 0)) {
         try {
-            const directPayload = await searchSongsOnlyDirect(query, 25);
+            const directPayload = await searchSongsOnlyDirect(query, 40);
             if (directPayload?.data?.results?.length > 0) {
                 console.info(`[saavnApi] Direct fallback resolved ${directPayload.data.results.length} songs for "${query}"`);
                 return directPayload;
@@ -423,7 +425,7 @@ async function computeSmartSearchResults({
     // fall back to the official JioSaavn API with built-in URL decryption.
     if (ranked.size < SMART_SEARCH_MIN_RESULTS) {
         try {
-            const directResults = await searchSongsOnlyDirect(normalizedQuery, 25);
+            const directResults = await searchSongsOnlyDirect(normalizedQuery, 40);
             const directSongs = directResults?.data?.results ?? [];
             if (directSongs.length > 0) {
                 console.info(`[saavnApi] Direct fallback added ${directSongs.length} songs for "${normalizedQuery}"`);
