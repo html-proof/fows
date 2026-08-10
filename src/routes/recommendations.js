@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { authenticateUser } from '../middleware/auth.js';
 import { getUserPreferences } from '../services/database.js';
-import { generateRecommendations, generateNextSongRecommendations } from '../services/recommendation.js';
+import { generateRecommendations, generateNextSongRecommendations, generateMoodSongs, generateRadioQueue, getMoodCatalog } from '../services/recommendation.js';
 
 const router = Router();
 
@@ -94,6 +94,65 @@ router.post('/next', authenticateUser, async (req, res) => {
     } catch (error) {
         console.error('Next recommendation error:', error.message);
         return res.status(500).json({ error: 'Failed to generate next-song recommendations' });
+    }
+});
+
+/**
+ * GET /api/recommendations/moods
+ * Returns the list of available mood categories.
+ */
+router.get('/moods', authenticateUser, (_req, res) => {
+    res.json({ success: true, data: getMoodCatalog() });
+});
+
+/**
+ * GET /api/recommendations/mood/:mood
+ * Returns songs for a specific mood.
+ * Query: languages (comma-separated), limit (max 30)
+ */
+router.get('/mood/:mood', authenticateUser, async (req, res) => {
+    try {
+        const mood = String(req.params.mood || '').toLowerCase().trim();
+        const prefs = await getUserPreferences(req.user.uid).catch(() => null);
+        const languages = prefs?.languages ?? [];
+        const limit = Math.min(parseInt(req.query.limit, 10) || 20, 30);
+
+        const songs = await generateMoodSongs({ mood, languages, limit });
+        res.json({ success: true, mood, count: songs.length, data: songs });
+    } catch (error) {
+        console.error('Mood songs error:', error.message);
+        res.status(500).json({ error: 'Failed to fetch mood songs' });
+    }
+});
+
+/**
+ * POST /api/recommendations/radio
+ * Generate a radio queue from a seed.
+ *
+ * Body: { seedType: 'song'|'artist'|'mood', seedId?, seedName?, excludeIds? }
+ */
+router.post('/radio', authenticateUser, async (req, res) => {
+    try {
+        const { seedType, seedId, seedName, excludeIds = [] } = req.body || {};
+        if (!seedType) return res.status(400).json({ error: '"seedType" is required' });
+
+        const prefs = await getUserPreferences(req.user.uid).catch(() => null);
+        const languages = prefs?.languages ?? [];
+        const limit = Math.min(parseInt(req.body?.limit, 10) || 20, 30);
+
+        const songs = await generateRadioQueue({
+            seedType,
+            seedId: seedId ? String(seedId) : undefined,
+            seedName: seedName ? String(seedName) : undefined,
+            languages,
+            limit,
+            excludeIds: Array.isArray(excludeIds) ? excludeIds.map(String) : [],
+        });
+
+        res.json({ success: true, count: songs.length, data: songs });
+    } catch (error) {
+        console.error('Radio error:', error.message);
+        res.status(500).json({ error: 'Failed to generate radio queue' });
     }
 });
 

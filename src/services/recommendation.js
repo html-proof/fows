@@ -899,7 +899,115 @@ function normalizeText(value) {
         .replace(/\s+/g, ' ');
 }
 
+// ── MOOD CATALOG ────────────────────────────────────────────────────────────
+
+const MOOD_CATALOG = {
+    happy:      { label: 'Happy',      emoji: '😊', queries: ['happy songs', 'feel good songs', 'upbeat songs'] },
+    sad:        { label: 'Sad',        emoji: '💔', queries: ['sad songs', 'heartbreak songs', 'melancholy songs'] },
+    romantic:   { label: 'Romantic',   emoji: '❤️',  queries: ['romantic love songs', 'love songs', 'romantic ballads'] },
+    workout:    { label: 'Workout',    emoji: '🔥', queries: ['workout songs energetic', 'gym motivation songs', 'pump up songs'] },
+    relax:      { label: 'Relax',      emoji: '😌', queries: ['relaxing songs', 'chill vibes', 'calm music'] },
+    party:      { label: 'Party',      emoji: '🎉', queries: ['party songs', 'dance songs', 'club music'] },
+    focus:      { label: 'Focus',      emoji: '🧠', queries: ['study music', 'focus instrumental', 'lo-fi music'] },
+    driving:    { label: 'Driving',    emoji: '🚗', queries: ['driving songs', 'road trip songs', 'open road music'] },
+    morning:    { label: 'Morning',    emoji: '☀️',  queries: ['morning songs', 'fresh start songs', 'good morning vibes'] },
+    night:      { label: 'Night',      emoji: '🌙', queries: ['night songs', 'late night music', 'slow night songs'] },
+    devotional: { label: 'Devotional', emoji: '🙏', queries: ['devotional songs', 'bhajan', 'spiritual songs'] },
+    sleep:      { label: 'Sleep',      emoji: '😴', queries: ['sleep music', 'calm lullaby', 'ambient sleep'] },
+};
+
+/**
+ * Returns the mood catalog (list of available moods with metadata).
+ */
+export function getMoodCatalog() {
+    return Object.entries(MOOD_CATALOG).map(([id, meta]) => ({ id, ...meta }));
+}
+
+/**
+ * Fetch songs for a given mood, optionally filtered by user's preferred languages.
+ */
+export async function generateMoodSongs({ mood, languages = [], limit = 20 }) {
+    const meta = MOOD_CATALOG[mood];
+    if (!meta) return [];
+
+    const lang = (languages[0] || '').toLowerCase();
+    const queries = meta.queries.map(q => lang ? `${lang} ${q}` : q);
+
+    const results = await Promise.all(
+        queries.map(q => searchSongsOnly(q).catch(() => ({ data: { results: [] } })))
+    );
+
+    const seen = new Set();
+    const songs = [];
+    for (const res of results) {
+        for (const song of (res?.data?.results || [])) {
+            if (!seen.has(song.id)) {
+                seen.add(song.id);
+                songs.push(song);
+            }
+        }
+    }
+
+    return shuffleArray(songs).slice(0, limit);
+}
+
+/**
+ * Generate a radio queue seeded by a song, artist, or mood.
+ * Extends the current queue when the user is near the end.
+ */
+export async function generateRadioQueue({ seedType, seedId, seedName, languages = [], limit = 20, excludeIds = [] }) {
+    const lang = (languages[0] || '').toLowerCase();
+    const excluded = new Set(excludeIds);
+    let queries = [];
+
+    if (seedType === 'song' && seedId) {
+        // Fetch song details to build relevant queries
+        try {
+            const details = await getSongById(seedId);
+            const song = extractSongFromDetails(details);
+            if (song) {
+                const artists = extractArtistNames(song);
+                const genre = resolvePrimaryGenre(song);
+                if (artists[0]) queries.push(lang ? `${lang} ${artists[0]} songs` : `${artists[0]} songs`);
+                if (genre) queries.push(lang ? `${lang} ${genre} songs` : `${genre} songs`);
+                if (song.language) queries.push(`${song.language} ${genre || 'popular'} songs`);
+            }
+        } catch (_) {}
+        if (queries.length === 0 && seedName) queries.push(lang ? `${lang} ${seedName}` : seedName);
+    } else if (seedType === 'artist' && seedName) {
+        queries.push(lang ? `${lang} ${seedName} songs` : `${seedName} songs`);
+        queries.push(seedName);
+    } else if (seedType === 'mood' && seedName) {
+        const meta = MOOD_CATALOG[seedName];
+        if (meta) {
+            queries = meta.queries.map(q => lang ? `${lang} ${q}` : q);
+        }
+    }
+
+    if (queries.length === 0) queries.push(lang ? `${lang} popular songs` : 'popular songs');
+
+    const results = await Promise.all(
+        queries.slice(0, 4).map(q => searchSongsOnly(q).catch(() => ({ data: { results: [] } })))
+    );
+
+    const seen = new Set();
+    const songs = [];
+    for (const res of results) {
+        for (const song of (res?.data?.results || [])) {
+            if (!seen.has(song.id) && !excluded.has(song.id)) {
+                seen.add(song.id);
+                songs.push(song);
+            }
+        }
+    }
+
+    return shuffleArray(songs).slice(0, limit);
+}
+
 export default {
     generateRecommendations,
     generateNextSongRecommendations,
+    generateMoodSongs,
+    generateRadioQueue,
+    getMoodCatalog,
 };

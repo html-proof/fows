@@ -58,9 +58,13 @@ router.get('/search', async (req, res) => {
             ? DEFAULT_LIMIT
             : Math.max(MIN_LIMIT, Math.min(parsedLimit, MAX_LIMIT));
 
+        // Expand query using NLP intent detection (used by both page 1 and load-more)
+        const pageOneIntent = detectSearchIntent(query);
+        const expandedQuery = pageOneIntent ? pageOneIntent.expandedQuery : query;
+
         // For page > 1, only fetch songs. This powers "load more" efficiently.
         if (page > 1) {
-            const songsData = await searchSongsOnly(query, page);
+            const songsData = await searchSongsOnly(expandedQuery, page);
             const baseSongs = prioritizeSongsByLanguage(
                 songsData?.data?.results ?? [],
                 preferredLanguages
@@ -107,9 +111,9 @@ router.get('/search', async (req, res) => {
 
         // First page returns songs + albums + artists
         const [songsData, albumsData, artistsData] = await Promise.allSettled([
-            searchSongsSmart(query, { preferredLanguages }),
-            searchAlbums(query),
-            searchArtists(query),
+            searchSongsSmart(expandedQuery, { preferredLanguages }),
+            searchAlbums(expandedQuery),
+            searchArtists(expandedQuery),
         ]);
 
         const songs = songsData.status === 'fulfilled'
@@ -177,10 +181,152 @@ router.get('/search', async (req, res) => {
     }
 });
 
+// ── Common artist-name typo corrections ──────────────────────────────────────
+const ARTIST_CORRECTIONS = new Map([
+    ['arijit sing', 'arijit singh'],
+    ['arijeet singh', 'arijit singh'],
+    ['arjit singh', 'arijit singh'],
+    ['arjeet', 'arijit singh'],
+    ['kishore', 'kishore kumar'],
+    ['lata', 'lata mangeshkar'],
+    ['asha', 'asha bhosle'],
+    ['sonu', 'sonu nigam'],
+    ['shreya', 'shreya ghoshal'],
+    ['shreya ghoshal', 'shreya ghoshal'],
+    ['atif', 'atif aslam'],
+    ['atif aslm', 'atif aslam'],
+    ['kk', 'k.k.'],
+    ['armaan', 'armaan malik'],
+    ['arman malik', 'armaan malik'],
+    ['jubin', 'jubin nautiyal'],
+    ['jubin notiyal', 'jubin nautiyal'],
+    ['mohit', 'mohit chauhan'],
+    ['vishal', 'vishal-shekhar'],
+    ['ar rahman', 'a.r. rahman'],
+    ['arrahman', 'a.r. rahman'],
+    ['rahman', 'a.r. rahman'],
+    ['sp balasubrahmanyam', 's.p. balasubrahmanyam'],
+    ['spb', 's.p. balasubrahmanyam'],
+    ['ilayaraja', 'ilaiyaraaja'],
+    ['illayaraja', 'ilaiyaraaja'],
+    ['sid sriram', 'sid sriram'],
+    ['anirudh', 'anirudh ravichander'],
+    ['thaman', 's. thaman'],
+    ['gv prakash', 'g.v. prakash kumar'],
+    ['devi sri prasad', 'devi sri prasad'],
+    ['dsp', 'devi sri prasad'],
+    ['mithoon', 'mithoon'],
+    ['amit trivedi', 'amit trivedi'],
+    ['shankar ehsaan loy', 'shankar-ehsaan-loy'],
+    ['shankar ehsaan', 'shankar-ehsaan-loy'],
+    ['benny dayal', 'benny dayal'],
+    ['hariharan', 'hariharan'],
+    ['udit narayan', 'udit narayan'],
+    ['kumar sanu', 'kumar sanu'],
+    ['alka yagnik', 'alka yagnik'],
+    ['kavita krishnamurthy', 'kavita krishnamurthy'],
+    ['sunidhi chauhan', 'sunidhi chauhan'],
+    ['neha kakkar', 'neha kakkar'],
+    ['badshah', 'badshah'],
+    ['yo yo honey singh', 'yo yo honey singh'],
+    ['honey singh', 'yo yo honey singh'],
+    ['guru randhawa', 'guru randhawa'],
+    ['hardy sandhu', 'hardy sandhu'],
+    ['diljit', 'diljit dosanjh'],
+    ['diljit dosanj', 'diljit dosanjh'],
+    ['ap dhillon', 'ap dhillon'],
+    ['karan aujla', 'karan aujla'],
+    ['imran khan', 'imran khan'],
+    ['ali zafar', 'ali zafar'],
+    ['rahat fateh ali', 'rahat fateh ali khan'],
+    ['nusrat', 'nusrat fateh ali khan'],
+    ['coke studio', 'coke studio'],
+    ['prateek kuhad', 'prateek kuhad'],
+    ['agathe chase', 'agathe chase'],
+    ['luke combs', 'luke combs'],
+]);
+
+// ── NLP intent keywords ───────────────────────────────────────────────────────
+const MOOD_KEYWORDS = new Map([
+    ['sad', 'sad songs'],
+    ['happy', 'happy songs'],
+    ['workout', 'workout songs energetic'],
+    ['gym', 'workout songs energetic'],
+    ['exercise', 'workout songs energetic'],
+    ['driving', 'driving songs upbeat'],
+    ['party', 'party songs dance'],
+    ['romantic', 'romantic love songs'],
+    ['love', 'romantic love songs'],
+    ['sleep', 'sleep songs calm ambient'],
+    ['study', 'focus study lo-fi'],
+    ['focus', 'focus study lo-fi'],
+    ['relax', 'relaxing chill songs'],
+    ['chill', 'chill relaxing songs'],
+    ['devotional', 'devotional bhajan songs'],
+    ['meditation', 'meditation calm music'],
+    ['morning', 'morning motivational songs'],
+    ['night', 'night slow songs'],
+]);
+
+const SIMILARITY_PREFIXES = [
+    'songs like ',
+    'similar to ',
+    'songs similar to ',
+    'music like ',
+    'artists like ',
+];
+
+/**
+ * Normalise, typo-correct, and expand a raw search query.
+ * Returns { query, isNlp, nlpHints } where `query` is the
+ * best string to forward to the search provider.
+ */
 function normalizeSearchQuery(value) {
-    return String(value ?? '')
-        .trim()
-        .replace(/\s+/g, ' ');
+    const raw = String(value ?? '').trim().replace(/\s+/g, ' ');
+    if (!raw) return '';
+
+    // Lowercase for matching, keep original case for output
+    const lower = raw.toLowerCase();
+
+    // Apply artist-name corrections (whole-string or leading match)
+    for (const [typo, correction] of ARTIST_CORRECTIONS) {
+        if (lower === typo || lower.startsWith(typo + ' ')) {
+            return raw.replace(new RegExp(typo, 'i'), correction);
+        }
+    }
+
+    return raw;
+}
+
+/**
+ * Detect NLP intent from a search query.
+ * Returns null when no special intent is found.
+ * @param {string} query
+ * @returns {{ type: string, expandedQuery: string } | null}
+ */
+export function detectSearchIntent(query) {
+    const lower = query.toLowerCase();
+
+    // "songs like X" / "similar to X" → similarity search
+    for (const prefix of SIMILARITY_PREFIXES) {
+        if (lower.startsWith(prefix)) {
+            const seed = query.slice(prefix.length).trim();
+            return { type: 'similarity', seed, expandedQuery: seed };
+        }
+    }
+
+    // Mood keywords
+    for (const [keyword, expansion] of MOOD_KEYWORDS) {
+        if (lower.includes(keyword)) {
+            const withoutMood = query.replace(new RegExp(keyword, 'gi'), '').trim();
+            const expandedQuery = withoutMood
+                ? `${withoutMood} ${expansion}`
+                : expansion;
+            return { type: 'mood', mood: keyword, expandedQuery };
+        }
+    }
+
+    return null;
 }
 
 function parsePreferredLanguages(value) {
