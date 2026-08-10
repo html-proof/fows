@@ -171,3 +171,31 @@ export async function searchSongsOnlyDirect(query, limit = 20) {
         },
     };
 }
+
+/**
+ * Search albums via JioSaavn's own search.getAlbumResults endpoint.
+ * Returns results shaped like the saavn.sumit.co proxy: { data: { results } }
+ * This endpoint correctly ranks albums (e.g. "Chotta Mumbai" → the film album,
+ * not a coincidentally-named OST from a different film).
+ */
+export async function searchAlbumsDirect(query, limit = 10) {
+    const data = await _apiCall({
+        '__call': 'search.getAlbumResults',
+        'q':      query,
+        'N':      String(Math.min(limit, 20)),
+        'p':      '1',
+    });
+
+    const results = (data?.results ?? []).map(r => ({
+        id:             String(r.id ?? ''),
+        name:           _htmlDecode(r.title ?? r.name ?? ''),
+        language:       (r.language ?? '').toLowerCase(),
+        year:           r.year ?? null,
+        url:            r.perma_url ?? null,
+        image:          r.image ? [{ quality: '150x150', url: r.image }] : [],
+        primaryArtists: _htmlDecode(r.subtitle ?? r.more_info?.music ?? ''),
+        songCount:      parseInt(r.more_info?.song_count ?? 0, 10),
+    }));
+
+    return { data: { results, total: data?.total ?? results.length } };
+}

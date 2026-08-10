@@ -148,8 +148,9 @@ export function buildSearchVariants(analysis) {
     // Also try original query (might differ from cleanTitle)
     if (originalQuery !== cleanTitle) push(originalQuery);
 
-    // Broad fallback: just first 2 words of title (helps with long Indian song titles)
     const titleWords = cleanTitle.split(/\s+/);
+
+    // Broad fallback: just first 2 words of title (helps with long Indian song titles)
     if (titleWords.length > 3) {
         push(titleWords.slice(0, 2).join(' '));
     }
@@ -161,7 +162,19 @@ export function buildSearchVariants(analysis) {
         push(`${cleanTitle} songs`);
     }
 
-    return variants.slice(0, 5);
+    // Last-resort single-word fallback: try each word alone (catches cases where
+    // JioSaavn has no results for the full phrase but indexes individual words).
+    // Only do this when the title is 2-3 words so we don't over-broaden long queries.
+    if (language && titleWords.length >= 2 && titleWords.length <= 3) {
+        for (const word of titleWords) {
+            if (word.length >= 4) {
+                push(`${word} ${language}`);
+                break; // just try the first meaningful word
+            }
+        }
+    }
+
+    return variants.slice(0, 6);
 }
 
 // ─── Song Identity ────────────────────────────────────────────────────────────
@@ -303,8 +316,10 @@ export function scoreSong(song, analysis) {
 
     // ── Duration heuristic ───────────────────────────────────────────────
     const dur = parseInt(song?.duration ?? 0, 10);
-    if (dur >= 120) score += 5;   // >= 2 min: real song
-    if (dur < 60 && dur > 0) score -= 8; // < 1 min: clip/intro
+    if (dur >= 180) score += 8;   // >= 3 min: strong signal of a real song
+    else if (dur >= 120) score += 5;
+    if (dur < 90 && dur > 0) score -= 20;  // score/jingle — heavy penalty
+    if (dur < 60 && dur > 0) score -= 20;  // stacked: < 1 min = -40 total
 
     // ── Light popularity signal (so we don't completely ignore JioSaavn's signals) ─
     const playCount = parseInt(song?.playCount ?? 0, 10);

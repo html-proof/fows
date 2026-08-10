@@ -102,19 +102,35 @@ app.head('/health', (_req, res) => {
 
 app.get('/', (_req, res) => {
     res.json({
-        message: 'Music Hub API Backend is running',
-        version: '2.0.0',
+        message: 'Music Hub API — JioSaavn-powered backend',
+        version: '2.1.0',
         endpoints: {
-            public: [
-                'GET /api/search?query=...',
-                'GET /api/songs/:id',
-                'GET /api/albums?id=...&query=...',
+            search: [
+                'GET  /api/search?query=&limit=&page=       — songs + albums + artists + top result',
+                'GET  /api/search/trending                  — trending search queries',
+            ],
+            songs: [
+                'GET  /api/songs/:id                        — song detail + 5-quality download URLs',
+                'GET  /api/songs/:id/stream?quality=320kbps — best stream URL (client plays directly)',
+                'GET  /api/songs/:id/lyrics                 — lyrics (JioSaavn Pro required)',
+                'GET  /api/songs/:id/recommendations?limit= — similar songs via reco engine',
+            ],
+            albums: [
+                'GET  /api/albums?id=                       — album by JioSaavn ID',
+                'GET  /api/albums/by-link?link=             — album by JioSaavn perma_url',
+            ],
+            artists: [
+                'GET  /api/artists/:id                      — artist profile + follower count',
+                'GET  /api/artists/:id/songs                — artist top songs',
+                'GET  /api/artists/:id/albums?page=&limit=  — artist albums',
+                'GET  /api/artists/by-language?language=    — artists by language',
+            ],
+            trending: [
+                'GET  /api/trending?language=&type=song|album&limit= — live trending',
             ],
             authenticated: [
                 'POST /api/user/preferences',
                 'GET  /api/user/preferences',
-                'POST /api/activity/search',
-                'POST /api/activity/search-click',
                 'POST /api/activity/play',
                 'POST /api/activity/skip',
                 'GET  /api/activity/history',
@@ -122,6 +138,15 @@ app.get('/', (_req, res) => {
                 'POST /api/recommendations/next',
                 'POST /api/playlist/import',
                 'POST /api/playlist/parse',
+            ],
+            catalog: [
+                'GET  /v1/catalog/search?q=                 — canonical search',
+                'GET  /v1/catalog/tracks/:id                — canonical track detail',
+                'GET  /v1/catalog/resolve/:id               — resolve canonical → stream URL',
+                'GET  /v1/home                              — personalised home feed (auth)',
+            ],
+            health: [
+                'GET  /healthz',
             ],
         },
     });

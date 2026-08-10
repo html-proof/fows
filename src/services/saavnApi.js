@@ -2,6 +2,7 @@ import { request } from 'undici';
 import {
     searchSongsOnlyDirect,
     getSongDirect,
+    searchAlbumsDirect,
 } from './jiosaavnDirect.js';
 
 const BASE_URL = 'https://saavn.sumit.co';
@@ -507,44 +508,34 @@ export async function getSongById(id) {
  * @param {string} id - Album ID
  * @returns {Promise<object>} Album details
  */
-export async function getAlbumById(id) {
+export async function getAlbumById(id, url) {
+    // Fetching by perma_url (?link=) is more reliable than numeric ID on the proxy.
+    if (url) {
+        try {
+            return await requestJsonWithTimeout(
+                `${BASE_URL}/api/albums?link=${encodeURIComponent(url)}`,
+                { timeoutMs: CATALOG_SEARCH_TIMEOUT_MS, label: 'Saavn album fetch (link)' }
+            );
+        } catch (_) { /* fall through to id-based fetch */ }
+    }
+
     try {
         return await requestJsonWithTimeout(
             `${BASE_URL}/api/albums/${encodeURIComponent(id)}`,
-            {
-                timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
-                label: 'Saavn album fetch (path)',
-            }
+            { timeoutMs: CATALOG_SEARCH_TIMEOUT_MS, label: 'Saavn album fetch (path)' }
         );
     } catch (error) {
         try {
             return await requestJsonWithTimeout(
                 `${BASE_URL}/api/albums?id=${encodeURIComponent(id)}`,
-                {
-                    timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
-                    label: 'Saavn album fetch (query)',
-                }
+                { timeoutMs: CATALOG_SEARCH_TIMEOUT_MS, label: 'Saavn album fetch (query)' }
             );
         } catch (innerError) {
-            try {
-                const fallbackData = await requestJsonWithTimeout(
-                    `${FALLBACK_BASE_URL}/api/albums?id=${encodeURIComponent(id)}`,
-                    {
-                        timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
-                        label: 'Fallback album fetch',
-                    }
-                );
-                return {
-                    success: true,
-                    data: fallbackData?.data ?? null,
-                };
-            } catch (fallbackError) {
-                return {
-                    success: false,
-                    error: 'Service temporarily unavailable',
-                    data: null,
-                };
-            }
+            return {
+                success: false,
+                error: 'Service temporarily unavailable',
+                data: null,
+            };
         }
     }
 }
@@ -555,6 +546,12 @@ export async function getAlbumById(id) {
  * @returns {Promise<object>} Album search results
  */
 export async function searchAlbums(query) {
+    // Prefer the direct JioSaavn endpoint — it ranks albums correctly (e.g. the
+    // actual "Chotta Mumbai" film album surfaces above coincidental OST matches).
+    try {
+        return await searchAlbumsDirect(query, 10);
+    } catch (_) { /* fall through to proxy */ }
+
     try {
         return await requestJsonWithTimeout(
             `${BASE_URL}/api/search/albums?query=${encodeURIComponent(query)}`,
@@ -564,29 +561,11 @@ export async function searchAlbums(query) {
             }
         );
     } catch (error) {
-        try {
-            const fallbackData = await requestJsonWithTimeout(
-                `${FALLBACK_BASE_URL}/api/search/albums?query=${encodeURIComponent(query)}`,
-                {
-                    timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
-                    label: 'Fallback album search',
-                }
-            );
-            return {
-                success: true,
-                data: {
-                    results: fallbackData?.data?.results ?? [],
-                },
-            };
-        } catch (fallbackError) {
-            return {
-                success: false,
-                error: fallbackError.message,
-                data: {
-                    results: [],
-                },
-            };
-        }
+        return {
+            success: false,
+            error: error.message,
+            data: { results: [] },
+        };
     }
 }
 

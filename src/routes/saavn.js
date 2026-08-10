@@ -12,6 +12,7 @@ import {
     searchAlbums,
     getLyricsBySongId,
 } from '../services/saavnApi.js';
+import { searchAlbumsDirect } from '../services/jiosaavnDirect.js';
 import { auth } from '../config/firebase.js';
 import { getGlobalTrending } from '../services/database.js';
 import {
@@ -20,6 +21,7 @@ import {
     rankSongs,
     deduplicateSongs,
     resolveTopResult as engineResolveTopResult,
+    normText,
 } from '../services/searchEngine.js';
 import { getUserPreferences } from '../services/database.js';
 import { rerankSongsForUser } from '../services/personalizationModel.js';
@@ -145,14 +147,30 @@ router.get('/search', async (req, res) => {
         let finalRanked = rankedSongs;
 
         // ── Album-song injection ─────────────────────────────────────────────
-        // When results are sparse (< 5 songs) and an album matches the query,
-        // pull that album's songs in. Handles queries like "perumazhakkalam"
-        // where the user typed a movie/album name rather than a song title.
-        if (finalRanked.length < 5 && albumsData.status === 'fulfilled') {
+        // Only inject when the query looks like an album/movie name (not a song
+        // title search). Guard: the top album name must closely match the query,
+        // AND the top ranked song must NOT already be an exact title match.
+        // This prevents flooding results with OST tracks when the user typed a
+        // song name that coincidentally matches an album.
+        // A short clip (< 90s) is NOT a reliable exact match — it's likely a score
+        // cue that happens to share the title. Treat it as missing for album injection.
+        const topSong = finalRanked[0];
+        const topSongDur = parseInt(topSong?.duration ?? 0, 10);
+        const topSongIsExactMatch = finalRanked.length > 0
+            && normText(topSong?.name ?? '') === normText(analysis.cleanTitle)
+            && topSongDur >= 90;
+        const queryLooksLikeAlbum = !topSongIsExactMatch && finalRanked.length < 8;
+
+        if (queryLooksLikeAlbum && albumsData.status === 'fulfilled') {
             const topAlbum = (albumsData.value?.data?.results ?? [])[0];
-            if (topAlbum?.id) {
+            const albumNameNorm = normText(topAlbum?.name ?? '');
+            const titleNorm = normText(analysis.cleanTitle);
+            const albumMatchesQuery = albumNameNorm && titleNorm &&
+                (albumNameNorm.includes(titleNorm) || titleNorm.includes(albumNameNorm));
+
+            if ((topAlbum?.id || topAlbum?.url) && albumMatchesQuery) {
                 try {
-                    const albumDetail = await getAlbumById(topAlbum.id);
+                    const albumDetail = await getAlbumById(topAlbum.id, topAlbum.url);
                     const albumSongs = albumDetail?.data?.songs ?? albumDetail?.data?.list ?? [];
                     if (albumSongs.length > 0) {
                         const ranked = rankSongs(deduplicateSongs([...albumSongs, ...finalRanked]), analysis);
@@ -233,7 +251,10 @@ const _TRENDING_FALLBACK = [
 
 router.get('/search/trending', async (_req, res) => {
     try {
-        const trending = await getGlobalTrending(10);
+        const trending = await Promise.race([
+            getGlobalTrending(10),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 3000)),
+        ]);
         const queries = trending.length >= 3
             ? [...new Set(trending.map(t => t.artist || t.songName).filter(Boolean))].slice(0, 10)
             : _TRENDING_FALLBACK;
@@ -944,6 +965,201 @@ router.get('/artists/:id/albums', async (req, res) => {
     } catch (error) {
         console.error('Artist albums API error:', error.message);
         return res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// ── Album by link (perma_url) ────────────────────────────────────────────────
+// Example: /api/albums?link=https://www.jiosaavn.com/album/chotta-mumbai/x2r2JfQW98M_
+// Also supports: /api/albums?id=55455073  (existing)
+// Updated to try ?link= first when provided
+router.get('/albums/by-link', async (req, res) => {
+    try {
+        const { link } = req.query;
+        if (!link) return res.status(400).json({ error: '"link" parameter is required' });
+        const data = await getAlbumById(null, link);
+        if (!data?.data?.name) return res.status(404).json({ error: 'Album not found' });
+        res.json(data);
+    } catch (error) {
+        console.error('Album by-link error:', error.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// ── Stream URL ───────────────────────────────────────────────────────────────
+// GET /api/songs/:id/stream
+// Returns the best available stream URL for a JioSaavn song ID.
+// The client uses this URL directly with an audio player — no proxy needed.
+// Quality preference: 320kbps → 160kbps → 96kbps (falls back down the chain).
+const _streamCache = new Map(); // songId → { urls, expiresAt }
+const _STREAM_TTL_MS = 25 * 60 * 1000; // 25 min (JioSaavn CDN URLs expire ~30 min)
+
+router.get('/songs/:id/stream', async (req, res) => {
+    const songId = req.params.id?.trim();
+    if (!songId) return res.status(400).json({ error: 'Song id is required' });
+
+    const quality = req.query.quality ?? '320kbps';
+    const QUALITY_ORDER = ['320kbps', '160kbps', '96kbps', '48kbps', '12kbps'];
+
+    try {
+        const now = Date.now();
+        let urls;
+
+        const cached = _streamCache.get(songId);
+        if (cached && cached.expiresAt > now) {
+            urls = cached.urls;
+        } else {
+            const data = await getSongById(songId);
+            const song = data?.data?.[0] ?? data?.data ?? null;
+            if (!song) return res.status(404).json({ error: 'Song not found' });
+
+            urls = song.downloadUrl ?? song.streamUrl ?? [];
+            if (urls.length) {
+                _streamCache.set(songId, { urls, expiresAt: now + _STREAM_TTL_MS });
+                if (_streamCache.size > 1000) _streamCache.delete(_streamCache.keys().next().value);
+            }
+        }
+
+        if (!urls.length) return res.status(404).json({ error: 'No stream URL available' });
+
+        // Pick requested quality, fall back down the chain
+        const urlMap = Object.fromEntries(urls.map(u => [u.quality, u.url]));
+        const startIdx = Math.max(0, QUALITY_ORDER.indexOf(quality));
+        let chosenUrl = null;
+        let chosenQuality = null;
+        for (const q of QUALITY_ORDER.slice(startIdx)) {
+            if (urlMap[q]) { chosenUrl = urlMap[q]; chosenQuality = q; break; }
+        }
+        if (!chosenUrl) { chosenUrl = urls[0].url; chosenQuality = urls[0].quality; }
+
+        res.json({
+            success: true,
+            data: {
+                songId,
+                streamUrl: chosenUrl,
+                quality: chosenQuality,
+                allQualities: urls.map(u => ({ quality: u.quality, url: u.url })),
+            },
+        });
+    } catch (error) {
+        console.error('Stream API error:', error.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// ── Recommendations (similar songs) ─────────────────────────────────────────
+// GET /api/songs/:id/recommendations?limit=10
+// Uses JioSaavn's album-reco engine: finds the song's album then returns
+// similar albums + their top tracks, deduped and ranked.
+const JIOSAAVN_DIRECT = 'https://www.jiosaavn.com/api.php';
+const DIRECT_QS = 'api_version=4&_format=json&_marker=0&ctx=wap6dot0';
+
+async function jiosaavnCall(params) {
+    const qs = new URLSearchParams({ ...params, api_version: '4', _format: 'json', _marker: '0', ctx: 'wap6dot0' });
+    const res = await fetch(`${JIOSAAVN_DIRECT}?${qs}`, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) throw new Error(`JioSaavn API error: ${res.status}`);
+    return res.json();
+}
+
+router.get('/songs/:id/recommendations', async (req, res) => {
+    const songId = req.params.id?.trim();
+    if (!songId) return res.status(400).json({ error: 'Song id is required' });
+
+    const limit = Math.min(parseInt(req.query.limit ?? '10', 10) || 10, 20);
+
+    try {
+        // Step 1: get song's album ID
+        const songData = await getSongById(songId);
+        const song = songData?.data?.[0] ?? songData?.data ?? null;
+        if (!song) return res.status(404).json({ error: 'Song not found' });
+
+        const albumId = song.album?.id ?? song.albumId;
+        if (!albumId) return res.status(404).json({ error: 'Album not found for song' });
+
+        // Step 2: get similar albums from JioSaavn reco engine
+        const recoData = await jiosaavnCall({ __call: 'reco.getAlbumReco', albumid: albumId });
+        const recoAlbums = Array.isArray(recoData) ? recoData : [];
+
+        if (!recoAlbums.length) {
+            return res.json({ success: true, data: [] });
+        }
+
+        // Step 3: from recommended albums, surface 1-2 top songs each
+        const recommendations = [];
+        for (const album of recoAlbums.slice(0, 8)) {
+            if (recommendations.length >= limit) break;
+            try {
+                const albumDetail = await getAlbumById(album.id ?? album.albumid);
+                const songs = albumDetail?.data?.songs ?? albumDetail?.data?.list ?? [];
+                // Pick the first real song (duration >= 60s)
+                const topSong = songs.find(s => parseInt(s.duration ?? 0, 10) >= 60);
+                if (topSong) {
+                    recommendations.push({
+                        id: topSong.id,
+                        name: topSong.name,
+                        artists: topSong.artists,
+                        album: { id: topSong.album?.id, name: topSong.album?.name ?? album.title },
+                        image: topSong.image,
+                        duration: topSong.duration,
+                        language: topSong.language,
+                        year: topSong.year,
+                    });
+                }
+            } catch (_) { /* skip failed album */ }
+        }
+
+        res.json({ success: true, data: recommendations.slice(0, limit) });
+    } catch (error) {
+        console.error('Recommendations error:', error.message);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// ── Trending ─────────────────────────────────────────────────────────────────
+// GET /api/trending?language=malayalam&type=song|album
+// Returns JioSaavn's live trending songs or albums for a language.
+const _trendingCache = new Map(); // key → { data, expiresAt }
+const _TRENDING_TTL_MS = 10 * 60 * 1000; // 10 min
+
+router.get('/trending', async (req, res) => {
+    const language = (req.query.language ?? 'hindi').toLowerCase().trim();
+    const type = req.query.type === 'album' ? 'album' : 'song';
+    const limit = Math.min(parseInt(req.query.limit ?? '20', 10) || 20, 50);
+    const cacheKey = `${language}:${type}`;
+
+    try {
+        const now = Date.now();
+        const cached = _trendingCache.get(cacheKey);
+        if (cached && cached.expiresAt > now) {
+            return res.json({ success: true, data: cached.data.slice(0, limit) });
+        }
+
+        const raw = await jiosaavnCall({
+            __call: 'content.getTrending',
+            entity_type: type,
+            entity_language: language,
+        });
+
+        // JioSaavn returns either an array or an object with numeric keys
+        const list = Array.isArray(raw)
+            ? raw
+            : Object.values(raw ?? {}).filter(v => v && typeof v === 'object' && !Array.isArray(v));
+
+        const data = list.map(item => ({
+            id:       item.id ?? null,
+            name:     item.title ?? item.name ?? '',
+            type:     item.type ?? type,
+            image:    item.image ?? null,
+            url:      item.perma_url ?? item.url ?? null,
+            language: item.language ?? language,
+            year:     item.year ?? null,
+            artists:  item.subtitle ?? item.more_info?.music ?? null,
+        })).filter(item => item.name);
+
+        _trendingCache.set(cacheKey, { data, expiresAt: now + _TRENDING_TTL_MS });
+        res.json({ success: true, data: data.slice(0, limit) });
+    } catch (error) {
+        console.error('Trending error:', error.message);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
