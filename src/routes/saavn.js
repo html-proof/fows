@@ -23,6 +23,7 @@ import {
 import { getUserPreferences } from '../services/database.js';
 import { rerankSongsForUser } from '../services/personalizationModel.js';
 import { searchItunes, enrichSongsWithItunes, buildItunesQueries } from '../services/itunesService.js';
+import { enrichSongsWithDeezer } from '../services/deezerService.js';
 import { attachCanonicalIds } from '../services/identityResolver.js';
 import { resolveItunesCountry } from '../services/regionResolver.js';
 
@@ -139,8 +140,13 @@ router.get('/search', async (req, res) => {
         // Deduplicate first (same song from multiple variants), then rank
         const dedupedSongs = deduplicateSongs(allRawSongs);
 
-        // Enrich with iTunes metadata before scoring (adds itunesBoost to each song)
-        const enrichedSongs = enrichSongsWithItunes(dedupedSongs, itunesTracks);
+        // Enrich with iTunes metadata (adds itunesBoost) and Deezer metadata
+        // (adds deezerMeta.isrc for canonical identity) in parallel.
+        const [enrichedSongs] = await Promise.all([
+            Promise.resolve(enrichSongsWithItunes(dedupedSongs, itunesTracks)).then(songs =>
+                enrichSongsWithDeezer(songs, primaryQuery)
+            ),
+        ]);
 
         const rankedByEngine = rankSongs(enrichedSongs, analysis);
 

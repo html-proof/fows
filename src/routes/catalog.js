@@ -41,6 +41,7 @@ import {
 } from '../services/playbackResolver.js';
 import { getUserPreferences } from '../services/database.js';
 import { resolveItunesCountry } from '../services/regionResolver.js';
+import { enrichSongsWithDeezer } from '../services/deezerService.js';
 import { rerankSongsForUser } from '../services/personalizationModel.js';
 
 const router = Router();
@@ -86,12 +87,14 @@ function shapeSong(song) {
             id:         song.album?.id ?? song.albumId ?? null,
             name:       albumName,
         },
-        artwork,
+        artwork:        song.deezerMeta?.artworkLg ?? artwork,
         durationMs:     (parseInt(song.duration ?? 0, 10) || 0) * 1000,
         language:       song.language ?? null,
         genre:          song.itunesMeta?.genre ?? null,
-        isExplicit:     song.itunesMeta?.isExplicit ?? false,
+        isExplicit:     song.itunesMeta?.isExplicit ?? song.deezerMeta?.explicit ?? false,
         itunesVerified: !!song.itunesMeta,
+        deezerVerified: !!song.deezerMeta,
+        isrc:           song.deezerMeta?.isrc ?? null,   // canonical identity key
         hasDownloadUrl: !!(song.downloadUrl?.length || song.streamUrl?.length),
         year:           song.itunesMeta?.year ?? (song.year ? parseInt(song.year, 10) : null),
     };
@@ -126,9 +129,10 @@ router.get('/catalog/search', async (req, res) => {
             itunesFetch,
         ]);
 
-        // Deduplicate → iTunes enrich → rank
+        // Deduplicate → iTunes enrich → Deezer enrich (ISRC) → rank
         let songs = deduplicateSongs(saavnRaw ?? []);
         songs = enrichSongsWithItunes(songs, itunesTracks);
+        songs = await enrichSongsWithDeezer(songs, primaryQ);
         songs = rankSongs(songs, analysis).slice(0, limit);
 
         // Personalise if user is known
