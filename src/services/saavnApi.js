@@ -418,6 +418,29 @@ async function computeSmartSearchResults({
         });
     }
 
+    // If both proxy APIs returned nothing (common when server runs outside India),
+    // fall back to the official JioSaavn API with built-in URL decryption.
+    if (ranked.size < SMART_SEARCH_MIN_RESULTS) {
+        try {
+            const directResults = await searchSongsOnlyDirect(normalizedQuery, 25);
+            const directSongs = directResults?.data?.results ?? [];
+            if (directSongs.length > 0) {
+                console.info(`[saavnApi] Direct fallback added ${directSongs.length} songs for "${normalizedQuery}"`);
+                addRankedSongs({
+                    ranked,
+                    songs: directSongs,
+                    query: normalizedQuery,
+                    variantIndex: SMART_SEARCH_MAX_VARIANTS + 2,
+                    sourceWeight: 10,
+                    languageHint,
+                    preferredLanguageSet,
+                });
+            }
+        } catch (err) {
+            console.warn(`[saavnApi] Direct fallback failed: ${err?.message}`);
+        }
+    }
+
     return buildRankedOutput(ranked);
 }
 
