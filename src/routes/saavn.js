@@ -22,7 +22,7 @@ import {
 } from '../services/searchEngine.js';
 import { getUserPreferences } from '../services/database.js';
 import { rerankSongsForUser } from '../services/personalizationModel.js';
-import { searchItunes, enrichSongsWithItunes } from '../services/itunesService.js';
+import { searchItunes, enrichSongsWithItunes, buildItunesQueries } from '../services/itunesService.js';
 import { attachCanonicalIds } from '../services/identityResolver.js';
 
 const router = Router();
@@ -113,16 +113,18 @@ router.get('/search', async (req, res) => {
                 .catch(() => [])
         );
 
-        // iTunes query: use cleanTitle + artist hint if available
-        const itunesQuery = analysis.movie
-            ? `${analysis.cleanTitle} ${analysis.movie}`
-            : analysis.cleanTitle || rawQuery;
+        // Build 1–2 targeted iTunes queries from intent (never raw user input).
+        // Cap at 2 to stay well under Apple's ~20 req/min rate limit.
+        const itunesQueries = buildItunesQueries(analysis);
+        const itunesFetch = Promise.all(
+            itunesQueries.map(q => searchItunes(q, { limit: 25, country: 'IN' }).catch(() => []))
+        ).then(results => results.flat());
 
         const [songResults, albumsData, artistsData, itunesResults] = await Promise.allSettled([
             Promise.all(songFetches),
             searchAlbums(primaryQuery),
             searchArtists(primaryQuery),
-            searchItunes(itunesQuery, { limit: 30, country: 'IN' }),
+            itunesFetch,
         ]);
 
         const itunesTracks = itunesResults.status === 'fulfilled' ? itunesResults.value : [];

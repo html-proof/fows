@@ -9,6 +9,7 @@ import activityRoutes from './routes/activity.js';
 import recommendationRoutes from './routes/recommendations.js';
 import playlistImportRoutes from './routes/playlistImport.js';
 import catalogRoutes from './routes/catalog.js';
+import { itunesHealthStatus } from './services/itunesService.js';
 import { isShuttingDown } from './runtimeState.js';
 
 const app = express();
@@ -82,6 +83,9 @@ app.get('/healthz', (_req, res) => {
         state: shuttingDown ? 'shutting_down' : 'ok',
         service: 'music-hub-backend',
         timestamp: new Date().toISOString(),
+        providers: {
+            itunes: itunesHealthStatus(),
+        },
     });
 });
 app.head('/healthz', (_req, res) => {
