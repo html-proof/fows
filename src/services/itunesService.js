@@ -11,6 +11,7 @@
  * No API key required. Rate limit: ~20 req/s per IP — safe for search use.
  */
 
+import { request } from 'undici';
 import { normText, bigramSimilarity } from './searchEngine.js';
 
 const ITUNES_BASE = 'https://itunes.apple.com/search';
@@ -59,17 +60,15 @@ export async function searchItunes(query, { limit = 25, country = 'IN', entity =
     url.searchParams.set('media', 'music');
 
     try {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), ITUNES_TIMEOUT_MS);
-
-        const res = await fetch(url.toString(), {
-            signal: ctrl.signal,
-            headers: { 'Accept': 'application/json' },
+        const { statusCode, body } = await request(url.toString(), {
+            method: 'GET',
+            headers: { 'Accept': 'application/json', 'User-Agent': 'MusicHubBackend/2.0' },
+            bodyTimeout: ITUNES_TIMEOUT_MS,
+            headersTimeout: ITUNES_TIMEOUT_MS,
         });
-        clearTimeout(timer);
 
-        if (!res.ok) throw new Error(`iTunes HTTP ${res.status}`);
-        const json = await res.json();
+        if (statusCode !== 200) throw new Error(`iTunes HTTP ${statusCode}`);
+        const json = await body.json();
         const tracks = (json.results ?? []).map(normaliseItunesTrack);
         _cacheSet(cacheKey, tracks);
         return tracks;
