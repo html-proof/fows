@@ -287,6 +287,10 @@ export function scoreSong(song, analysis) {
     if (playCount > 10_000_000) score += 4;
     else if (playCount > 1_000_000) score += 2;
 
+    // ── iTunes identity confirmation bonus ────────────────────────────────────
+    // Set by enrichSongsWithItunes() — 0 when no iTunes match, up to 25 pts
+    score += (song?.itunesBoost ?? 0);
+
     return score;
 }
 
@@ -381,7 +385,7 @@ export function resolveTopResult({ analysis, songs, artists, albums }) {
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
-function normText(value) {
+export function normText(value) {
     return String(value ?? '')
         .toLowerCase()
         .replace(/[^\p{L}\p{N}\s]/gu, ' ')
@@ -389,7 +393,7 @@ function normText(value) {
         .trim();
 }
 
-function bigramSimilarity(a, b) {
+export function bigramSimilarity(a, b) {
     if (!a || !b) return 0;
     if (a === b) return 1;
 

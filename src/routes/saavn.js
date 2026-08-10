@@ -22,6 +22,7 @@ import {
 } from '../services/searchEngine.js';
 import { getUserPreferences } from '../services/database.js';
 import { rerankSongsForUser } from '../services/personalizationModel.js';
+import { searchItunes, enrichSongsWithItunes } from '../services/itunesService.js';
 
 const router = Router();
 const DEFAULT_LIMIT = 20;
@@ -105,17 +106,25 @@ router.get('/search', async (req, res) => {
         // Build query variants from analysis (most-specific → least-specific)
         const searchVariants = buildSearchVariants(analysis);
 
-        // Fire songs from each variant + albums + artists in parallel
+        // Fire songs from each variant + albums + artists + iTunes in parallel
         const songFetches = searchVariants.map(variant =>
             searchSongsSmart(variant, { preferredLanguages, waitForFresh: true })
                 .catch(() => [])
         );
 
-        const [songResults, albumsData, artistsData] = await Promise.allSettled([
+        // iTunes query: use cleanTitle + artist hint if available
+        const itunesQuery = analysis.movie
+            ? `${analysis.cleanTitle} ${analysis.movie}`
+            : analysis.cleanTitle || rawQuery;
+
+        const [songResults, albumsData, artistsData, itunesResults] = await Promise.allSettled([
             Promise.all(songFetches),
             searchAlbums(primaryQuery),
             searchArtists(primaryQuery),
+            searchItunes(itunesQuery, { limit: 30, country: 'IN' }),
         ]);
+
+        const itunesTracks = itunesResults.status === 'fulfilled' ? itunesResults.value : [];
 
         // ── Step 4: Merge + deduplicate + rank songs ─────────────────────────
         const allRawSongs = songResults.status === 'fulfilled'
@@ -124,7 +133,11 @@ router.get('/search', async (req, res) => {
 
         // Deduplicate first (same song from multiple variants), then rank
         const dedupedSongs = deduplicateSongs(allRawSongs);
-        const rankedByEngine = rankSongs(dedupedSongs, analysis);
+
+        // Enrich with iTunes metadata before scoring (adds itunesBoost to each song)
+        const enrichedSongs = enrichSongsWithItunes(dedupedSongs, itunesTracks);
+
+        const rankedByEngine = rankSongs(enrichedSongs, analysis);
 
         // Apply language preference as a secondary sort layer (doesn't override exact matches)
         const songsWithLangPref = preferredLanguages.length > 0
@@ -186,6 +199,7 @@ router.get('/search', async (req, res) => {
                     language: analysis.language,
                     movie: analysis.movie,
                     isVersionSearch: analysis.isVersionSearch,
+                    itunesEnriched: itunesTracks.length > 0,
                 },
                 sections: buildSearchSections({
                     songs: songsOut,
