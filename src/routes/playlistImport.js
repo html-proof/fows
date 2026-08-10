@@ -10,7 +10,7 @@ import {
 
 const router = Router();
 
-const MAX_ITEMS = 500;
+const MAX_ITEMS = 10000;
 const SCRAPE_TIMEOUT_MS = 7000;
 
 // Only these hostnames may be fetched server-side (SSRF allowlist)
@@ -189,6 +189,7 @@ router.post('/parse', authenticateUser, async (req, res) => {
             success: true,
             name: name || '',
             items: items.slice(0, MAX_ITEMS),
+            totalParsed: items.length,
         });
     } catch (error) {
         console.error('Playlist parse error:', error?.message ?? error);

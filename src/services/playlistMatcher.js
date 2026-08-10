@@ -1,7 +1,7 @@
 import { searchSongsSmart } from './saavnApi.js';
 
-const MATCH_CONCURRENCY = 10;
-const MATCH_TIMEOUT_MS = 6000;
+const MATCH_CONCURRENCY = 20;
+const MATCH_TIMEOUT_MS = 8000;
 const MIN_FUZZY_SIMILARITY = 0.45;
 const MAX_PARSED_TITLE_LENGTH = 180;
 const MAX_PARSED_ARTIST_LENGTH = 140;
@@ -67,11 +67,13 @@ export async function matchPlaylistItems(items, options = {}) {
 async function matchSingleItem(item, { preferredLanguages }) {
     const title = normalize(item?.title);
     const artist = normalize(item?.artist);
+    const movie = normalize(item?.movie ?? '');
+    const album = normalize(item?.album ?? '');
 
     if (!title) return null;
 
     // Build search queries in priority order
-    const queries = buildSearchQueries(title, artist);
+    const queries = buildSearchQueries(title, artist, movie, album);
 
     for (const query of queries) {
         try {
@@ -102,62 +104,64 @@ async function matchSingleItem(item, { preferredLanguages }) {
 }
 
 /**
- * Build progressively broader search queries.
+ * Build progressively broader search queries using all available metadata.
+ * Supports Indian music patterns: "Song (From Movie)" or "Song - Artist - Movie"
  */
-function buildSearchQueries(title, artist) {
+function buildSearchQueries(title, artist, movie = '', album = '') {
     const queries = [];
     const push = (q) => {
-        const normalized = q.trim();
+        const normalized = q.replace(/\s+/g, ' ').trim();
         if (normalized && !queries.includes(normalized)) {
             queries.push(normalized);
         }
     };
 
-    // Most specific: "title artist"
-    if (artist) {
-        push(`${title} ${artist}`);
-    }
+    const firstArtist = artist && artist.includes(',') ? artist.split(',')[0].trim() : artist;
 
-    // Secondary: "title firstArtist" (if multiple artists)
-    if (artist && artist.includes(',')) {
-        const firstArtist = artist.split(',')[0].trim();
-        if (firstArtist) push(`${title} ${firstArtist}`);
-    }
+    // Most specific: title + artist + movie (best for Indian music)
+    if (artist && movie) push(`${title} ${firstArtist} ${movie}`);
+    // title + artist
+    if (artist) push(`${title} ${artist}`);
+    // title + firstArtist (if multiple)
+    if (firstArtist && firstArtist !== artist) push(`${title} ${firstArtist}`);
+    // title + movie (without artist — good for JioSaavn's song naming)
+    if (movie) push(`${title} ${movie}`);
+    // title + album
+    if (album && album !== movie) push(`${title} ${album}`);
 
-    // Just title
-    push(title);
-
-    // Drops " - From ..." or similar noise common in various music platforms
+    // Strip noise from title to make a cleaner query
     const noiseRemovals = [
         /\s*-\s*from\s+.*$/i,
         /\s*-\s*original\s+motion\s+picture\s+soundtrack\s*$/i,
-        /\s*-\s*remastered\s*$/i,
-        /\s*-\s*remix\s*$/i,
-        /\s*-\s*single\s+version\s*$/i,
-        /\s*[\(\[].*?[\)\]]\s*/g,
+        /\s*-\s*remastered.*$/i,
+        /\s*-\s*remix.*$/i,
+        /\s*-\s*single\s+version.*$/i,
+        /\s*[\(\[][^)\]]*[\)\]]\s*/g,
     ];
-
-    let queryTitle = title;
+    let cleanTitle = title;
     for (const pattern of noiseRemovals) {
-        queryTitle = queryTitle.replace(pattern, ' ');
+        cleanTitle = cleanTitle.replace(pattern, ' ');
     }
-    queryTitle = queryTitle.replace(/\s+/g, ' ').trim();
+    cleanTitle = cleanTitle.replace(/\s+/g, ' ').trim();
 
-    if (queryTitle && queryTitle !== title) {
-        if (artist) push(`${queryTitle} ${artist}`);
-        const firstArtist = artist && artist.includes(',') ? artist.split(',')[0].trim() : artist;
-        if (firstArtist && firstArtist !== artist) push(`${queryTitle} ${firstArtist}`);
-        push(queryTitle);
+    if (cleanTitle && cleanTitle !== title) {
+        if (artist) push(`${cleanTitle} ${firstArtist || artist}`);
+        if (movie) push(`${cleanTitle} ${movie}`);
+        push(cleanTitle);
     }
 
-    // Fallback: search just first 3 words of title if it's long
-    const words = title.split(/\s+/);
-    if (words.length > 5) {
+    // Just title — broadest fallback
+    push(title);
+
+    // Short title fallback for long titles
+    const words = (cleanTitle || title).split(/\s+/);
+    if (words.length > 4) {
         const shortTitle = words.slice(0, 3).join(' ');
-        if (artist) push(`${shortTitle} ${artist}`);
+        if (artist) push(`${shortTitle} ${firstArtist || artist}`);
+        if (movie) push(`${shortTitle} ${movie}`);
     }
 
-    return queries.slice(0, 5); // Allow more variants
+    return queries.slice(0, 7);
 }
 
 /**
@@ -246,6 +250,16 @@ function parsePlaylistLine(line) {
         .replace(/^[\•\-\*\#]+\s*/, '')
         .trim();
 
+    // Extract movie name from parentheticals BEFORE splitting by delimiter
+    // Patterns: "(From Movie Name)", "(From the Movie Name)", "(OST Movie)", "(Movie)", "(फ़िल्म Name)"
+    let movie = '';
+    let album = '';
+    const fromMovieMatch = cleaned.match(/\(\s*(?:from\s+(?:the\s+)?(?:movie\s+|film\s+)?|ost[:\s]+|फ़िल्म\s*)['"]?([^'")\n]{1,80})['"]?\s*\)/i);
+    if (fromMovieMatch) {
+        movie = fromMovieMatch[1].trim();
+        cleaned = cleaned.replace(fromMovieMatch[0], '').replace(/\s+/g, ' ').trim();
+    }
+
     // Try splitting by common delimiters
     const delimiters = [' - ', ' – ', ' — ', ' by ', ' • ', ' | '];
     for (const delimiter of delimiters) {
@@ -253,16 +267,13 @@ function parsePlaylistLine(line) {
         if (parts.length >= 2) {
             const left = parts[0].trim();
             const right = parts.slice(1).join(delimiter).trim();
-
             if (left && right) {
-                // Heuristic: if delimiter is "by", left=title, right=artist
-                // Otherwise: could be either order, assume left=title
-                return { title: left, artist: right };
+                return { title: left, artist: right, movie, album };
             }
         }
     }
 
-    return { title: cleaned, artist: '' };
+    return { title: cleaned, artist: '', movie, album };
 }
 
 function isHeaderLine(line) {
