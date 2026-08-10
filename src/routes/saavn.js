@@ -13,6 +13,7 @@ import {
     getLyricsBySongId,
 } from '../services/saavnApi.js';
 import { auth } from '../config/firebase.js';
+import { getGlobalTrending } from '../services/database.js';
 import {
     analyzeQuery,
     buildSearchVariants,
@@ -154,8 +155,7 @@ router.get('/search', async (req, res) => {
                     const albumDetail = await getAlbumById(topAlbum.id);
                     const albumSongs = albumDetail?.data?.songs ?? albumDetail?.data?.list ?? [];
                     if (albumSongs.length > 0) {
-                        const enrichedAlbumSongs = enrichSongsWithItunes(albumSongs, itunesTracks);
-                        const ranked = rankSongs(deduplicateSongs([...enrichedAlbumSongs, ...finalRanked]), analysis);
+                        const ranked = rankSongs(deduplicateSongs([...albumSongs, ...finalRanked]), analysis);
                         finalRanked = ranked;
                     }
                 } catch (_) { /* album fetch is best-effort */ }
@@ -206,7 +206,7 @@ router.get('/search', async (req, res) => {
                     language: analysis.language,
                     movie: analysis.movie,
                     isVersionSearch: analysis.isVersionSearch,
-                    itunesEnriched: itunesTracks.length > 0,
+                    itunesEnriched: false,
                 },
                 sections: buildSearchSections({
                     songs: songsOut,
@@ -824,9 +824,24 @@ router.get('/songs/:id', async (req, res) => {
 
 // Song Lyrics API (public)
 // Example: /api/songs/:id/lyrics
+const _lyricsCache = new Map(); // songId → { data, expiresAt }
+const _LYRICS_TTL_MS = 30 * 60 * 1000; // 30 min
+
 router.get('/songs/:id/lyrics', async (req, res) => {
     try {
-        const data = await getLyricsBySongId(req.params.id);
+        const songId = req.params.id;
+        const now = Date.now();
+        const cached = _lyricsCache.get(songId);
+        if (cached && cached.expiresAt > now) {
+            return res.json(cached.data);
+        }
+
+        const data = await getLyricsBySongId(songId);
+        _lyricsCache.set(songId, { data, expiresAt: now + _LYRICS_TTL_MS });
+        // Evict oldest entry when cache exceeds 500 songs
+        if (_lyricsCache.size > 500) {
+            _lyricsCache.delete(_lyricsCache.keys().next().value);
+        }
         res.json(data);
     } catch (error) {
         console.error('Lyrics API error:', error.message);

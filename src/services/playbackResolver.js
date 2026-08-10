@@ -20,6 +20,7 @@ import {
     resolveOrCreate,
 } from './identityResolver.js';
 import { getSongById, searchSongsOnly } from './saavnApi.js';
+import { searchSongsDirect, getSongDirect } from './jiosaavnDirect.js';
 import { bigramSimilarity, normText } from './searchEngine.js';
 
 // ─── Error type ───────────────────────────────────────────────────────────────
@@ -116,31 +117,50 @@ export async function resolveStream(canonicalId, opts = {}) {
         }
     }
 
-    // 4. JioSaavn search fallback
+    // 4. JioSaavn proxy search fallback
     const query = `${track.title} ${track.artist_name ?? ''}`.trim();
-    let results;
     try {
-        results = await searchSongsOnly(query, 1, 10);
-    } catch (err) {
-        throw new PlaybackResolveError(`JioSaavn search failed: ${err.message}`, 'PROVIDER_ERROR');
-    }
+        const results = await searchSongsOnly(query, 1, 10);
+        for (const song of results ?? []) {
+            const score = _scoreMatch(track, song);
+            if (score < IDENTITY_CONFIDENCE_MIN) continue;
+            const stream = _bestStreamUrl(song);
+            if (!stream) continue;
+            resolveOrCreate(
+                { title: track.title, artist: track.artist_name, durationMs: track.duration_ms },
+                'jiosaavn', song.id ?? song.songId ?? '',
+            );
+            cacheStreamUrl(canonicalId, stream.url, stream.quality);
+            return { ...stream, provider: 'jiosaavn', canonicalId };
+        }
+    } catch (_) { /* fall through to direct client */ }
 
-    for (const song of results ?? []) {
-        const score = _scoreMatch(track, song);
-        if (score < IDENTITY_CONFIDENCE_MIN) continue;
+    // 5. JioSaavn direct client (decrypts media URLs itself — bypasses proxy)
+    try {
+        const jiosaavnId = getProviderTrackId(canonicalId, 'jiosaavn');
+        if (jiosaavnId) {
+            const direct = await getSongDirect(jiosaavnId);
+            const song = direct?.data?.[0] ?? direct?.data ?? null;
+            if (song) {
+                const stream = _bestStreamUrl(song);
+                if (stream) {
+                    cacheStreamUrl(canonicalId, stream.url, stream.quality);
+                    return { ...stream, provider: 'jiosaavn-direct', canonicalId };
+                }
+            }
+        }
 
-        const stream = _bestStreamUrl(song);
-        if (!stream) continue;
-
-        // Register this JioSaavn song as a mapping
-        resolveOrCreate(
-            { title: track.title, artist: track.artist_name, durationMs: track.duration_ms },
-            'jiosaavn', song.id ?? song.songId ?? '',
-        );
-
-        cacheStreamUrl(canonicalId, stream.url, stream.quality);
-        return { ...stream, provider: 'jiosaavn', canonicalId };
-    }
+        // Direct search as last resort
+        const directResults = await searchSongsDirect(query, 10);
+        for (const song of directResults ?? []) {
+            const score = _scoreMatch(track, song);
+            if (score < IDENTITY_CONFIDENCE_MIN) continue;
+            const stream = _bestStreamUrl(song);
+            if (!stream) continue;
+            cacheStreamUrl(canonicalId, stream.url, stream.quality);
+            return { ...stream, provider: 'jiosaavn-direct', canonicalId };
+        }
+    } catch (_) { /* exhausted all fallbacks */ }
 
     throw new PlaybackResolveError(
         `No playable source found for "${track.title}" (${canonicalId})`,

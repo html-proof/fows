@@ -34,8 +34,9 @@ import {
     resolveStream,
     PlaybackResolveError,
 } from '../services/playbackResolver.js';
-import { getUserPreferences } from '../services/database.js';
+import { getUserPreferences, getGlobalTrending, getRecentActivity } from '../services/database.js';
 import { rerankSongsForUser } from '../services/personalizationModel.js';
+import { generateRecommendations } from '../services/recommendation.js';
 
 const router = Router();
 
@@ -107,8 +108,13 @@ router.get('/catalog/search', async (req, res) => {
 
         // Personalise if user is known
         if (uid) {
-            const prefs = await getUserPreferences(uid).catch(() => null);
-            if (prefs) songs = rerankSongsForUser(songs, prefs, rawQ);
+            songs = await rerankSongsForUser({
+                uid,
+                songs,
+                query: rawQ,
+                preferredLanguages: [],
+                mode: 'search',
+            }).catch(() => songs);
         }
 
         // Assign canonical IDs
@@ -276,24 +282,54 @@ async function _fetchRecentlyPlayed(uid) {
 async function _fetchRecommended(uid, languages) {
     try {
         const prefs = await getUserPreferences(uid);
-        const langs = languages.length ? languages : (prefs?.languages ?? []);
-        if (!langs.length) return [];
-
-        const lang = langs[Math.floor(Math.random() * langs.length)];
-        const raw = await searchSongsOnly(`top ${lang} songs`, 1, 25);
-        const enriched = attachCanonicalIds(raw ?? []);
-        return enriched.map(shapeSong);
+        if (!prefs) return [];
+        const langs = languages.length ? languages : (prefs.languages ?? []);
+        const songs = await generateRecommendations(
+            { languages: langs, favoriteArtists: prefs.favoriteArtists ?? [] },
+            uid,
+        );
+        return attachCanonicalIds(songs ?? []).map(shapeSong).slice(0, 20);
     } catch {
-        return [];
+        // Fall back to a language-based query so home never returns empty
+        try {
+            const prefs = await getUserPreferences(uid).catch(() => null);
+            const langs = languages.length ? languages : (prefs?.languages ?? ['hindi']);
+            const lang = langs[Math.floor(Math.random() * langs.length)] ?? 'hindi';
+            const raw = await searchSongsOnly(`top ${lang} songs`, 1, 25);
+            return attachCanonicalIds(raw ?? []).map(shapeSong);
+        } catch {
+            return [];
+        }
     }
 }
 
 async function _fetchTrending(languages) {
     try {
+        // First try real global trending from Firebase activity data
+        const trending = await getGlobalTrending(25);
+        if (trending.length >= 5) {
+            // Trending entries have { songId, songName, artist, language, playCount }
+            // Re-fetch full song objects from Saavn for the top ones so artwork is present
+            const topIds = trending.slice(0, 10).map(t => t.songId).filter(Boolean);
+            if (topIds.length > 0) {
+                const { getSongById } = await import('../services/saavnApi.js');
+                const fetched = await Promise.allSettled(topIds.map(id => getSongById(id)));
+                const songs = fetched
+                    .filter(r => r.status === 'fulfilled')
+                    .map(r => r.value?.data?.[0] ?? r.value?.data ?? null)
+                    .filter(Boolean);
+                if (songs.length >= 3) {
+                    return attachCanonicalIds(songs).map(shapeSong);
+                }
+            }
+        }
+    } catch { /* fall through */ }
+
+    // Fallback: language-based Saavn search
+    try {
         const lang = languages[0] ?? 'hindi';
         const raw = await searchSongsOnly(`trending ${lang}`, 1, 20);
-        const enriched = attachCanonicalIds(raw ?? []);
-        return enriched.map(shapeSong);
+        return attachCanonicalIds(raw ?? []).map(shapeSong);
     } catch {
         return [];
     }
