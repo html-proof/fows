@@ -17,6 +17,15 @@ import { normText, bigramSimilarity } from './searchEngine.js';
 const ITUNES_BASE = 'https://itunes.apple.com/search';
 const ITUNES_TIMEOUT_MS = 4000;
 
+// ─── Circuit breaker ──────────────────────────────────────────────────────────
+// After 3 consecutive failures, pause iTunes for 10 minutes so we don't spam
+// logs on environments where itunes.apple.com is unreachable (e.g. firewalled
+// Docker deployments).
+let _failCount = 0;
+let _disabledUntil = 0;
+const FAIL_THRESHOLD = 3;
+const DISABLED_TTL_MS = 10 * 60 * 1000;
+
 // ─── Simple in-process cache (5 min TTL) ────────────────────────────────────
 const _cache = new Map();
 const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -48,6 +57,9 @@ function _cacheSet(key, value) {
  * @returns {Promise<ItunesTrack[]>}
  */
 export async function searchItunes(query, { limit = 25, country = 'IN', entity = 'song' } = {}) {
+    // Circuit breaker: skip if repeatedly failing
+    if (_disabledUntil > Date.now()) return [];
+
     const cacheKey = `${entity}:${country}:${limit}:${query}`;
     const cached = _cacheGet(cacheKey);
     if (cached) return cached;
@@ -70,11 +82,19 @@ export async function searchItunes(query, { limit = 25, country = 'IN', entity =
         if (statusCode !== 200) throw new Error(`iTunes HTTP ${statusCode}`);
         const json = await body.json();
         const tracks = (json.results ?? []).map(normaliseItunesTrack);
+        _failCount = 0; // reset on success
         _cacheSet(cacheKey, tracks);
         return tracks;
     } catch (err) {
         // iTunes is optional — never block the main search
-        console.warn('[iTunes] search failed:', err.message);
+        const msg = err?.message || err?.code || err?.cause?.message || err?.cause?.code || String(err);
+        _failCount++;
+        if (_failCount >= FAIL_THRESHOLD) {
+            _disabledUntil = Date.now() + DISABLED_TTL_MS;
+            console.warn(`[iTunes] disabled for 10 min after ${_failCount} consecutive failures. Last error: ${msg}`);
+        } else {
+            console.warn(`[iTunes] search failed (${_failCount}/${FAIL_THRESHOLD}):`, msg);
+        }
         return [];
     }
 }
