@@ -13,7 +13,8 @@
         },
         "global_trending": {
             ".read": false,
-            ".write": false
+            ".write": false,
+            ".indexOn": ["lastPlayed"]
         },
         "co_listen_pairs": {
             ".read": false,
