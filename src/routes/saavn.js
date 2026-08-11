@@ -78,6 +78,10 @@ router.get('/search', async (req, res) => {
 
         // Merge: if language/movie were stripped by analyzeQuery, use cleanTitle for NLP too
         const primaryQuery = analysis.cleanTitle || rawQuery;
+        // When a movie was identified, use it for album lookup. Searching the
+        // album endpoint with the song title misses the OST that contains the
+        // requested track.
+        const albumSearchQuery = analysis.movie || primaryQuery;
 
         // ── Step 2: Load-more (page > 1) — only songs, re-ranked ────────────
         if (page > 1) {
@@ -117,7 +121,7 @@ router.get('/search', async (req, res) => {
 
         const [songResults, albumsData, artistsData] = await Promise.allSettled([
             Promise.all(songFetches),
-            searchAlbums(primaryQuery),
+            searchAlbums(albumSearchQuery),
             searchArtists(primaryQuery),
         ]);
 
@@ -159,10 +163,19 @@ router.get('/search', async (req, res) => {
         const topSongIsExactMatch = finalRanked.length > 0
             && normText(topSong?.name ?? '') === normText(analysis.cleanTitle)
             && topSongDur >= 90;
-        const queryLooksLikeAlbum = !topSongIsExactMatch && finalRanked.length < 8;
+        const explicitMovieSearch = Boolean(analysis.movie);
+        const albumSearchResults = albumsData.status === 'fulfilled'
+            ? (albumsData.value?.data?.results ?? [])
+            : [];
+        const albumSearchTarget = normText(analysis.movie || analysis.cleanTitle);
+        const hasMatchingAlbum = albumSearchResults.some(album =>
+            areSearchTermsSimilar(normText(album?.name ?? ''), albumSearchTarget)
+        );
+        const queryLooksLikeAlbum = explicitMovieSearch || hasMatchingAlbum ||
+            (!topSongIsExactMatch && finalRanked.length < 8);
 
         if (queryLooksLikeAlbum) {
-            const titleNorm = normText(analysis.cleanTitle);
+            const titleNorm = normText(analysis.movie || analysis.cleanTitle);
 
             // Helper: pick the best-matching album from a results list
             const pickMatchingAlbum = (results) => {
@@ -175,9 +188,7 @@ router.get('/search', async (req, res) => {
             };
 
             // Try the proxy result first
-            const proxyAlbums = albumsData.status === 'fulfilled'
-                ? (albumsData.value?.data?.results ?? [])
-                : [];
+            const proxyAlbums = albumSearchResults;
             let matchedAlbum = pickMatchingAlbum(proxyAlbums);
 
             // Proxy didn't return a matching album — fall back to the direct API.
@@ -185,7 +196,7 @@ router.get('/search', async (req, res) => {
             // "Perumazhakaalam") that the sumit.co proxy misses.
             if (!matchedAlbum) {
                 try {
-                    const directResults = await searchAlbumsDirect(analysis.cleanTitle, 5);
+                    const directResults = await searchAlbumsDirect(albumSearchQuery, 5);
                     matchedAlbum = pickMatchingAlbum(directResults?.data?.results ?? []);
                 } catch (_) { /* direct album search is best-effort */ }
             }

@@ -80,6 +80,17 @@ export function analyzeQuery(rawQuery) {
         // Remove the parenthetical from the query string for title extraction
     }
 
+    // Also support the natural form "song name from movie name". Without
+    // this split the provider receives one long query and the album/movie
+    // lookup is performed against the song title instead of the movie.
+    const fromMatch = query.match(/^(.+?)\s+from\s+(.+)$/i);
+    if (!movie && fromMatch) {
+        const possibleMovie = fromMatch[2].trim();
+        if (possibleMovie.length >= 2) {
+            movie = possibleMovie;
+        }
+    }
+
     // 3. Detect version hints
     for (const marker of VERSION_MARKERS) {
         if (lower.includes(marker)) {
@@ -92,6 +103,9 @@ export function analyzeQuery(rawQuery) {
     if (parenMatch) {
         cleanTitle = cleanTitle.replace(parenMatch[0], '').trim();
     }
+    if (fromMatch && movie === fromMatch[2].trim()) {
+        cleanTitle = fromMatch[1].trim();
+    }
 
     // Remove trailing language word from cleanTitle
     if (language) {
@@ -101,6 +115,14 @@ export function analyzeQuery(rawQuery) {
         for (const [alias, mapped] of LANGUAGE_MAP) {
             if (mapped === language) {
                 cleanTitle = cleanTitle.replace(new RegExp(`\\s+${alias}\\s*$`, 'i'), '').trim();
+            }
+        }
+        if (movie) {
+            movie = movie.replace(new RegExp(`\\s+${escapedLang}\\s*$`, 'i'), '').trim();
+            for (const [alias, mapped] of LANGUAGE_MAP) {
+                if (mapped === language) {
+                    movie = movie.replace(new RegExp(`\\s+${alias}\\s*$`, 'i'), '').trim();
+                }
             }
         }
     }
