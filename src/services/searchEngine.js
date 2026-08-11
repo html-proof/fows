@@ -333,8 +333,15 @@ export function fuseSongCandidates(candidateGroups, analysis, options = {}) {
             current.sources.add(source);
             current.sourceRanks.push({ source, rank });
             if (relevanceScore > current.bestRelevanceScore) {
-                current.song = song;
-                current.bestRelevanceScore = relevanceScore;
+                // Prefer the candidate with real download URLs so search
+                // results never lose a valid stream URL to an album-injected
+                // song that has empty/placeholder downloadUrl.
+                const currentHasUrls = Array.isArray(current.song?.downloadUrl) && current.song.downloadUrl.length > 0;
+                const candidateHasUrls = Array.isArray(song?.downloadUrl) && song.downloadUrl.length > 0;
+                if (!currentHasUrls || candidateHasUrls) {
+                    current.song = song;
+                    current.bestRelevanceScore = relevanceScore;
+                }
             }
             if (rank < current.bestRank) {
                 current.bestRank = rank;
