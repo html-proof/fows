@@ -67,8 +67,8 @@ export default {
             return forwardToBackend(request, url);
         }
 
-        // Try the Cloudflare cache first
-        const cacheKey = new Request(url.toString(), request);
+        // Cache key is URL-only — Authorization header must not leak across users.
+        const cacheKey = new Request(url.toString());
         const cache = caches.default;
         const cached = await cache.match(cacheKey);
         if (cached) {

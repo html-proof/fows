@@ -770,65 +770,6 @@ function resolveAlbumLanguage(album, songAlbumLanguageMap, fallbackLanguage) {
     return normalizeLanguage(fallbackLanguage);
 }
 
-function resolveTopResultLegacy({
-    query,
-    songs,
-    albums,
-    artists,
-}) {
-    const candidates = [];
-
-    const addCandidate = (type, item) => {
-        if (!item) return;
-        const name = type === 'song'
-            ? (item?.name ?? item?.title)
-            : item?.name;
-        const score = scoreTopResultCandidate(name, query);
-        candidates.push({
-            type,
-            data: item,
-            score,
-        });
-    };
-
-    addCandidate('song', songs?.[0]);
-    addCandidate('artist', artists?.[0]);
-    addCandidate('album', albums?.[0]);
-
-    if (candidates.length === 0) return null;
-
-    candidates.sort((a, b) => b.score - a.score);
-    return {
-        type: candidates[0].type,
-        data: candidates[0].data,
-    };
-}
-
-function scoreTopResultCandidate(name, query) {
-    const normalizedName = String(name ?? '')
-        .toLowerCase()
-        .trim();
-    const normalizedQuery = String(query ?? '')
-        .toLowerCase()
-        .trim();
-
-    if (!normalizedName || !normalizedQuery) return 0;
-    if (normalizedName === normalizedQuery) return 1;
-    if (normalizedName.startsWith(normalizedQuery)) return 0.95;
-    if (normalizedName.includes(normalizedQuery)) return 0.85;
-
-    const queryTerms = normalizedQuery.split(/\s+/).filter(Boolean);
-    if (queryTerms.length === 0) return 0.5;
-
-    let hits = 0;
-    for (const term of queryTerms) {
-        if (normalizedName.includes(term)) {
-            hits += 1;
-        }
-    }
-
-    return hits / queryTerms.length;
-}
 
 function buildSearchSections({
     songs,
@@ -954,12 +895,15 @@ router.get('/songs/:id/lyrics', async (req, res) => {
         const now = Date.now();
         const cached = _lyricsCache.get(songId);
         if (cached && cached.expiresAt > now) {
+            // Touch: re-insert to move to end so LRU eviction keeps hot entries
+            _lyricsCache.delete(songId);
+            _lyricsCache.set(songId, cached);
             return res.json(cached.data);
         }
 
         const data = await getLyricsBySongId(songId);
         _lyricsCache.set(songId, { data, expiresAt: now + _LYRICS_TTL_MS });
-        // Evict oldest entry when cache exceeds 500 songs
+        // LRU eviction: Map preserves insertion order; first key is least-recently-used
         if (_lyricsCache.size > 500) {
             _lyricsCache.delete(_lyricsCache.keys().next().value);
         }
@@ -1205,28 +1149,30 @@ router.get('/songs/:id/recommendations', async (req, res) => {
             return res.json({ success: true, data: [] });
         }
 
-        // Step 3: from recommended albums, surface 1-2 top songs each
+        // Step 3: from recommended albums, surface 1 top song each — fetched in parallel
+        const albumResults = await Promise.allSettled(
+            recoAlbums.slice(0, 8).map(album => getAlbumById(album.id ?? album.albumid))
+        );
         const recommendations = [];
-        for (const album of recoAlbums.slice(0, 8)) {
+        for (let i = 0; i < albumResults.length; i++) {
             if (recommendations.length >= limit) break;
-            try {
-                const albumDetail = await getAlbumById(album.id ?? album.albumid);
-                const songs = albumDetail?.data?.songs ?? albumDetail?.data?.list ?? [];
-                // Pick the first real song (duration >= 60s)
-                const topSong = songs.find(s => parseInt(s.duration ?? 0, 10) >= 60);
-                if (topSong) {
-                    recommendations.push({
-                        id: topSong.id,
-                        name: topSong.name,
-                        artists: topSong.artists,
-                        album: { id: topSong.album?.id, name: topSong.album?.name ?? album.title },
-                        image: topSong.image,
-                        duration: topSong.duration,
-                        language: topSong.language,
-                        year: topSong.year,
-                    });
-                }
-            } catch (_) { /* skip failed album */ }
+            if (albumResults[i].status !== 'fulfilled') continue;
+            const albumDetail = albumResults[i].value;
+            const album = recoAlbums[i];
+            const songs = albumDetail?.data?.songs ?? albumDetail?.data?.list ?? [];
+            const topSong = songs.find(s => parseInt(s.duration ?? 0, 10) >= 60);
+            if (topSong) {
+                recommendations.push({
+                    id: topSong.id,
+                    name: topSong.name,
+                    artists: topSong.artists,
+                    album: { id: topSong.album?.id, name: topSong.album?.name ?? album.title },
+                    image: topSong.image,
+                    duration: topSong.duration,
+                    language: topSong.language,
+                    year: topSong.year,
+                });
+            }
         }
 
         res.json({ success: true, data: recommendations.slice(0, limit) });
