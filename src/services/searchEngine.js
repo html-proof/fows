@@ -38,6 +38,23 @@ const MOOD_SUFFIXES = new Set([
     'new', 'old', 'classic', 'greatest',
 ]);
 
+const TRAILING_QUERY_NOISE = new Set([
+    'song',
+    'songs',
+    'music',
+    'movie',
+    'film',
+    'album',
+    'soundtrack',
+    'ost',
+    'official',
+    'audio',
+    'video',
+    'lyrics',
+    'full',
+    'track',
+]);
+
 // ─── Query Analysis ───────────────────────────────────────────────────────────
 
 /**
@@ -127,12 +144,17 @@ export function analyzeQuery(rawQuery) {
         }
     }
 
+    cleanTitle = stripTrailingQueryNoise(cleanTitle);
+    if (movie) {
+        movie = stripTrailingQueryNoise(movie);
+    }
+
     // 5. Detect if query is a mood search (no title, just "malayalam songs")
     const isMoodSearch = tokens.length <= 2 && tokens.some(t => MOOD_SUFFIXES.has(t));
 
-    // 6. Heuristic: likely-artist query (single name or known artist abbreviation)
-    // We rely on the caller's ARTIST_CORRECTIONS map for this; just flag short queries
-    const likelyArtist = tokens.length <= 3 && !language && !movie && !isMoodSearch;
+    // 6. Heuristic: likely-artist query. Keep this conservative so short
+    // movie-title searches do not get misclassified as artists.
+    const likelyArtist = tokens.length === 1 && !language && !movie && !isMoodSearch;
 
     return {
         originalQuery: query,
@@ -144,6 +166,22 @@ export function analyzeQuery(rawQuery) {
         isMoodSearch,
         likelyArtist,
     };
+}
+
+function stripTrailingQueryNoise(value) {
+    const words = String(value ?? '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean);
+
+    while (words.length > 0) {
+        const last = words[words.length - 1].toLowerCase();
+        if (!TRAILING_QUERY_NOISE.has(last)) break;
+        words.pop();
+    }
+
+    return words.join(' ').trim();
 }
 
 /**
