@@ -990,6 +990,12 @@ router.get('/albums', async (req, res) => {
             data = await searchAlbums(query);
         }
 
+        // Normalise: JioSaavn proxy puts tracks under `list` for many album
+        // detail responses; unify to `songs` before sending to the client.
+        if (data?.data && Array.isArray(data.data.list) && !Array.isArray(data.data.songs)) {
+            data = { ...data, data: { ...data.data, songs: data.data.list } };
+        }
+
         // Album detail payloads contain raw provider tracks. Assign canonical
         // IDs here so the mobile player resolves each tapped album track via
         // the verified playback resolver instead of guessing from metadata.
