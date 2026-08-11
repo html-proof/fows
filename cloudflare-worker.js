@@ -67,25 +67,44 @@ export default {
             return forwardToBackend(request, url);
         }
 
+        // Honour Cache-Control: no-cache from the client (used by force-refresh paths).
+        const clientCacheControl = request.headers.get('Cache-Control') ?? '';
+        const bypassCache = clientCacheControl.includes('no-cache') || clientCacheControl.includes('no-store');
+
         // Cache key is URL-only — Authorization header must not leak across users.
         const cacheKey = new Request(url.toString());
         const cache = caches.default;
-        const cached = await cache.match(cacheKey);
-        if (cached) {
-            const response = new Response(cached.body, cached);
-            response.headers.set('X-Cache', 'HIT');
-            return response;
+
+        if (!bypassCache) {
+            const cached = await cache.match(cacheKey);
+            if (cached) {
+                const response = new Response(cached.body, cached);
+                response.headers.set('X-Cache', 'HIT');
+                return response;
+            }
         }
 
-        // Cache miss — fetch from backend and store
+        // Cache miss — fetch from backend and store.
+        // Do NOT cache failure responses (success:false at HTTP 200, or any 4xx/5xx).
+        // A cached failure would serve stale errors for hours (e.g. album not found
+        // during a Render cold-start).
         const backendResponse = await forwardToBackend(request, url);
         if (backendResponse.ok) {
-            const responseToCache = backendResponse.clone();
-            responseToCache.headers.set(
-                'Cache-Control',
-                `public, max-age=60, s-maxage=${edgeTtl}`,
-            );
-            ctx.waitUntil(cache.put(cacheKey, responseToCache));
+            const clone = backendResponse.clone();
+            // Peek at the body to check the success flag without consuming the
+            // original response. Only cache confirmed-good payloads.
+            ctx.waitUntil((async () => {
+                try {
+                    const body = await clone.json();
+                    if (body?.success === false) return; // don't cache failures
+                    const toCache = new Response(JSON.stringify(body), clone);
+                    toCache.headers.set(
+                        'Cache-Control',
+                        `public, max-age=60, s-maxage=${edgeTtl}`,
+                    );
+                    await cache.put(cacheKey, toCache);
+                } catch (_) { /* non-JSON response — skip caching */ }
+            })());
         }
 
         const response = new Response(backendResponse.body, backendResponse);

@@ -956,6 +956,12 @@ router.get('/albums', async (req, res) => {
             };
         }
 
+        // Return 503 (not 200) when all fallbacks failed so Cloudflare does NOT
+        // cache the failure response. A 200 success:false gets cached for hours.
+        if (data?.success === false && !data?.data) {
+            return res.status(503).json(data);
+        }
+
         res.json(data);
     } catch (error) {
         console.error('Album API error:', error.message);
