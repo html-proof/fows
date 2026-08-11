@@ -30,7 +30,7 @@ import { attachCanonicalIds } from '../services/identityResolver.js';
 const router = Router();
 const DEFAULT_LIMIT = 40;
 const MIN_LIMIT = 10;
-const MAX_LIMIT = 40;
+const MAX_LIMIT = 60;
 const MAX_RELATED_LANGUAGES = 5;
 const MAX_ALBUM_LANGUAGE_BUCKETS = 4;
 const USER_LANGUAGE_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -161,18 +161,38 @@ router.get('/search', async (req, res) => {
             && topSongDur >= 90;
         const queryLooksLikeAlbum = !topSongIsExactMatch && finalRanked.length < 8;
 
-        if (queryLooksLikeAlbum && albumsData.status === 'fulfilled') {
-            const topAlbum = (albumsData.value?.data?.results ?? [])[0];
-            const albumNameNorm = normText(topAlbum?.name ?? '');
+        if (queryLooksLikeAlbum) {
             const titleNorm = normText(analysis.cleanTitle);
-            const albumMatchesQuery = areSearchTermsSimilar(
-                albumNameNorm,
-                titleNorm,
-            );
 
-            if ((topAlbum?.id || topAlbum?.url) && albumMatchesQuery) {
+            // Helper: pick the best-matching album from a results list
+            const pickMatchingAlbum = (results) => {
+                for (const alb of (results ?? [])) {
+                    if (areSearchTermsSimilar(normText(alb?.name ?? ''), titleNorm)) {
+                        return alb;
+                    }
+                }
+                return null;
+            };
+
+            // Try the proxy result first
+            const proxyAlbums = albumsData.status === 'fulfilled'
+                ? (albumsData.value?.data?.results ?? [])
+                : [];
+            let matchedAlbum = pickMatchingAlbum(proxyAlbums);
+
+            // Proxy didn't return a matching album — fall back to the direct API.
+            // This catches typo/transliteration variants (e.g. "perumazhakkalam" →
+            // "Perumazhakaalam") that the sumit.co proxy misses.
+            if (!matchedAlbum) {
                 try {
-                    const albumDetail = await getAlbumById(topAlbum.id, topAlbum.url);
+                    const directResults = await searchAlbumsDirect(analysis.cleanTitle, 5);
+                    matchedAlbum = pickMatchingAlbum(directResults?.data?.results ?? []);
+                } catch (_) { /* direct album search is best-effort */ }
+            }
+
+            if (matchedAlbum && (matchedAlbum.id || matchedAlbum.url)) {
+                try {
+                    const albumDetail = await getAlbumById(matchedAlbum.id, matchedAlbum.url);
                     const albumSongs = albumDetail?.data?.songs ?? albumDetail?.data?.list ?? [];
                     if (albumSongs.length > 0) {
                         const ranked = rankSongs(deduplicateSongs([...albumSongs, ...finalRanked]), analysis);
