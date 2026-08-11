@@ -16,8 +16,8 @@ import { auth } from '../config/firebase.js';
 import {
     analyzeQuery,
     buildSearchVariants,
-    rankSongs,
-    deduplicateSongs,
+    fuseSongCandidates,
+    filterRelevantSongs,
 } from '../services/searchEngine.js';
 import {
     searchSongsOnly,
@@ -98,17 +98,27 @@ router.get('/catalog/search', async (req, res) => {
     try {
         const analysis = analyzeQuery(rawQ);
         const primaryQ = analysis.cleanTitle || rawQ;
+        const searchVariants = buildSearchVariants(analysis);
 
         // JioSaavn search — searchSongsSmart returns Song[], searchSongsOnly returns payload
-        const saavnRaw = await searchSongsSmart(primaryQ, { preferredLanguages: [], waitForFresh: true })
-            .catch(async () => {
-                const payload = await searchSongsOnly(primaryQ, page).catch(() => null);
-                return payload?.data?.results ?? [];
-            });
+        const variantResults = await Promise.all(searchVariants.map(variant =>
+            searchSongsSmart(variant || primaryQ, { preferredLanguages: [], waitForFresh: true })
+                .catch(async () => {
+                    const payload = await searchSongsOnly(variant || primaryQ, page).catch(() => null);
+                    return payload?.data?.results ?? [];
+                })
+        ));
 
         // Deduplicate → rank
-        const rawSongs = Array.isArray(saavnRaw) ? saavnRaw : (saavnRaw?.data?.results ?? []);
-        let songs = rankSongs(deduplicateSongs(rawSongs), analysis).slice(0, limit);
+        let songs = filterRelevantSongs(
+            fuseSongCandidates(variantResults.map((songs, index) => ({
+                source: index === 0 ? 'exact' : `variant:${index}`,
+                weight: Math.max(0.45, 1 - index * 0.15),
+                songs: Array.isArray(songs) ? songs : (songs?.data?.results ?? []),
+            })), analysis),
+            analysis,
+            { minKeep: Math.min(12, limit) },
+        ).slice(0, limit);
 
         // Personalise if user is known
         if (uid) {

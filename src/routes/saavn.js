@@ -18,9 +18,12 @@ import { getGlobalTrending } from '../services/database.js';
 import {
     analyzeQuery,
     buildSearchVariants,
+    fuseSongCandidates,
+    filterRelevantSongs,
     rankSongs,
     deduplicateSongs,
     resolveTopResult as engineResolveTopResult,
+    scoreSong,
     normText,
 } from '../services/searchEngine.js';
 import { getUserPreferences } from '../services/database.js';
@@ -126,11 +129,19 @@ router.get('/search', async (req, res) => {
         ]);
 
         // ── Step 4: Merge + deduplicate + rank songs ─────────────────────────
-        const allRawSongs = songResults.status === 'fulfilled'
-            ? songResults.value.flat().filter(Boolean)
+        const candidateGroups = songResults.status === 'fulfilled'
+            ? songResults.value.map((songs, index) => ({
+                source: index === 0 ? 'exact' : `variant:${index}`,
+                weight: Math.max(0.45, 1 - index * 0.15),
+                songs,
+            }))
             : [];
 
-        const rankedByEngine = rankSongs(deduplicateSongs(allRawSongs), analysis);
+        const rankedByEngine = filterRelevantSongs(
+            fuseSongCandidates(candidateGroups, analysis),
+            analysis,
+            { minKeep: Math.min(12, limit) },
+        );
 
         // Apply language preference as a secondary sort layer (doesn't override exact matches)
         const songsWithLangPref = preferredLanguages.length > 0
@@ -206,7 +217,14 @@ router.get('/search', async (req, res) => {
                     const albumDetail = await getAlbumById(matchedAlbum.id, matchedAlbum.url);
                     const albumSongs = albumDetail?.data?.songs ?? albumDetail?.data?.list ?? [];
                     if (albumSongs.length > 0) {
-                        const ranked = rankSongs(deduplicateSongs([...albumSongs, ...finalRanked]), analysis);
+                        const ranked = filterRelevantSongs(
+                            fuseSongCandidates([
+                                { source: 'album', weight: 0.85, songs: rankSongs(deduplicateSongs(albumSongs), analysis) },
+                                { source: 'search', weight: 1.1, songs: finalRanked },
+                            ], analysis),
+                            analysis,
+                            { minKeep: Math.min(12, limit) },
+                        );
                         finalRanked = ranked;
                     }
                 } catch (_) { /* album fetch is best-effort */ }
@@ -591,7 +609,11 @@ function applyLanguageBoost(rankedSongs, preferredLanguages, analysis) {
     return rankedSongs.map(song => ({
         song,
         lang: String(song?.language ?? '').toLowerCase(),
+        score: song?._searchFeatures?.relevanceScore ?? scoreSong(song, analysis),
     })).sort((a, b) => {
+        const scoreGap = Math.abs(a.score - b.score);
+        if (scoreGap > 15) return b.score - a.score;
+
         const aPreferred = preferredSet.has(a.lang);
         const bPreferred = preferredSet.has(b.lang);
         if (aPreferred === bPreferred) return 0;

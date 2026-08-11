@@ -70,7 +70,7 @@ const TRAILING_QUERY_NOISE = new Set([
 export function analyzeQuery(rawQuery) {
     const query = String(rawQuery ?? '').replace(/\s+/g, ' ').trim();
     if (!query) {
-        return { originalQuery: '', cleanTitle: '', language: null, movie: null, versionHints: [], isVersionSearch: false, likelyArtist: false };
+        return { originalQuery: '', cleanTitle: '', language: null, movie: null, versionHints: [], isVersionSearch: false, isKnownItemSearch: false, intent: 'EMPTY', likelyArtist: false };
     }
 
     const lower = query.toLowerCase();
@@ -155,6 +155,20 @@ export function analyzeQuery(rawQuery) {
     // 6. Heuristic: likely-artist query. Keep this conservative so short
     // movie-title searches do not get misclassified as artists.
     const likelyArtist = tokens.length === 1 && !language && !movie && !isMoodSearch;
+    const discoveryWords = tokens.filter(token => MOOD_SUFFIXES.has(token) || TRAILING_QUERY_NOISE.has(token));
+    const meaningfulTokenCount = tokens.length - discoveryWords.length;
+    const isKnownItemSearch = !isMoodSearch && !likelyArtist && (
+        Boolean(movie) ||
+        meaningfulTokenCount >= 2 ||
+        (meaningfulTokenCount === 1 && !discoveryWords.length)
+    );
+    const intent = isMoodSearch
+        ? 'EXPLORATORY_SEARCH'
+        : likelyArtist
+            ? 'ARTIST_EXACT'
+            : isKnownItemSearch
+                ? 'TRACK_EXACT'
+                : 'TRACK_DISCOVERY';
 
     return {
         originalQuery: query,
@@ -163,7 +177,9 @@ export function analyzeQuery(rawQuery) {
         movie,
         versionHints,
         isVersionSearch: versionHints.length > 0,
+        isKnownItemSearch,
         isMoodSearch,
+        intent,
         likelyArtist,
     };
 }
@@ -244,6 +260,12 @@ export function buildSearchVariants(analysis) {
  * Two results with the same key are considered the same song.
  */
 export function getSongIdentityKey(song) {
+    const canonicalId = String(song?.canonicalId ?? song?.canonicalSongId ?? '').trim();
+    if (canonicalId) return `canonical:${canonicalId}`;
+
+    const songId = String(song?.songId ?? '').trim();
+    if (songId) return `song:${songId}`;
+
     const title = normText(song?.name ?? song?.title ?? '');
     const rawArtist = song?.primaryArtists
         ?? (Array.isArray(song?.artists?.primary)
@@ -275,6 +297,102 @@ export function deduplicateSongs(songs) {
         seen.add(key);
         return true;
     });
+}
+
+export function fuseSongCandidates(candidateGroups, analysis, options = {}) {
+    const groups = Array.isArray(candidateGroups) ? candidateGroups : [];
+    const k = Number.isFinite(options?.rrfK) ? options.rrfK : 60;
+    const byKey = new Map();
+
+    for (const group of groups) {
+        const songs = Array.isArray(group?.songs) ? group.songs : [];
+        const source = String(group?.source ?? group?.name ?? 'retrieval');
+        const weight = Number.isFinite(group?.weight) ? group.weight : 1;
+
+        songs.forEach((song, index) => {
+            if (!song) return;
+            const key = getSongIdentityKey(song);
+            const rank = index + 1;
+            const rrfScore = weight / (k + rank);
+            const relevanceScore = scoreSong(song, analysis);
+            const current = byKey.get(key);
+
+            if (!current) {
+                byKey.set(key, {
+                    song,
+                    bestRelevanceScore: relevanceScore,
+                    rrfScore,
+                    bestRank: rank,
+                    sources: new Set([source]),
+                    sourceRanks: [{ source, rank }],
+                });
+                return;
+            }
+
+            current.rrfScore += rrfScore;
+            current.sources.add(source);
+            current.sourceRanks.push({ source, rank });
+            if (relevanceScore > current.bestRelevanceScore) {
+                current.song = song;
+                current.bestRelevanceScore = relevanceScore;
+            }
+            if (rank < current.bestRank) {
+                current.bestRank = rank;
+            }
+        });
+    }
+
+    return Array.from(byKey.values())
+        .map(entry => {
+            const sourceCount = entry.sources.size;
+            const fusionScore = entry.bestRelevanceScore + (entry.rrfScore * 950) + Math.min(12, sourceCount * 3);
+            return {
+                ...entry.song,
+                _searchFeatures: {
+                    ...(entry.song?._searchFeatures ?? {}),
+                    relevanceScore: Number(entry.bestRelevanceScore.toFixed(3)),
+                    rrfScore: Number(entry.rrfScore.toFixed(5)),
+                    fusionScore: Number(fusionScore.toFixed(3)),
+                    sourceCount,
+                    bestRank: entry.bestRank,
+                    sourceRanks: entry.sourceRanks.slice(0, 8),
+                },
+            };
+        })
+        .sort((a, b) => {
+            const aFusion = a?._searchFeatures?.fusionScore ?? scoreSong(a, analysis);
+            const bFusion = b?._searchFeatures?.fusionScore ?? scoreSong(b, analysis);
+            if (bFusion !== aFusion) return bFusion - aFusion;
+            return (a?._searchFeatures?.bestRank ?? 999) - (b?._searchFeatures?.bestRank ?? 999);
+        });
+}
+
+export function filterRelevantSongs(songs, analysis, options = {}) {
+    const safeSongs = Array.isArray(songs) ? songs : [];
+    if (safeSongs.length === 0 || analysis?.isMoodSearch) return safeSongs;
+
+    const minKeep = Number.isFinite(options?.minKeep) ? options.minKeep : 8;
+    const threshold = Number.isFinite(options?.threshold)
+        ? options.threshold
+        : analysis?.isKnownItemSearch
+            ? 44
+            : 22;
+
+    const withScores = safeSongs.map(song => ({
+        song,
+        score: song?._searchFeatures?.relevanceScore ?? scoreSong(song, analysis),
+    }));
+    const relevant = withScores.filter(entry => entry.score >= threshold);
+
+    if (relevant.length >= minKeep) {
+        return relevant.map(entry => entry.song);
+    }
+
+    const fallbackCount = Math.min(safeSongs.length, Math.max(minKeep, relevant.length));
+    return withScores
+        .sort((a, b) => b.score - a.score)
+        .slice(0, fallbackCount)
+        .map(entry => entry.song);
 }
 
 // ─── Scoring ──────────────────────────────────────────────────────────────────
@@ -312,6 +430,12 @@ export function scoreSong(song, analysis) {
     );
 
     let score = 0;
+    const lexical = extractLexicalFeatures({
+        query: originalQuery || cleanTitle,
+        title: songName,
+        artist: songArtist,
+        album: albumName,
+    });
 
     // ── Title match (up to 100 pts) ─────────────────────────────────────
     if (songName === titleNorm || songName === queryNorm) {
@@ -329,6 +453,20 @@ export function scoreSong(song, analysis) {
     } else {
         const sim = bigramSimilarity(songName, titleNorm);
         score += sim * 40;
+    }
+
+    // Known-item searches often look like "title artist" or "title movie".
+    // Reward candidates whose title plus metadata covers the query even when
+    // the title alone is only a prefix of the typed text.
+    score += lexical.weightedCoverage * (analysis?.isKnownItemSearch ? 36 : 20);
+    if (lexical.titleExactInQuery && lexical.facetHitCount > 0) {
+        score += analysis?.isKnownItemSearch ? 42 : 24;
+    }
+    if (lexical.allTermsDirectlyCovered) {
+        score += analysis?.isKnownItemSearch ? 28 : 14;
+    }
+    if (lexical.titleHitCount > 0 && lexical.facetHitCount > 0) {
+        score += 18;
     }
 
     // ── Version penalty (big) ────────────────────────────────────────────
@@ -482,6 +620,62 @@ export function resolveTopResult({ analysis, songs, artists, albums }) {
     return { type: candidates[0].type, data: candidates[0].data };
 }
 
+function extractLexicalFeatures({ query, title, artist, album }) {
+    const queryTerms = tokenizeForSearch(query).filter(term => !TRAILING_QUERY_NOISE.has(term));
+    const effectiveTerms = queryTerms.length > 0 ? queryTerms : tokenizeForSearch(query);
+    const titleTokens = tokenizeForSearch(title);
+    const artistTokens = tokenizeForSearch(artist);
+    const albumTokens = tokenizeForSearch(album);
+    const metadataTokens = new Set([...artistTokens, ...albumTokens]);
+    const titleTokenSet = new Set(titleTokens);
+    const haystackTokens = new Set([...titleTokens, ...artistTokens, ...albumTokens]);
+    const compactQuery = compactText(query);
+    const compactTitle = compactText(title);
+
+    let titleHitCount = 0;
+    let facetHitCount = 0;
+    let directHitCount = 0;
+    let weightedHits = 0;
+
+    for (const term of effectiveTerms) {
+        if (!term) continue;
+
+        if (titleTokenSet.has(term) || title.includes(term)) {
+            titleHitCount += 1;
+            directHitCount += 1;
+            weightedHits += 1.3;
+            continue;
+        }
+
+        if (metadataTokens.has(term) || artist.includes(term) || album.includes(term)) {
+            facetHitCount += 1;
+            directHitCount += 1;
+            weightedHits += 1.05;
+            continue;
+        }
+
+        for (const token of haystackTokens) {
+            const maxDistance = term.length >= 7 ? 2 : 1;
+            if (Math.abs(term.length - token.length) > maxDistance) continue;
+            if (term[0] !== token[0]) continue;
+            if (levenshteinDistance(term, token) <= maxDistance) {
+                weightedHits += 0.45;
+                break;
+            }
+        }
+    }
+
+    const maxWeighted = Math.max(1, effectiveTerms.length * 1.3);
+
+    return {
+        titleHitCount,
+        facetHitCount,
+        weightedCoverage: Math.min(1, weightedHits / maxWeighted),
+        allTermsDirectlyCovered: effectiveTerms.length > 0 && directHitCount === effectiveTerms.length,
+        titleExactInQuery: Boolean(compactTitle && compactQuery && compactQuery.includes(compactTitle)),
+    };
+}
+
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
 export function normText(value) {
@@ -490,6 +684,33 @@ export function normText(value) {
         .replace(/[^\p{L}\p{N}\s]/gu, ' ')
         .replace(/\s+/g, ' ')
         .trim();
+}
+
+function compactText(value) {
+    return normText(value).replace(/[^\p{L}\p{N}]/gu, '');
+}
+
+function tokenizeForSearch(value) {
+    return normText(value)
+        .split(/\s+/)
+        .filter(Boolean);
+}
+
+function levenshteinDistance(left, right) {
+    let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+    for (let row = 1; row <= left.length; row += 1) {
+        const current = [row];
+        for (let column = 1; column <= right.length; column += 1) {
+            const substitution = previous[column - 1] + (left[row - 1] === right[column - 1] ? 0 : 1);
+            current[column] = Math.min(
+                previous[column] + 1,
+                current[column - 1] + 1,
+                substitution,
+            );
+        }
+        previous = current;
+    }
+    return previous[right.length];
 }
 
 export function bigramSimilarity(a, b) {
