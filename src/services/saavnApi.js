@@ -15,7 +15,7 @@ const SMART_SEARCH_MIN_RESULTS = 24;
 const SEARCH_CACHE_FRESH_TTL_MS = 2 * 60 * 1000;
 const SEARCH_CACHE_STALE_TTL_MS = 20 * 60 * 1000;
 const SEARCH_CACHE_MAX_ENTRIES = 300;
-const SMART_SEARCH_MAX_VARIANTS = 3;
+const SMART_SEARCH_MAX_VARIANTS = 4;
 const SMART_SEARCH_MAX_LATENCY_MS = 3200;
 const PRIMARY_SEARCH_TIMEOUT_MS = 2200;
 const FALLBACK_SEARCH_TIMEOUT_MS = 1800;
@@ -837,6 +837,14 @@ function buildSearchQueryVariants(query) {
         push(filteredTokens.join(' '));
     }
 
+    // Transliteration cleanup: many Malayalam/Hindi song titles are typed with
+    // one extra trailing vowel or doubled consonant. Try a slightly relaxed
+    // spelling before falling back to broader truncation.
+    const relaxedQuery = buildRelaxedTransliterationQuery(tokens);
+    if (relaxedQuery && relaxedQuery !== normalizeQuery(query)) {
+        push(relaxedQuery);
+    }
+
     // Drop trailing token for long queries (often a typo/noise fragment).
     if (tokens.length > 3) {
         push(tokens.slice(0, -1).join(' '));
@@ -848,6 +856,29 @@ function buildSearchQueryVariants(query) {
     }
 
     return variants.slice(0, SMART_SEARCH_MAX_VARIANTS);
+}
+
+function buildRelaxedTransliterationQuery(tokens) {
+    if (!Array.isArray(tokens) || tokens.length === 0) return '';
+
+    const relaxedTokens = tokens.map((token) => {
+        let relaxed = normalizeQuery(token);
+        if (!relaxed) return relaxed;
+
+        // Collapse doubled letters first, then smooth common transliteration
+        // endings such as "au" -> "u" or "ai" -> "i".
+        relaxed = relaxed.replace(/([a-z])\1+/g, '$1');
+        relaxed = relaxed
+            .replace(/aa$/g, 'a')
+            .replace(/ee$/g, 'e')
+            .replace(/ii$/g, 'i')
+            .replace(/oo$/g, 'o')
+            .replace(/au$/g, 'u')
+            .replace(/ai$/g, 'i');
+        return relaxed;
+    });
+
+    return relaxedTokens.join(' ').trim();
 }
 
 function tokenize(value) {
