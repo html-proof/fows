@@ -11,7 +11,7 @@ import {
 const router = Router();
 
 const MAX_ITEMS = 10000;
-const SCRAPE_TIMEOUT_MS = 7000;
+const SCRAPE_TIMEOUT_MS = 15000;
 
 // Only these hostnames may be fetched server-side (SSRF allowlist)
 const ALLOWED_FETCH_HOSTS = new Set([
@@ -309,11 +309,17 @@ async function fetchPageHtml(url, depth = 0) {
             const response = await fetch(url, {
                 signal: controller.signal,
                 headers: {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
                     'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
                     'Cache-Control': 'no-cache',
                     'Pragma': 'no-cache',
+                    'Sec-Fetch-Dest': 'document',
+                    'Sec-Fetch-Mode': 'navigate',
+                    'Sec-Fetch-Site': 'none',
+                    'Sec-Fetch-User': '?1',
+                    'Upgrade-Insecure-Requests': '1',
                 },
                 redirect: 'manual', // Validate redirect targets before following
             });
@@ -410,11 +416,13 @@ async function parseSpotifyPage(html, url) {
     // Try to get playlist name from og:title
     name = extractMetaContent(html, 'og:title') || extractMetaContent(html, 'twitter:title');
 
-    // Try JSON-LD or initial state for track data
+    // Try JSON-LD or initial state for track data from the main page HTML
     let items = parseSpotifyEmbedHtml(html);
 
-    // If direct parse failed, try the embed URL variant
-    if (items.length === 0 && !url.includes('/embed/')) {
+    // Always also try the embed URL — Spotify's main page is often client-side
+    // rendered and returns no track data in the initial HTML. Fetch main + embed
+    // concurrently so the embed result is ready immediately if the main fails.
+    if (!url.includes('/embed/')) {
         const playlistId = extractSpotifyPlaylistId(url, html);
         if (playlistId) {
             try {
@@ -423,12 +431,14 @@ async function parseSpotifyPage(html, url) {
                     name = extractMetaContent(embedHtml, 'og:title')
                         || extractMetaContent(embedHtml, 'twitter:title');
                 }
-                items = parseSpotifyEmbedHtml(embedHtml);
+                if (items.length === 0) {
+                    items = parseSpotifyEmbedHtml(embedHtml);
+                }
                 if (items.length === 0 && isSpotifyUnavailablePage(embedHtml)) {
                     error = 'This Spotify playlist is unavailable, private, or invalid.';
                 }
             } catch (embedError) {
-                console.warn('Spotify embed fallback failed:', embedError?.message);
+                console.warn('Spotify embed fetch failed:', embedError?.message);
             }
         }
     }

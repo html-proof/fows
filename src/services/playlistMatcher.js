@@ -309,7 +309,10 @@ export function parseSpotifyEmbedHtml(html) {
                 const data = JSON.parse(jsonContent);
                 const orderedTracks = extractOrderedSpotifyTracks(data);
                 if (orderedTracks.length > 0) {
-                    return sanitizePlaylistItems(orderedTracks, { requireArtist: true });
+                    // requireArtist: false — Spotify's unauthenticated embed often
+                    // omits artist info; title-only tracks are still importable via
+                    // title search in the matching phase.
+                    return sanitizePlaylistItems(orderedTracks, { requireArtist: false });
                 }
 
                 const extracted = extractTracksFromSpotifyJson(data);
@@ -332,7 +335,7 @@ export function parseSpotifyEmbedHtml(html) {
         }
         
         if (htmlTracks.length > bestFallbackItems.length) {
-            return sanitizePlaylistItems(htmlTracks, { requireArtist: true });
+            return sanitizePlaylistItems(htmlTracks, { requireArtist: false });
         }
 
         // Final Fallback: look for track info in meta tags
@@ -357,7 +360,7 @@ export function parseSpotifyEmbedHtml(html) {
 
     return sanitizePlaylistItems(bestFallbackItems, {
         dedupe: true,
-        requireArtist: true,
+        requireArtist: false,
     });
 }
 
@@ -394,30 +397,37 @@ function extractTracksFromSpotifyJson(data) {
             return;
         }
 
-        // Look for track-like objects: { name, artists: [...] } or { title, artist: "..." }
+        // Look for track-like objects in multiple Spotify data formats:
+        //   Legacy embed: { title, subtitle }
+        //   API v1:       { name, artists: [{name}] }
+        //   Apollo cache: { name, artists: [{profile:{name}}] }
         const name = obj.name ?? obj.title;
         const artists = obj.artists ?? obj.artist ?? obj.subtitle;
 
-        if (name && typeof name === 'string' && artists) {
+        if (name && typeof name === 'string' && name.length > 0 &&
+            !name.toLowerCase().includes('viewport') &&
+            !name.toLowerCase().includes('device-width')) {
+
             let artistName = '';
             if (typeof artists === 'string') {
                 artistName = artists;
             } else if (Array.isArray(artists)) {
                 artistName = artists
-                    .map(a => (typeof a === 'string' ? a : a?.name ?? ''))
+                    .map(a => {
+                        if (typeof a === 'string') return a;
+                        // API v1: { profile: { name } }
+                        return a?.profile?.name ?? a?.name ?? '';
+                    })
                     .filter(Boolean)
                     .join(', ');
-            } else if (typeof artists === 'object' && artists.name) {
-                artistName = artists.name;
+            } else if (typeof artists === 'object' && artists !== null) {
+                artistName = artists.name ?? '';
             }
 
-            if (name.length > 0 && artistName.length > 0 && 
-                !name.toLowerCase().includes('viewport') && 
-                !name.toLowerCase().includes('device-width') &&
-                !artistName.toLowerCase().includes('viewport')) {
-                items.push({ 
-                    title: unescapeHtml(name.trim()), 
-                    artist: unescapeHtml(artistName.trim()) 
+            if (!artistName.toLowerCase().includes('viewport')) {
+                items.push({
+                    title: unescapeHtml(name.trim()),
+                    artist: unescapeHtml(artistName.trim()),
                 });
             }
         }
@@ -439,7 +449,7 @@ function extractTracksFromSpotifyJson(data) {
             const val = obj[key];
             if (val && typeof val === 'object') {
                 // Heuristic: only dive into keys that likely contain music data
-                if (['data', 'resources', 'track', 'tracks', 'items', 'pageProps', 'state', 'content', 'entity', 'trackList', 'tracklist', 'playlistData', 'body'].includes(key)) {
+                if (['data', 'resources', 'track', 'tracks', 'items', 'pageProps', 'state', 'content', 'entity', 'trackList', 'tracklist', 'playlistData', 'body', 'playlist', 'playlistV2', 'album', 'content', 'profiles', 'queryResult', 'searchV3', 'apolloCache', '__APOLLO_STATE__'].includes(key)) {
                     walk(val);
                 }
             }
@@ -494,6 +504,8 @@ function parseSpotifyTrackItem(item) {
     if (!item || typeof item !== 'object') return null;
 
     const title = item.title ?? item.name ?? '';
+    if (!title) return null; // Only title is required; artist may be absent on unauthenticated embeds
+
     const artist = item.subtitle
         ?? item.artist
         ?? (Array.isArray(item.artists)
@@ -503,12 +515,18 @@ function parseSpotifyTrackItem(item) {
                     : artistItem?.name ?? '')
                 .filter(Boolean)
                 .join(', ')
+            : '')
+        // Spotify API v1 format: artists: [{uri, profile:{name}}]
+        ?? (Array.isArray(item.artists)
+            ? item.artists
+                .map(a => a?.profile?.name ?? a?.name ?? '')
+                .filter(Boolean)
+                .join(', ')
             : '');
 
-    if (!title || !artist) return null;
     return {
         title: unescapeHtml(String(title).trim()),
-        artist: unescapeHtml(String(artist).trim()),
+        artist: unescapeHtml(String(artist ?? '').trim()),
     };
 }
 
