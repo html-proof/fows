@@ -12,7 +12,7 @@ import {
     searchAlbums,
     getLyricsBySongId,
 } from '../services/saavnApi.js';
-import { searchAlbumsDirect } from '../services/jiosaavnDirect.js';
+import { searchAlbumsDirect, autocompleteAlbumSearch } from '../services/jiosaavnDirect.js';
 import { auth } from '../config/firebase.js';
 import { getGlobalTrending } from '../services/database.js';
 import {
@@ -210,6 +210,17 @@ router.get('/search', async (req, res) => {
                     const directResults = await searchAlbumsDirect(albumSearchQuery, 5);
                     matchedAlbum = pickMatchingAlbum(directResults?.data?.results ?? []);
                 } catch (_) { /* direct album search is best-effort */ }
+            }
+
+            // Last resort: JioSaavn autocomplete handles transliterated Indian
+            // movie names (e.g. "udayananu tharam") that the search APIs miss.
+            if (!matchedAlbum) {
+                try {
+                    const acAlbum = await autocompleteAlbumSearch(albumSearchQuery);
+                    if (acAlbum && areSearchTermsSimilar(normText(acAlbum.name), titleNorm)) {
+                        matchedAlbum = acAlbum;
+                    }
+                } catch (_) { /* autocomplete is best-effort */ }
             }
 
             if (matchedAlbum && (matchedAlbum.id || matchedAlbum.url)) {

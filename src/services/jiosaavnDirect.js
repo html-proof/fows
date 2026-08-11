@@ -219,6 +219,57 @@ export async function searchSongsOnlyDirect(query, limit = 20) {
  * This endpoint correctly ranks albums (e.g. "Chotta Mumbai" → the film album,
  * not a coincidentally-named OST from a different film).
  */
+/**
+ * Use JioSaavn's autocomplete endpoint to find the best-matching album.
+ * Returns a normalised album object (id, name, url, language) or null.
+ * Autocomplete handles transliteration variants (e.g. "udayananu tharam" →
+ * "Udayananu Tharam") far better than the search.getAlbumResults endpoint.
+ */
+export async function autocompleteAlbumSearch(query) {
+    const url = new URL(DIRECT_BASE);
+    url.searchParams.set('__call', 'autocomplete.get');
+    url.searchParams.set('_format', 'json');
+    url.searchParams.set('_marker', '0');
+    url.searchParams.set('ctx', 'wap6dot0');
+    url.searchParams.set('query', query);
+
+    let data;
+    try {
+        const { statusCode, body } = await request(url.toString(), {
+            method: 'GET',
+            headers: {
+                'Accept':     'application/json, text/plain, */*',
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+                'Referer':    'https://www.jiosaavn.com/',
+                'Origin':     'https://www.jiosaavn.com',
+            },
+            connectTimeout: CONNECT_TIMEOUT,
+            bodyTimeout:    BODY_TIMEOUT,
+        });
+        if (statusCode !== 200) return null;
+        data = await body.json();
+    } catch (_) {
+        return null;
+    }
+
+    // topquery is the most reliable signal — JioSaavn picks it automatically.
+    const topAlbum = data?.topquery?.data?.[0]?.type === 'album'
+        ? data.topquery.data[0]
+        : null;
+    const albumFromAlbums = data?.albums?.data?.[0] ?? null;
+    const candidate = topAlbum ?? albumFromAlbums;
+    if (!candidate) return null;
+
+    return {
+        id:       String(candidate.id ?? ''),
+        name:     _htmlDecode(candidate.title ?? candidate.name ?? ''),
+        url:      candidate.url ?? candidate.perma_url ?? null,
+        language: (candidate.more_info?.language ?? '').toLowerCase(),
+        year:     candidate.more_info?.year ?? null,
+        image:    candidate.image ? [{ quality: '150x150', url: candidate.image }] : [],
+    };
+}
+
 export async function searchAlbumsDirect(query, limit = 10) {
     const data = await _apiCall({
         '__call': 'search.getAlbumResults',
