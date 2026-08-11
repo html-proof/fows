@@ -175,12 +175,19 @@ router.get('/catalog/resolve/:id', async (req, res) => {
     }
 
     try {
-        const result = await resolveStream(canonicalId);
+        const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
+        const failedUrl = typeof req.query.failedUrl === 'string'
+            ? req.query.failedUrl
+            : undefined;
+        const result = await resolveStream(canonicalId, { forceRefresh, failedUrl });
         return res.json({
             canonicalId,
             streamUrl: result.url,
             quality:   result.quality,
             provider:  result.provider,
+            confidence: result.confidence ?? null,
+            resolvedAt: result.resolvedAt ?? new Date().toISOString(),
+            validationStatus: result.validationStatus ?? 'cached-or-provider',
         });
     } catch (err) {
         if (err instanceof PlaybackResolveError) {

@@ -1,14 +1,8 @@
 /**
- * Playback Resolver — resolves a canonical track_id to a streamable URL.
+ * Canonical playback-source resolver.
  *
- * Resolution order:
- *   1. Valid cached stream URL (SQLite stream_cache, 25 min TTL)
- *   2. JioSaavn exact mapping  (provider_maps → getSongById)
- *   3. JioSaavn search fallback (title + artist, re-verify identity)
- *   4. Failure (throw PlaybackResolveError)
- *
- * The Flutter app never calls JioSaavn directly.
- * This is the single choke point where JioSaavn stream URLs are produced.
+ * A canonical track is catalog identity. A stream URL is an expiring playback
+ * source. This module only ever replaces the latter.
  */
 
 import {
@@ -17,13 +11,10 @@ import {
     getCachedStreamUrl,
     cacheStreamUrl,
     invalidateStreamCache,
-    resolveOrCreate,
 } from './identityResolver.js';
 import { getSongById, searchSongsOnly } from './saavnApi.js';
 import { searchSongsDirect, getSongDirect } from './jiosaavnDirect.js';
 import { bigramSimilarity, normText } from './searchEngine.js';
-
-// ─── Error type ───────────────────────────────────────────────────────────────
 
 export class PlaybackResolveError extends Error {
     constructor(message, code = 'UNRESOLVABLE') {
@@ -33,146 +24,205 @@ export class PlaybackResolveError extends Error {
     }
 }
 
-// ─── Identity confidence for fallback matching ────────────────────────────────
+const IDENTITY_CONFIDENCE_MIN = 78;
+const FAILED_URL_TTL_MS = 10 * 60 * 1000;
 
-const IDENTITY_CONFIDENCE_MIN = 55; // accept fallback only above this
+// Error callbacks frequently arrive in bursts. Keep recovery keyed by canonical
+// identity so every callback awaits one shared background search.
+const recoveryLocks = new Map();
+const failedUrls = new Map();
 
-function _scoreMatch(canonical, saavnSong) {
-    const ct = normText(canonical.title);
-    const ca = normText(canonical.artist_name ?? '');
+function _songArtist(song) {
+    return Array.isArray(song.artists?.primary)
+        ? song.artists.primary.map(a => a.name ?? '').join(' ')
+        : (song.primaryArtists ?? song.artist ?? '');
+}
 
-    const saavnTitle  = normText(saavnSong.name ?? saavnSong.title ?? '');
-    const saavnArtist = normText(
-        Array.isArray(saavnSong.artists?.primary)
-            ? saavnSong.artists.primary.map(a => a.name ?? '').join(' ')
-            : (saavnSong.primaryArtists ?? '')
-    );
+function _songAlbum(song) {
+    return typeof song.album === 'string'
+        ? song.album
+        : (song.album?.name ?? song.albumName ?? '');
+}
 
-    const ts = bigramSimilarity(ct, saavnTitle);
-    const as = bigramSimilarity(ca, saavnArtist);
-    if (ts < 0.65) return 0;
+function _versionKind(value) {
+    const normalized = normText(value ?? '');
+    const markers = ['remix', 'cover', 'live', 'acoustic', 'unplugged',
+        'instrumental', 'karaoke', 'slowed', 'reverb', 'sped up', 'nightcore',
+        'lofi', 'lo fi', 'remastered', 'extended', 'radio edit', 'reprise'];
+    return markers.find(marker => normalized.includes(marker)) ?? 'original';
+}
 
-    let score = ts * 60 + as * 30;
+function _fieldSimilarity(left, right) {
+    const a = normText(left ?? '');
+    const b = normText(right ?? '');
+    if (!a || !b) return 0.5; // unknown is neutral, never a positive match
+    if (a === b) return 1;
+    if (a.includes(b) || b.includes(a)) return 0.86;
+    return bigramSimilarity(a, b);
+}
 
-    if (canonical.duration_ms && saavnSong.duration) {
-        const diff = Math.abs(canonical.duration_ms / 1000 - parseInt(saavnSong.duration, 10));
-        if (diff <= 5)       score += 15;
-        else if (diff <= 20) score += 5;
-        else if (diff > 90)  score -= 20;
+function _scoreMatch(canonical, candidate) {
+    const titleMatch = _fieldSimilarity(canonical.title, candidate.name ?? candidate.title);
+    if (titleMatch < 0.72) return 0;
+    if (_versionKind(canonical.title) !== _versionKind(candidate.name ?? candidate.title)) return 0;
+
+    const artistMatch = _fieldSimilarity(canonical.artist_name, _songArtist(candidate));
+    if (normText(canonical.artist_name ?? '') && artistMatch < 0.45) return 0;
+
+    const movieMatch = _fieldSimilarity(canonical.album_name, _songAlbum(candidate));
+    const languageMatch = _fieldSimilarity(canonical.language, candidate.language);
+    let durationMatch = 0.5;
+    if (canonical.duration_ms && candidate.duration) {
+        const diff = Math.abs(canonical.duration_ms / 1000 - parseInt(candidate.duration, 10));
+        if (diff <= 5) durationMatch = 1;
+        else if (diff <= 20) durationMatch = 0.7;
+        else if (diff <= 45) durationMatch = 0.25;
+        else return 0;
     }
 
-    return score;
+    return (titleMatch * 0.35 + artistMatch * 0.30 + movieMatch * 0.15 +
+        languageMatch * 0.10 + durationMatch * 0.10) * 100;
 }
 
-function _bestStreamUrl(saavnSong) {
-    // downloadUrl or streamUrl, prefer 320kbps
-    const urls = saavnSong?.downloadUrl ?? saavnSong?.streamUrl ?? [];
-    if (!Array.isArray(urls) || !urls.length) return null;
-    const sorted = [...urls].sort((a, b) => {
-        const qa = parseInt(a.quality ?? '0', 10);
-        const qb = parseInt(b.quality ?? '0', 10);
-        return qb - qa;
-    });
-    return { url: sorted[0].url, quality: sorted[0].quality ?? '96kbps' };
+function _bestStreamUrl(song) {
+    const urls = song?.downloadUrl ?? song?.streamUrl ?? [];
+    if (!Array.isArray(urls) || urls.length === 0) return null;
+    const sorted = [...urls].sort((a, b) =>
+        parseInt(b.quality ?? '0', 10) - parseInt(a.quality ?? '0', 10));
+    const best = sorted.find(item => typeof item?.url === 'string' && item.url.trim());
+    return best ? { url: best.url, quality: best.quality ?? '96kbps' } : null;
 }
-
-// ─── Main resolver ────────────────────────────────────────────────────────────
 
 /**
- * Resolve a canonical track ID to a stream URL.
- *
- * @param {string} canonicalId
- * @param {{ preferQuality?: '96kbps'|'160kbps'|'320kbps' }} [opts]
- * @returns {Promise<{ url: string, quality: string, provider: string, canonicalId: string }>}
- * @throws {PlaybackResolveError}
+ * Normal playback lookup: return a cached source when valid, then try the
+ * provider's exact mapping. If those miss, run the recovery search pipeline.
  */
 export async function resolveStream(canonicalId, opts = {}) {
-    // 1. Cache hit
+    if (opts.forceRefresh) return resolveReplacementStream(canonicalId, opts);
+
     const cached = getCachedStreamUrl(canonicalId);
-    if (cached) {
-        return { ...cached, provider: 'jiosaavn', canonicalId };
-    }
+    if (cached) return { ...cached, provider: 'jiosaavn', canonicalId };
 
-    // 2. Load canonical track data
     const track = getTrack(canonicalId);
-    if (!track) {
-        throw new PlaybackResolveError(`Unknown canonical ID: ${canonicalId}`, 'NOT_FOUND');
-    }
+    if (!track) throw new PlaybackResolveError(`Unknown canonical ID: ${canonicalId}`, 'NOT_FOUND');
 
-    // 3. JioSaavn exact mapping
-    const jiosaavnId = getProviderTrackId(canonicalId, 'jiosaavn');
-    if (jiosaavnId) {
+    const providerId = getProviderTrackId(canonicalId, 'jiosaavn');
+    if (providerId) {
         try {
-            const resp = await getSongById(jiosaavnId);
-            const song = (resp?.data?.[0] ?? resp?.data ?? null);
-            if (song) {
-                const stream = _bestStreamUrl(song);
-                if (stream) {
-                    cacheStreamUrl(canonicalId, stream.url, stream.quality);
-                    return { ...stream, provider: 'jiosaavn', canonicalId };
-                }
+            const response = await getSongById(providerId);
+            const stream = _bestStreamUrl(response?.data?.[0] ?? response?.data);
+            if (stream && !_isFailedUrl(stream.url)) {
+                cacheStreamUrl(canonicalId, stream.url, stream.quality);
+                return { ...stream, provider: 'jiosaavn', canonicalId };
             }
         } catch (_) {
-            // fall through to search
+            // The parallel resolver below is the intended fallback.
         }
     }
 
-    // 4. JioSaavn proxy search fallback
-    const query = `${track.title} ${track.artist_name ?? ''}`.trim();
-    try {
-        const payload = await searchSongsOnly(query, 1, 10);
-        const results = payload?.data?.results ?? [];
-        for (const song of results) {
-            const score = _scoreMatch(track, song);
-            if (score < IDENTITY_CONFIDENCE_MIN) continue;
-            const stream = _bestStreamUrl(song);
-            if (!stream) continue;
-            resolveOrCreate(
-                { title: track.title, artist: track.artist_name, durationMs: track.duration_ms },
-                'jiosaavn', song.id ?? song.songId ?? '',
-            );
-            cacheStreamUrl(canonicalId, stream.url, stream.quality);
-            return { ...stream, provider: 'jiosaavn', canonicalId };
-        }
-    } catch (_) { /* fall through to direct client */ }
-
-    // 5. JioSaavn direct client (decrypts media URLs itself — bypasses proxy)
-    try {
-        const jiosaavnId = getProviderTrackId(canonicalId, 'jiosaavn');
-        if (jiosaavnId) {
-            const direct = await getSongDirect(jiosaavnId);
-            const song = direct ?? null;
-            if (song) {
-                const stream = _bestStreamUrl(song);
-                if (stream) {
-                    cacheStreamUrl(canonicalId, stream.url, stream.quality);
-                    return { ...stream, provider: 'jiosaavn-direct', canonicalId };
-                }
-            }
-        }
-
-        // Direct search as last resort
-        const directResults = await searchSongsDirect(query, 10);
-        for (const song of directResults ?? []) {
-            const score = _scoreMatch(track, song);
-            if (score < IDENTITY_CONFIDENCE_MIN) continue;
-            const stream = _bestStreamUrl(song);
-            if (!stream) continue;
-            cacheStreamUrl(canonicalId, stream.url, stream.quality);
-            return { ...stream, provider: 'jiosaavn-direct', canonicalId };
-        }
-    } catch (_) { /* exhausted all fallbacks */ }
-
-    throw new PlaybackResolveError(
-        `No playable source found for "${track.title}" (${canonicalId})`,
-        'UNRESOLVABLE',
-    );
+    return resolveReplacementStream(canonicalId, opts);
 }
 
 /**
- * Force-invalidate the cached stream URL for a track so the next
- * resolveStream() call fetches a fresh one.
+ * Resolve a fresh source while retaining the original canonical track. Search
+ * candidates may come from another album/movie/catalog entry, but their
+ * metadata never escapes this method.
  */
+export async function resolveReplacementStream(canonicalId, opts = {}) {
+    const active = recoveryLocks.get(canonicalId);
+    if (active) return active;
+
+    const operation = _resolveReplacementStream(canonicalId, opts)
+        .finally(() => recoveryLocks.delete(canonicalId));
+    recoveryLocks.set(canonicalId, operation);
+    return operation;
+}
+
+async function _resolveReplacementStream(canonicalId, opts) {
+    const track = getTrack(canonicalId);
+    if (!track) throw new PlaybackResolveError(`Unknown canonical ID: ${canonicalId}`, 'NOT_FOUND');
+
+    invalidateStreamCache(canonicalId);
+    const failedUrl = String(opts.failedUrl ?? '').trim();
+    if (failedUrl) failedUrls.set(failedUrl, Date.now() + FAILED_URL_TTL_MS);
+    _pruneFailedUrls();
+
+    const queries = _buildRecoveryQueries(track);
+    const providerId = getProviderTrackId(canonicalId, 'jiosaavn');
+    const settled = await Promise.allSettled([
+        ...queries.map(query => searchSongsOnly(query, 1)),
+        ...queries.map(query => searchSongsDirect(query, 20)),
+        ...(providerId ? [getSongById(providerId), getSongDirect(providerId)] : []),
+    ]);
+
+    const candidates = new Map();
+    for (const result of settled) {
+        if (result.status !== 'fulfilled') continue;
+        const value = result.value;
+        const songs = Array.isArray(value)
+            ? value
+            : (value?.data?.results ?? (value?.data ? [value.data] : (value ? [value] : [])));
+        for (const song of songs) {
+            if (!song || typeof song !== 'object') continue;
+            const stream = _bestStreamUrl(song);
+            if (!stream?.url || _isFailedUrl(stream.url)) continue;
+            const key = `${song.id ?? song.songId ?? ''}|${stream.url}`;
+            if (!candidates.has(key)) candidates.set(key, { song, stream });
+        }
+    }
+
+    const winner = [...candidates.values()]
+        .map(candidate => ({ ...candidate, score: _scoreMatch(track, candidate.song) }))
+        .filter(candidate => candidate.score >= IDENTITY_CONFIDENCE_MIN)
+        .sort((a, b) => b.score - a.score)[0];
+    if (!winner) {
+        throw new PlaybackResolveError(
+            `No replacement source found for "${track.title}" (${canonicalId})`,
+            'UNRESOLVABLE',
+        );
+    }
+
+    cacheStreamUrl(canonicalId, winner.stream.url, winner.stream.quality);
+    return {
+        ...winner.stream,
+        provider: 'jiosaavn-recovery',
+        canonicalId,
+        confidence: Math.round(winner.score),
+        resolvedAt: new Date().toISOString(),
+        validationStatus: 'pending-client-validation',
+    };
+}
+
+function _buildRecoveryQueries(track) {
+    const title = String(track.title ?? '').trim();
+    const artist = String(track.artist_name ?? '').trim();
+    const album = String(track.album_name ?? '').trim();
+    const language = String(track.language ?? '').trim();
+    const queries = [
+        [title, artist],
+        [title, album],
+        [title, artist, album],
+        [title, language],
+        [title, artist, language],
+        [artist, title, album],
+        [album, 'songs'], // catalog/album lane
+    ].map(parts => parts.filter(Boolean).join(' ').replace(/\s+/g, ' ').trim());
+    return [...new Set(queries.filter(Boolean))];
+}
+
+function _pruneFailedUrls() {
+    const now = Date.now();
+    for (const [url, expiresAt] of failedUrls) {
+        if (expiresAt <= now) failedUrls.delete(url);
+    }
+}
+
+function _isFailedUrl(url) {
+    const expiresAt = failedUrls.get(url);
+    return !!expiresAt && expiresAt > Date.now();
+}
+
+/** Force-invalidate a cached source before the next normal resolution. */
 export function evictStream(canonicalId) {
     invalidateStreamCache(canonicalId);
 }
