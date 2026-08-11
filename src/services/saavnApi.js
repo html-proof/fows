@@ -536,7 +536,7 @@ export async function searchAlbums(query) {
     // Prefer the direct JioSaavn endpoint — it ranks albums correctly (e.g. the
     // actual "Chotta Mumbai" film album surfaces above coincidental OST matches).
     try {
-        return await searchAlbumsDirect(query, 10);
+        return await searchAlbumsDirect(query, 20);
     } catch (_) { /* fall through to proxy */ }
 
     try {

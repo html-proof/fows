@@ -32,8 +32,9 @@ import { attachCanonicalIds } from '../services/identityResolver.js';
 
 const router = Router();
 const DEFAULT_LIMIT = 40;
-const MIN_LIMIT = 10;
+const MIN_LIMIT = 20;
 const MAX_LIMIT = 60;
+const ALBUM_LIMIT = 20;
 const MAX_RELATED_LANGUAGES = 5;
 const MAX_ALBUM_LANGUAGE_BUCKETS = 4;
 const USER_LANGUAGE_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -140,7 +141,7 @@ router.get('/search', async (req, res) => {
         const rankedByEngine = filterRelevantSongs(
             fuseSongCandidates(candidateGroups, analysis),
             analysis,
-            { minKeep: Math.min(12, limit) },
+            { minKeep: Math.min(20, limit) },
         );
 
         // Apply language preference as a secondary sort layer (doesn't override exact matches)
@@ -234,7 +235,7 @@ router.get('/search', async (req, res) => {
                                 { source: 'search', weight: 1.1, songs: finalRanked },
                             ], analysis),
                             analysis,
-                            { minKeep: Math.min(12, limit) },
+                            { minKeep: Math.min(20, limit) },
                         );
                         finalRanked = ranked;
                     }
@@ -245,10 +246,10 @@ router.get('/search', async (req, res) => {
         const songsOut = attachCanonicalIds(finalRanked.slice(0, limit));
 
         const albumsOut = albumsData.status === 'fulfilled'
-            ? (albumsData.value?.data?.results ?? []).slice(0, limit)
+            ? (albumsData.value?.data?.results ?? []).slice(0, ALBUM_LIMIT)
             : [];
         const artistsOut = artistsData.status === 'fulfilled'
-            ? (artistsData.value?.data?.results ?? []).slice(0, limit)
+            ? (artistsData.value?.data?.results ?? []).slice(0, ALBUM_LIMIT)
             : [];
 
         // ── Step 5: Resolve top result using engine scoring ──────────────────
