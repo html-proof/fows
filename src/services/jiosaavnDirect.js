@@ -383,3 +383,46 @@ export async function searchAlbumsDirect(query, limit = 10) {
 
     return { data: { results, total: data?.total ?? results.length } };
 }
+
+/**
+ * Search for artists by name using JioSaavn's direct API.
+ * Both saavn.sumit.co and jiosaavn-api-murex.vercel.app have become unreliable;
+ * this provides a dependency-free fallback that hits jiosaavn.com directly.
+ *
+ * Returns an array of normalised artist objects shaped like the proxy response:
+ * [{ id, name, imageUrl, permaUrl, followerCount }]
+ */
+export async function searchArtistsDirect(query, limit = 20) {
+    const data = await _apiCall({
+        '__call': 'search.getArtistResults',
+        'q':      query,
+        'n':      String(Math.min(limit, 20)),
+        'p':      '1',
+    });
+
+    const results = (data?.results ?? []).filter(r => {
+        const name = String(r.name ?? '');
+        const hasImage = r.image && !r.image.includes('artist-default');
+        return r.id && hasImage && !name.includes('|') && name.length < 60;
+    }).map(r => {
+        const imgRaw = String(r.image ?? '');
+        // Build image list in the same format as saavn.sumit.co proxy so Flutter
+        // can use artist['image'].last['url'] without special-casing.
+        const img500 = imgRaw.replace(/\d+x\d+/g, '500x500');
+        const image = [
+            { quality: '50x50',   url: imgRaw.replace(/\d+x\d+/g, '50x50')   },
+            { quality: '150x150', url: imgRaw.replace(/\d+x\d+/g, '150x150') },
+            { quality: '500x500', url: img500 },
+        ];
+        return {
+            id:            String(r.id),
+            name:          _htmlDecode(r.name ?? ''),
+            image,
+            imageUrl:      img500,
+            permaUrl:      r.perma_url ?? null,
+            followerCount: r.ctr ?? 0,
+        };
+    });
+
+    return results.slice(0, limit);
+}

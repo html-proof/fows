@@ -4,6 +4,7 @@ import {
     getSongDirect,
     searchAlbumsDirect,
     getAlbumByIdDirect,
+    searchArtistsDirect,
 } from './jiosaavnDirect.js';
 
 function describeProviderError(error) {
@@ -711,6 +712,46 @@ export async function getArtistById(artistId) {
     }
 }
 
+// Curated per-language artist seeds used when proxy providers are unavailable.
+// Each name is searched individually on the JioSaavn direct API — we take the
+// top result per query, which is reliably the correct artist profile.
+const LANGUAGE_ARTIST_SEEDS = {
+    hindi:     ['Arijit Singh', 'Shreya Ghoshal', 'Sonu Nigam', 'Neha Kakkar',
+                'Jubin Nautiyal', 'Armaan Malik', 'Atif Aslam', 'Sunidhi Chauhan',
+                'Kumar Sanu', 'Lata Mangeshkar', 'Kishore Kumar', 'Mohammed Rafi',
+                'Udit Narayan', 'Alka Yagnik', 'KK'],
+    tamil:     ['AR Rahman', 'SP Balasubrahmanyam', 'Sid Sriram', 'Anirudh Ravichander',
+                'Vijay Antony', 'Hariharan', 'Karthik', 'Chinmayi', 'Ilaiyaraaja',
+                'Benny Dayal', 'Haricharan', 'Andrea Jeremiah'],
+    telugu:    ['SP Balasubrahmanyam', 'Sid Sriram', 'Anirudh Ravichander',
+                'Shreya Ghoshal', 'Chinmayi', 'Rahul Sipligunj', 'Harika Narayan',
+                'Sunitha', 'Karthik', 'Geetha Madhuri', 'Armaan Malik'],
+    kannada:   ['Rajkumar', 'Shreya Ghoshal', 'Vijay Prakash', 'Sithara Krishnakumar',
+                'Chandan Shetty', 'Hamsalekha', 'Udit Narayan', 'Sonu Nigam'],
+    malayalam: ['KJ Yesudas', 'MG Sreekumar', 'Shreya Ghoshal', 'Sithara Krishnakumar',
+                'Vijay Yesudas', 'KS Chithra', 'P Jayachandran', 'Shaan Rahman',
+                'Harisankar', 'Jassie Gift'],
+    punjabi:   ['Diljit Dosanjh', 'Gurnam Bhullar', 'Babbu Maan', 'Hardy Sandhu',
+                'Prabh Gill', 'Amrit Maan', 'Jordan Sandhu', 'Surjit Bindrakhia',
+                'Gippy Grewal', 'Mankirt Aulakh'],
+    bengali:   ['Arijit Singh', 'Nachiketa Chakraborty', 'Rupankar Bagchi',
+                'Shaan', 'Lagnajita Chakraborty', 'Anupam Roy', 'Usha Uthup',
+                'Shreya Ghoshal', 'Sidhu'],
+    english:   ['Ed Sheeran', 'Taylor Swift', 'The Weeknd', 'Coldplay',
+                'Eminem', 'Justin Bieber', 'Billie Eilish', 'Ariana Grande',
+                'Bruno Mars', 'Adele', 'Dua Lipa'],
+    marathi:   ['Ajay Atul', 'Shreya Ghoshal', 'Vaishali Samant', 'Swapnil Bandodkar',
+                'Avdhoot Gupte', 'Hrishikesh Ranade', 'Bela Shende'],
+    gujarati:  ['Kirtidan Gadhvi', 'Aishwarya Majmudar', 'Premal Desai',
+                'Osman Mir', 'Arijit Singh', 'Falguni Pathak'],
+    bhojpuri:  ['Pawan Singh', 'Khesari Lal Yadav', 'Dinesh Lal Yadav',
+                'Manoj Tiwari', 'Kalpana'],
+    odia:      ['Humane Sagar', 'Ira Mohanty', 'Md Aziz', 'Tapu Mishra'],
+    assamese:  ['Zubeen Garg', 'Papon', 'Nilim Kumar'],
+    urdu:      ['Atif Aslam', 'Rahat Fateh Ali Khan', 'Nusrat Fateh Ali Khan',
+                'Ghulam Ali', 'Mehdi Hassan', 'Arijit Singh'],
+};
+
 /**
  * Get popular artists for a specific language.
  * This is used during onboarding to show a list of artists for selection.
@@ -718,22 +759,37 @@ export async function getArtistById(artistId) {
  * @returns {Promise<object[]>} List of artists
  */
 export async function getArtistsByLanguage(language) {
-    // Saavn API doesn't have a direct 'popular artists by language' endpoint.
-    // We'll search for 'Top <language> Artists' and 'Popular <language> Artists'
-    // to gather a good candidate list.
-    const queries = [`Top ${language} Artists`, `Popular ${language} Artists`];
-
-    const results = await Promise.allSettled(
-        queries.map(q => searchArtists(q))
-    );
-
     const artistMap = new Map();
-    for (const result of results) {
+
+    // Try proxy providers first (fast path with rich metadata).
+    const proxyQueries = [`Top ${language} Artists`, `Popular ${language} singers`];
+    const proxyResults = await Promise.allSettled(
+        proxyQueries.map(q => searchArtists(q))
+    );
+    for (const result of proxyResults) {
         if (result.status === 'fulfilled' && result.value?.data?.results) {
             for (const artist of result.value.data.results) {
-                if (artist.id) artistMap.set(artist.id, artist);
+                if (artist.id) artistMap.set(String(artist.id), artist);
             }
         }
+    }
+    if (artistMap.size >= 5) return Array.from(artistMap.values());
+
+    // Both proxies are down (or returned too few results) — use the JioSaavn
+    // direct API with curated per-language artist names as seed queries.
+    // Searching by exact artist name reliably returns the correct profile as
+    // the first result, unlike generic "Top Hindi Artists" which returns noise.
+    const lang = language.toLowerCase();
+    const seeds = LANGUAGE_ARTIST_SEEDS[lang] ?? LANGUAGE_ARTIST_SEEDS.hindi;
+
+    const directResults = await Promise.allSettled(
+        seeds.map(name => searchArtistsDirect(name, 3))
+    );
+    for (const result of directResults) {
+        if (result.status !== 'fulfilled' || !Array.isArray(result.value)) continue;
+        // Take only the top result per seed — it's the artist we searched for.
+        const top = result.value[0];
+        if (top?.id) artistMap.set(String(top.id), top);
     }
 
     return Array.from(artistMap.values());
