@@ -5,6 +5,14 @@ import {
     searchAlbumsDirect,
 } from './jiosaavnDirect.js';
 
+function describeProviderError(error) {
+    const message = String(error?.message ?? '').trim();
+    if (message) return message;
+    const causeMessage = String(error?.cause?.message ?? '').trim();
+    if (causeMessage) return causeMessage;
+    return [error?.name, error?.code].filter(Boolean).join(' ') || 'unknown provider error';
+}
+
 const BASE_URL = 'https://saavn.sumit.co';
 const FALLBACK_BASE_URL = 'https://jiosaavn-api-murex.vercel.app';
 const MAX_SMART_RESULTS = 40;
@@ -167,7 +175,7 @@ export async function searchSongsOnly(query, page = 1) {
                 return directPayload;
             }
         } catch (directErr) {
-            console.warn(`[saavnApi] Direct JioSaavn fallback failed: ${directErr?.message}`);
+            console.warn(`[saavnApi] Direct JioSaavn fallback failed: ${describeProviderError(directErr)}`);
         }
     }
 
@@ -440,7 +448,7 @@ async function computeSmartSearchResults({
                 });
             }
         } catch (err) {
-            console.warn(`[saavnApi] Direct fallback failed: ${err?.message}`);
+            console.warn(`[saavnApi] Direct fallback failed: ${describeProviderError(err)}`);
         }
     }
 

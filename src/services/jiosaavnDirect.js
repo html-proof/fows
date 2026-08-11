@@ -15,8 +15,9 @@ import crypto from 'crypto';
 import { request } from 'undici';
 
 const DIRECT_BASE    = 'https://www.jiosaavn.com/api.php';
-const CONNECT_TIMEOUT = 4000;
-const BODY_TIMEOUT    = 5000;
+const CONNECT_TIMEOUT = 6000;
+const BODY_TIMEOUT    = 8000;
+const MAX_REQUEST_ATTEMPTS = 2;
 
 // ─── DES decryption ───────────────────────────────────────────────────────────
 
@@ -122,20 +123,39 @@ async function _apiCall(params) {
     url.searchParams.set('_marker', '0');
     url.searchParams.set('ctx', 'web6dot0');
 
-    const { statusCode, body } = await request(url.toString(), {
-        method: 'GET',
-        headers: {
-            'Accept':     'application/json, text/plain, */*',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-            'Referer':    'https://www.jiosaavn.com/',
-            'Origin':     'https://www.jiosaavn.com',
-        },
-        connectTimeout: CONNECT_TIMEOUT,
-        bodyTimeout:    BODY_TIMEOUT,
-    });
+    let lastError;
+    for (let attempt = 1; attempt <= MAX_REQUEST_ATTEMPTS; attempt++) {
+        try {
+            const { statusCode, body } = await request(url.toString(), {
+                method: 'GET',
+                headers: {
+                    'Accept':     'application/json, text/plain, */*',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+                    'Referer':    'https://www.jiosaavn.com/',
+                    'Origin':     'https://www.jiosaavn.com',
+                },
+                connectTimeout: CONNECT_TIMEOUT,
+                bodyTimeout:    BODY_TIMEOUT,
+            });
 
-    if (statusCode !== 200) throw new Error(`JioSaavn direct API: HTTP ${statusCode}`);
-    return body.json();
+            if (statusCode !== 200) {
+                throw new Error(`JioSaavn direct API: HTTP ${statusCode}`);
+            }
+            return await body.json();
+        } catch (error) {
+            lastError = error;
+            // A rejected request can have an empty message (notably some
+            // abort/socket errors on hosted runtimes). Retry once before
+            // surfacing it to the fallback chain.
+            if (attempt < MAX_REQUEST_ATTEMPTS) continue;
+        }
+    }
+
+    const message = lastError?.message?.trim();
+    const detail = message || lastError?.code || lastError?.name || 'unknown network error';
+    throw new Error(`JioSaavn direct API request failed after ${MAX_REQUEST_ATTEMPTS} attempts: ${detail}`, {
+        cause: lastError,
+    });
 }
 
 // ─── Public exports ───────────────────────────────────────────────────────────
