@@ -428,7 +428,7 @@ async function computeSmartSearchResults({
             const directResults = await searchSongsOnlyDirect(normalizedQuery, 40);
             const directSongs = directResults?.data?.results ?? [];
             if (directSongs.length > 0) {
-                console.info(`[saavnApi] Direct fallback added ${directSongs.length} songs for "${normalizedQuery}"`);
+                console.info(`[saavnApi] Direct fallback added ${directSongs.length} songs`);
                 addRankedSongs({
                     ranked,
                     songs: directSongs,
