@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
+import compression from 'compression';
 
 import saavnRoutes from './routes/saavn.js';
 import userRoutes from './routes/user.js';
@@ -13,8 +14,12 @@ import { isShuttingDown } from './runtimeState.js';
 
 const app = express();
 
-// Trust the first proxy hop (nginx / cloud LB sets X-Forwarded-For)
-app.set('trust proxy', 1);
+// Trust Cloudflare + Render proxy hops (sets X-Forwarded-For correctly)
+app.set('trust proxy', 2);
+
+// Gzip / Brotli compression — reduces payload size 60-80% for JSON responses.
+// Cloudflare also compresses at the edge, but this covers direct Render traffic.
+app.use(compression({ level: 6, threshold: 512 }));
 
 // Security headers
 app.use(helmet());
@@ -70,12 +75,41 @@ const strictLimiter = rateLimit({
 
 app.use(globalLimiter);
 
+// ── Cache-Control helpers ──────────────────────────────────────────────────────
+// s-maxage is respected by Cloudflare CDN; max-age is the client-side TTL.
+// Authenticated / write routes use `private, no-store` so they bypass the CDN.
+
+function cachePublic(maxAgeS, cdnAgeS) {
+    return (_req, res, next) => {
+        res.set('Cache-Control', `public, max-age=${maxAgeS}, s-maxage=${cdnAgeS}`);
+        next();
+    };
+}
+
+const cachePrivate = (_req, res, next) => {
+    res.set('Cache-Control', 'private, no-store');
+    next();
+};
+
+// Per-route cache policies
+//   Search / trending  — fresh for 5 min client, 10 min CDN
+//   Albums / artists   — fresh for 1 h client, 6 h CDN
+//   Songs              — fresh for 1 h client, 24 h CDN (stream URLs change, song metadata doesn't)
+//   Authenticated      — never cached at CDN
+
+app.use('/api/user', cachePrivate, userRoutes);
+app.use('/api/activity', cachePrivate, activityRoutes);
+app.use('/api/recommendations', cachePrivate, recommendationRoutes);
+app.use('/api/playlist', strictLimiter, cachePrivate, playlistImportRoutes);
+app.use('/v1/catalog/resolve', cachePublic(600, 1800));      // stream URLs: 10 min / 30 min
+app.use('/v1/catalog/tracks', cachePublic(3600, 86400));     // track meta: 1 h / 24 h
+app.use('/v1', cachePublic(300, 600), catalogRoutes);
+app.use('/api/trending', cachePublic(300, 600));             // 5 min / 10 min
+app.use('/api/songs', cachePublic(3600, 86400));             // 1 h / 24 h
+app.use('/api/albums', cachePublic(3600, 21600));            // 1 h / 6 h
+app.use('/api/artists', cachePublic(1800, 7200));            // 30 min / 2 h
+app.use('/api/search', cachePublic(300, 600));               // 5 min / 10 min
 app.use('/api', saavnRoutes);
-app.use('/api/user', userRoutes);
-app.use('/api/activity', activityRoutes);
-app.use('/api/recommendations', recommendationRoutes);
-app.use('/api/playlist', strictLimiter, playlistImportRoutes);
-app.use('/v1', catalogRoutes);
 
 // Lightweight health routes for keepalive probes.
 app.get('/healthz', (_req, res) => {
