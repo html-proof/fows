@@ -163,7 +163,7 @@ export async function searchSongsOnly(query, page = 1) {
         try {
             const directPayload = await searchSongsOnlyDirect(query, 40);
             if (directPayload?.data?.results?.length > 0) {
-                console.info(`[saavnApi] Direct fallback resolved ${directPayload.data.results.length} songs for "${query}"`);
+                console.info(`[saavnApi] Direct fallback resolved ${directPayload.data.results.length} songs`);
                 return directPayload;
             }
         } catch (directErr) {
