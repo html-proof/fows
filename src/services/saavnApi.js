@@ -714,36 +714,34 @@ export async function getArtistsByLanguage(language) {
  * @returns {Promise<object>} Lyrics data
  */
 export async function getLyricsBySongId(id) {
-    try {
-        // Primary: check /api/songs/:id/lyrics (new spec)
-        return await requestJsonWithTimeout(
-            `${BASE_URL}/api/songs/${encodeURIComponent(id)}/lyrics`,
-            {
-                timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
-                label: 'Saavn lyrics fetch (path)',
+    const encoded = encodeURIComponent(id);
+    const candidates = [
+        requestJsonWithTimeout(`${BASE_URL}/api/songs/${encoded}/lyrics`, {
+            timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+            label: 'Saavn lyrics fetch (path)',
+        }),
+        requestJsonWithTimeout(`${BASE_URL}/api/lyrics?id=${encoded}`, {
+            timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+            label: 'Saavn lyrics fetch (query)',
+        }),
+        requestJsonWithTimeout(`${FALLBACK_BASE_URL}/api/lyrics?id=${encoded}`, {
+            timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
+            label: 'Fallback lyrics fetch',
+        }),
+    ];
+
+    // Race all three providers — first non-null, non-error response wins.
+    const results = await Promise.allSettled(candidates);
+    for (const result of results) {
+        if (result.status === 'fulfilled' && result.value != null) {
+            const data = result.value?.data ?? result.value;
+            if (data?.lyrics || data?.syncedLyrics) {
+                return result.value;
             }
-        );
-    } catch (error) {
-        try {
-            // Secondary: check /api/lyrics?id=:id (older spec)
-            return await requestJsonWithTimeout(
-                `${BASE_URL}/api/lyrics?id=${encodeURIComponent(id)}`,
-                {
-                    timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
-                    label: 'Saavn lyrics fetch (query)',
-                }
-            );
-        } catch (innerError) {
-            // Fallback: check alternate provider
-            return await requestJsonWithTimeout(
-                `${FALLBACK_BASE_URL}/api/lyrics?id=${encodeURIComponent(id)}`,
-                {
-                    timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
-                    label: 'Fallback lyrics fetch',
-                }
-            ).catch(() => ({ success: false, data: null }));
         }
     }
+    // All failed or returned empty — return a safe empty response
+    return { success: false, data: null };
 }
 
 export default {
