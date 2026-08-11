@@ -3,6 +3,7 @@ import {
     searchSongsOnlyDirect,
     getSongDirect,
     searchAlbumsDirect,
+    getAlbumByIdDirect,
 } from './jiosaavnDirect.js';
 
 function describeProviderError(error) {
@@ -28,6 +29,7 @@ const SMART_SEARCH_MAX_LATENCY_MS = 2000;
 const PRIMARY_SEARCH_TIMEOUT_MS = 2200;
 const FALLBACK_SEARCH_TIMEOUT_MS = 1800;
 const CATALOG_SEARCH_TIMEOUT_MS = 1500;
+const ALBUM_FETCH_TIMEOUT_MS = 10000; // album detail can be large; proxy may be slow
 const LOCAL_INDEX_MAX_ENTRIES = 6000;
 const LOCAL_INDEX_MAX_CANDIDATES = 120;
 const smartSearchCache = new Map();
@@ -497,32 +499,55 @@ export async function getAlbumById(id, url) {
     // Fetching by perma_url (?link=) is more reliable than numeric ID on the proxy.
     if (url) {
         try {
-            return await requestJsonWithTimeout(
+            const res = await requestJsonWithTimeout(
                 `${BASE_URL}/api/albums?link=${encodeURIComponent(url)}`,
-                { timeoutMs: CATALOG_SEARCH_TIMEOUT_MS, label: 'Saavn album fetch (link)' }
+                { timeoutMs: ALBUM_FETCH_TIMEOUT_MS, label: 'Saavn album fetch (link)' }
             );
-        } catch (_) { /* fall through to id-based fetch */ }
+            if (_albumHasSongs(res)) return res;
+        } catch (_) { /* fall through */ }
     }
 
+    // Primary: proxy path-style
     try {
-        return await requestJsonWithTimeout(
+        const res = await requestJsonWithTimeout(
             `${BASE_URL}/api/albums/${encodeURIComponent(id)}`,
-            { timeoutMs: CATALOG_SEARCH_TIMEOUT_MS, label: 'Saavn album fetch (path)' }
+            { timeoutMs: ALBUM_FETCH_TIMEOUT_MS, label: 'Saavn album fetch (path)' }
         );
-    } catch (error) {
-        try {
-            return await requestJsonWithTimeout(
-                `${BASE_URL}/api/albums?id=${encodeURIComponent(id)}`,
-                { timeoutMs: CATALOG_SEARCH_TIMEOUT_MS, label: 'Saavn album fetch (query)' }
-            );
-        } catch (innerError) {
-            return {
-                success: false,
-                error: 'Service temporarily unavailable',
-                data: null,
-            };
-        }
-    }
+        if (_albumHasSongs(res)) return res;
+    } catch (_) { /* fall through */ }
+
+    // Secondary: proxy query-style
+    try {
+        const res = await requestJsonWithTimeout(
+            `${BASE_URL}/api/albums?id=${encodeURIComponent(id)}`,
+            { timeoutMs: ALBUM_FETCH_TIMEOUT_MS, label: 'Saavn album fetch (query)' }
+        );
+        if (_albumHasSongs(res)) return res;
+    } catch (_) { /* fall through */ }
+
+    // Tertiary: fallback proxy
+    try {
+        const res = await requestJsonWithTimeout(
+            `${FALLBACK_BASE_URL}/api/albums?id=${encodeURIComponent(id)}`,
+            { timeoutMs: ALBUM_FETCH_TIMEOUT_MS, label: 'Saavn album fetch (fallback)' }
+        );
+        if (_albumHasSongs(res)) return res;
+    } catch (_) { /* fall through */ }
+
+    // Last resort: JioSaavn direct API via undici
+    try {
+        const res = await getAlbumByIdDirect(id);
+        if (_albumHasSongs(res)) return res;
+    } catch (_) {}
+
+    return { success: false, error: 'Service temporarily unavailable', data: null };
+}
+
+function _albumHasSongs(res) {
+    if (!res || !res.data) return false;
+    const d = res.data;
+    const songs = d.songs ?? d.list ?? d.tracks;
+    return Array.isArray(songs) && songs.length > 0;
 }
 
 /**

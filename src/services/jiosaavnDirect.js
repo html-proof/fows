@@ -161,6 +161,66 @@ async function _apiCall(params) {
 // ─── Public exports ───────────────────────────────────────────────────────────
 
 /**
+ * Fetch full album details (including track list) via JioSaavn's direct API.
+ * Returns a normalised object shaped like the saavn.sumit.co proxy response:
+ * { success: true, data: { id, name, songs: [...] } }
+ */
+export async function getAlbumByIdDirect(albumId) {
+    const data = await _apiCall({
+        '__call': 'content.getAlbumDetails',
+        'albumid': String(albumId),
+    });
+
+    // Direct API returns tracks under `list` (array of raw song objects)
+    const list = Array.isArray(data?.list) ? data.list
+        : Array.isArray(data?.songs) ? data.songs
+        : [];
+
+    const songs = list.map(raw => {
+        const info = { ...(raw ?? {}), ...(raw?.more_info ?? {}) };
+        const encrypted = info.encrypted_media_url ?? '';
+        const has320 = info['320kbps'] === 'true' || info['320kbps'] === true;
+        const downloadUrl = encrypted ? _buildDownloadUrls(encrypted, has320) : [];
+        const imgRaw = raw.image ?? '';
+        const imgBase = imgRaw.replace(/\d+x\d+\.jpg$/, '{q}.jpg').replace(/\d+x\d+\.webp$/, '{q}.jpg');
+        const image = imgBase.includes('{q}') ? [
+            { quality: '50x50',   url: imgBase.replace('{q}', '50x50')   },
+            { quality: '150x150', url: imgBase.replace('{q}', '150x150') },
+            { quality: '500x500', url: imgBase.replace('{q}', '500x500') },
+        ] : [{ quality: '150x150', url: imgRaw }];
+
+        const name   = _htmlDecode(raw.song ?? raw.title ?? raw.name ?? '');
+        const artist = _htmlDecode(info.primary_artists ?? info.singers ?? '');
+        return {
+            id:             String(raw.id ?? ''),
+            name,
+            title:          name,
+            primaryArtists: artist,
+            artists: { primary: artist ? [{ id: null, name: artist }] : [] },
+            album:   { id: String(albumId), name: _htmlDecode(info.album ?? data.title ?? '') },
+            albumId: String(albumId),
+            duration: String(info.duration ?? raw.duration ?? ''),
+            language: info.language ?? data.language ?? '',
+            image,
+            downloadUrl,
+        };
+    }).filter(s => s.name);
+
+    if (songs.length === 0) throw new Error('No songs in direct album response');
+
+    return {
+        success: true,
+        data: {
+            id:       String(data.albumid ?? data.id ?? albumId),
+            name:     _htmlDecode(data.title ?? data.name ?? ''),
+            language: (data.language ?? '').toLowerCase(),
+            year:     data.year ?? null,
+            songs,
+        },
+    };
+}
+
+/**
  * Fetch trending songs or albums via JioSaavn's content.getTrending endpoint.
  * Returns an array of normalised objects { id, name, type, image, url, language, year, artists }.
  */

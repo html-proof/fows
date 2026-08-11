@@ -990,10 +990,13 @@ router.get('/albums', async (req, res) => {
             data = await searchAlbums(query);
         }
 
-        // Normalise: JioSaavn proxy puts tracks under `list` for many album
-        // detail responses; unify to `songs` before sending to the client.
-        if (data?.data && Array.isArray(data.data.list) && !Array.isArray(data.data.songs)) {
-            data = { ...data, data: { ...data.data, songs: data.data.list } };
+        // Normalise: depending on the source, tracks may be under `list` or
+        // `tracks`; unify everything to `songs` before sending to the client.
+        if (data?.data) {
+            const alt = data.data.list ?? data.data.tracks;
+            if (Array.isArray(alt) && !Array.isArray(data.data.songs)) {
+                data = { ...data, data: { ...data.data, songs: alt } };
+            }
         }
 
         // Album detail payloads contain raw provider tracks. Assign canonical
