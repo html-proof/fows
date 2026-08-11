@@ -161,6 +161,34 @@ async function _apiCall(params) {
 // ─── Public exports ───────────────────────────────────────────────────────────
 
 /**
+ * Fetch trending songs or albums via JioSaavn's content.getTrending endpoint.
+ * Returns an array of normalised objects { id, name, type, image, url, language, year, artists }.
+ */
+export async function getTrendingDirect(type = 'song', language = 'hindi', limit = 20) {
+    const data = await _apiCall({
+        '__call':          'content.getTrending',
+        'entity_type':     type,
+        'entity_language': language,
+    });
+
+    // Response is either an array or an object with numeric keys
+    const list = Array.isArray(data)
+        ? data
+        : Object.values(data ?? {}).filter(v => v && typeof v === 'object' && !Array.isArray(v));
+
+    return list.slice(0, limit).map(item => ({
+        id:       String(item.id ?? ''),
+        name:     _htmlDecode(item.title ?? item.name ?? ''),
+        type:     item.type ?? type,
+        image:    item.image ?? null,
+        url:      item.perma_url ?? item.url ?? null,
+        language: item.language ?? language,
+        year:     item.year ?? null,
+        artists:  item.subtitle ?? item.more_info?.music ?? null,
+    })).filter(item => item.name);
+}
+
+/**
  * Search songs via JioSaavn's own API endpoint.
  * Returns normalised song objects matching the saavn.sumit.co proxy format.
  */

@@ -12,7 +12,7 @@ import {
     searchAlbums,
     getLyricsBySongId,
 } from '../services/saavnApi.js';
-import { searchAlbumsDirect, autocompleteAlbumSearch } from '../services/jiosaavnDirect.js';
+import { searchAlbumsDirect, autocompleteAlbumSearch, getTrendingDirect } from '../services/jiosaavnDirect.js';
 import { auth } from '../config/firebase.js';
 import { getGlobalTrending } from '../services/database.js';
 import {
@@ -1245,41 +1245,36 @@ router.get('/trending', async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit ?? '20', 10) || 20, 50);
     const cacheKey = `${language}:${type}`;
 
-    try {
-        const now = Date.now();
-        const cached = _trendingCache.get(cacheKey);
-        if (cached && cached.expiresAt > now) {
-            return res.json({ success: true, data: cached.data.slice(0, limit) });
-        }
-
-        const raw = await jiosaavnCall({
-            __call: 'content.getTrending',
-            entity_type: type,
-            entity_language: language,
-        });
-
-        // JioSaavn returns either an array or an object with numeric keys
-        const list = Array.isArray(raw)
-            ? raw
-            : Object.values(raw ?? {}).filter(v => v && typeof v === 'object' && !Array.isArray(v));
-
-        const data = list.map(item => ({
-            id:       item.id ?? null,
-            name:     item.title ?? item.name ?? '',
-            type:     item.type ?? type,
-            image:    item.image ?? null,
-            url:      item.perma_url ?? item.url ?? null,
-            language: item.language ?? language,
-            year:     item.year ?? null,
-            artists:  item.subtitle ?? item.more_info?.music ?? null,
-        })).filter(item => item.name);
-
-        _trendingCache.set(cacheKey, { data, expiresAt: now + _TRENDING_TTL_MS });
-        res.json({ success: true, data: data.slice(0, limit) });
-    } catch (error) {
-        console.error('Trending error:', error.message);
-        res.status(500).json({ error: 'Internal server error' });
+    const now = Date.now();
+    const cached = _trendingCache.get(cacheKey);
+    if (cached && cached.expiresAt > now) {
+        return res.json({ success: true, data: cached.data.slice(0, limit) });
     }
+
+    try {
+        // getTrendingDirect uses undici (not Node fetch) — works from any region.
+        const data = await getTrendingDirect(type, language, limit);
+        if (data.length > 0) {
+            _trendingCache.set(cacheKey, { data, expiresAt: now + _TRENDING_TTL_MS });
+            return res.json({ success: true, data });
+        }
+    } catch (err) {
+        // log and fall through to search-based fallback
+        console.warn('Trending direct failed, using fallback:', err.message);
+    }
+
+    // Fallback: surface recent popular songs via search
+    try {
+        const query = type === 'album' ? `top ${language} albums` : `top ${language} songs`;
+        const results = await searchSongsOnly(query, 20);
+        const fallback = (results?.data?.results ?? []).slice(0, limit);
+        if (fallback.length > 0) {
+            _trendingCache.set(cacheKey, { data: fallback, expiresAt: now + 2 * 60 * 1000 });
+            return res.json({ success: true, data: fallback });
+        }
+    } catch (_) {}
+
+    res.json({ success: true, data: [] });
 });
 
 export default router;
