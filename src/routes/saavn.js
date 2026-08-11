@@ -203,25 +203,22 @@ router.get('/search', async (req, res) => {
             const proxyAlbums = albumSearchResults;
             let matchedAlbum = pickMatchingAlbum(proxyAlbums);
 
-            // Proxy didn't return a matching album — fall back to the direct API.
-            // This catches typo/transliteration variants (e.g. "perumazhakkalam" →
-            // "Perumazhakaalam") that the sumit.co proxy misses.
+            // Proxy didn't return a matching album — run direct API and autocomplete
+            // in parallel to find a match without adding sequential round-trips.
             if (!matchedAlbum) {
-                try {
-                    const directResults = await searchAlbumsDirect(albumSearchQuery, 5);
-                    matchedAlbum = pickMatchingAlbum(directResults?.data?.results ?? []);
-                } catch (_) { /* direct album search is best-effort */ }
-            }
-
-            // Last resort: JioSaavn autocomplete handles transliterated Indian
-            // movie names (e.g. "udayananu tharam") that the search APIs miss.
-            if (!matchedAlbum) {
-                try {
-                    const acAlbum = await autocompleteAlbumSearch(albumSearchQuery);
-                    if (acAlbum && areSearchTermsSimilar(normText(acAlbum.name), titleNorm)) {
+                const [directRes, acRes] = await Promise.allSettled([
+                    searchAlbumsDirect(albumSearchQuery, 5),
+                    autocompleteAlbumSearch(albumSearchQuery),
+                ]);
+                if (directRes.status === 'fulfilled') {
+                    matchedAlbum = pickMatchingAlbum(directRes.value?.data?.results ?? []);
+                }
+                if (!matchedAlbum && acRes.status === 'fulfilled' && acRes.value) {
+                    const acAlbum = acRes.value;
+                    if (areSearchTermsSimilar(normText(acAlbum.name), titleNorm)) {
                         matchedAlbum = acAlbum;
                     }
-                } catch (_) { /* autocomplete is best-effort */ }
+                }
             }
 
             if (matchedAlbum && (matchedAlbum.id || matchedAlbum.url)) {

@@ -19,12 +19,12 @@ const MAX_SMART_RESULTS = 40;
 const BIGRAM_MIN_OVERLAP = 0.35;
 // Ten provider results are not enough after duplicate removal and client-side
 // quality filtering. Keep collecting until there is a useful browseable set.
-const SMART_SEARCH_MIN_RESULTS = 24;
+const SMART_SEARCH_MIN_RESULTS = 12;
 const SEARCH_CACHE_FRESH_TTL_MS = 2 * 60 * 1000;
 const SEARCH_CACHE_STALE_TTL_MS = 20 * 60 * 1000;
 const SEARCH_CACHE_MAX_ENTRIES = 300;
 const SMART_SEARCH_MAX_VARIANTS = 4;
-const SMART_SEARCH_MAX_LATENCY_MS = 3200;
+const SMART_SEARCH_MAX_LATENCY_MS = 2000;
 const PRIMARY_SEARCH_TIMEOUT_MS = 2200;
 const FALLBACK_SEARCH_TIMEOUT_MS = 1800;
 const CATALOG_SEARCH_TIMEOUT_MS = 1500;
