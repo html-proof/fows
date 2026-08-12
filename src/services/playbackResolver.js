@@ -14,7 +14,53 @@ import {
 } from './identityResolver.js';
 import { getSongById, searchSongsOnly } from './saavnApi.js';
 import { searchSongsDirect, getSongDirect } from './jiosaavnDirect.js';
+import { getSongById as getGaanaSongById, searchSongsOnly as searchGaanaSongsOnly } from './gaanaApi.js';
 import { bigramSimilarity, normText } from './searchEngine.js';
+import { request } from 'undici';
+
+async function validateUrl(url) {
+    if (!url) return false;
+    try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 1200);
+
+        const { statusCode } = await request(url, {
+            method: 'HEAD',
+            signal: controller.signal,
+            headersTimeout: 1200,
+            bodyTimeout: 1200,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': 'https://gaana.com/',
+            },
+        });
+
+        clearTimeout(timeout);
+        return statusCode >= 200 && statusCode < 400;
+    } catch (e) {
+        try {
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 1200);
+
+            const { statusCode } = await request(url, {
+                method: 'GET',
+                signal: controller.signal,
+                headersTimeout: 1200,
+                bodyTimeout: 1200,
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Referer': 'https://gaana.com/',
+                    'Range': 'bytes=0-8',
+                },
+            });
+
+            clearTimeout(timeout);
+            return statusCode >= 200 && statusCode < 400;
+        } catch (_) {
+            return false;
+        }
+    }
+}
 
 export class PlaybackResolveError extends Error {
     constructor(message, code = 'UNRESOLVABLE') {
@@ -98,12 +144,12 @@ function _bestStreamUrl(song) {
  * provider's exact mapping. If those miss, run the recovery search pipeline.
  */
 export async function resolveStream(canonicalId, opts = {}) {
-    if (opts.forceRefresh) return resolveReplacementStream(canonicalId, opts);
+    if (opts.forceRefresh || opts.overrideTrack) return resolveReplacementStream(canonicalId, opts);
 
     const cached = getCachedStreamUrl(canonicalId);
     if (cached) return { ...cached, provider: 'jiosaavn', canonicalId };
 
-    const track = getTrack(canonicalId);
+    const track = opts.overrideTrack || getTrack(canonicalId);
     if (!track) throw new PlaybackResolveError(`Unknown canonical ID: ${canonicalId}`, 'NOT_FOUND');
 
     const providerId = getProviderTrackId(canonicalId, 'jiosaavn');
@@ -139,7 +185,7 @@ export async function resolveReplacementStream(canonicalId, opts = {}) {
 }
 
 async function _resolveReplacementStream(canonicalId, opts) {
-    const track = getTrack(canonicalId);
+    const track = opts.overrideTrack || getTrack(canonicalId);
     if (!track) throw new PlaybackResolveError(`Unknown canonical ID: ${canonicalId}`, 'NOT_FOUND');
 
     invalidateStreamCache(canonicalId);
@@ -149,13 +195,18 @@ async function _resolveReplacementStream(canonicalId, opts) {
 
     const queries = _buildRecoveryQueries(track);
     const providerId = getProviderTrackId(canonicalId, 'jiosaavn');
+    const gaanaProviderId = getProviderTrackId(canonicalId, 'gaana');
     const settled = await Promise.allSettled([
         ...queries.map(query => searchSongsOnly(query, 1)),
         ...queries.map(query => searchSongsDirect(query, 20)),
+        ...queries.map(query => searchGaanaSongsOnly(query, 20)),
         ...(providerId ? [getSongById(providerId), getSongDirect(providerId)] : []),
+        ...(gaanaProviderId ? [getGaanaSongById(gaanaProviderId)] : []),
     ]);
 
-    const candidates = new Map();
+    const jioCandidates = [];
+    const gaanaCandidates = [];
+
     for (const result of settled) {
         if (result.status !== 'fulfilled') continue;
         const value = result.value;
@@ -166,30 +217,83 @@ async function _resolveReplacementStream(canonicalId, opts) {
             if (!song || typeof song !== 'object') continue;
             const stream = _bestStreamUrl(song);
             if (!stream?.url || _isFailedUrl(stream.url)) continue;
-            const key = `${song.id ?? song.songId ?? ''}|${stream.url}`;
-            if (!candidates.has(key)) candidates.set(key, { song, stream });
+            
+            const score = _scoreMatch(track, song);
+            if (score < IDENTITY_CONFIDENCE_MIN) continue;
+
+            const provider = song.provider === 'gaana' ? 'gaana' : 'jiosaavn';
+            const candidate = { song, stream, score };
+
+            if (provider === 'gaana') {
+                gaanaCandidates.push(candidate);
+            } else {
+                jioCandidates.push(candidate);
+            }
         }
     }
 
-    const winner = [...candidates.values()]
-        .map(candidate => ({ ...candidate, score: _scoreMatch(track, candidate.song) }))
-        .filter(candidate => candidate.score >= IDENTITY_CONFIDENCE_MIN)
-        .sort((a, b) => b.score - a.score)[0];
-    if (!winner) {
+    jioCandidates.sort((a, b) => b.score - a.score);
+    gaanaCandidates.sort((a, b) => b.score - a.score);
+
+    const bestJio = jioCandidates[0];
+    const bestGaana = gaanaCandidates[0];
+
+    if (!bestJio && !bestGaana) {
         throw new PlaybackResolveError(
             `No replacement source found for "${track.title}" (${canonicalId})`,
             'UNRESOLVABLE',
         );
     }
 
-    cacheStreamUrl(canonicalId, winner.stream.url, winner.stream.quality);
+    const [jioPlayable, gaanaPlayable] = await Promise.all([
+        bestJio ? validateUrl(bestJio.stream.url) : Promise.resolve(false),
+        bestGaana ? validateUrl(bestGaana.stream.url) : Promise.resolve(false),
+    ]);
+
+    let primary = null;
+    let fallback = null;
+
+    if (bestJio && bestGaana) {
+        if (jioPlayable && gaanaPlayable) {
+            primary = bestJio;
+            fallback = bestGaana;
+        } else if (gaanaPlayable) {
+            primary = bestGaana;
+            fallback = bestJio;
+        } else if (jioPlayable) {
+            primary = bestJio;
+            fallback = bestGaana;
+        } else {
+            if (bestJio.score >= bestGaana.score) {
+                primary = bestJio;
+                fallback = bestGaana;
+            } else {
+                primary = bestGaana;
+                fallback = bestJio;
+            }
+        }
+    } else if (bestJio) {
+        primary = bestJio;
+    } else if (bestGaana) {
+        primary = bestGaana;
+    }
+
+    const primaryUrl = primary.stream.url;
+    const primaryQuality = primary.stream.quality;
+    const primaryProvider = primary.song.provider === 'gaana' ? 'gaana' : 'jiosaavn';
+
+    cacheStreamUrl(canonicalId, primaryUrl, primaryQuality);
+
     return {
-        ...winner.stream,
-        provider: 'jiosaavn-recovery',
+        url: primaryUrl,
+        quality: primaryQuality,
+        provider: primaryProvider,
+        fallbackUrl: fallback?.stream?.url ?? null,
+        fallbackProvider: fallback ? (fallback.song.provider === 'gaana' ? 'gaana' : 'jiosaavn') : null,
         canonicalId,
-        confidence: Math.round(winner.score),
+        confidence: Math.round(primary.score),
         resolvedAt: new Date().toISOString(),
-        validationStatus: 'pending-client-validation',
+        validationStatus: (jioPlayable || gaanaPlayable) ? 'verified-playable' : 'fallback-unverified',
     };
 }
 

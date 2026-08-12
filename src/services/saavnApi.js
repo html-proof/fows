@@ -6,6 +6,7 @@ import {
     getAlbumByIdDirect,
     searchArtistsDirect,
 } from './jiosaavnDirect.js';
+import { getSongById as getGaanaSongById } from './gaanaApi.js';
 
 function describeProviderError(error) {
     const message = String(error?.message ?? '').trim();
@@ -486,6 +487,13 @@ export async function getSongById(id) {
         const songs = fallbackData?.data ?? [];
         const hasDlUrl = (Array.isArray(songs) ? songs : [songs]).some(s => s?.downloadUrl?.length > 0);
         if (hasDlUrl) return { success: true, data: songs };
+    } catch (_) {}
+
+    try {
+        const gaanaRes = await getGaanaSongById(id);
+        if (gaanaRes && gaanaRes.success && gaanaRes.data?.length > 0) {
+            return gaanaRes;
+        }
     } catch (_) {}
 
     return { success: false, error: 'Service temporarily unavailable', data: [] };

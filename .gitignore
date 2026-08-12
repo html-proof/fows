@@ -7,4 +7,9 @@ dist/
 build/
 .next/
 music_hub/
+music-app-original/
+.claude/
+.wrangler/
+data/*.db-shm
+data/*.db-wal
 

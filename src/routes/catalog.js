@@ -2,12 +2,14 @@
  * /v1/catalog — Canonical catalog API
  *
  * The Flutter app talks to these endpoints for everything music-related.
- * It never needs to know whether data came from iTunes, JioSaavn, or the DB.
+ * It never needs to know whether data came from iTunes, JioSaavn, Gaana, or the DB.
  *
  * Routes:
- *   GET  /v1/catalog/search?q=...            - search, returns canonical entities
+ *   GET  /v1/catalog/search?q=...            - parallel multi-provider search (JioSaavn + Gaana)
  *   GET  /v1/catalog/tracks/:id              - canonical track details
  *   GET  /v1/catalog/resolve/:id             - resolve canonical → stream URL
+ *   GET  /v1/catalog/play/:id                - stable playback redirect URL
+ *   GET  /v1/playback/song/:id               - alias for stable playback URL
  *   GET  /v1/home                            - dynamic home feed sections
  */
 
@@ -25,6 +27,7 @@ import {
     getArtistById,
     getAlbumById,
 } from '../services/saavnApi.js';
+import { searchSongsOnly as searchGaanaSongsOnly } from '../services/gaanaApi.js';
 import {
     attachCanonicalIds,
     getTrack,
@@ -100,22 +103,30 @@ router.get('/catalog/search', async (req, res) => {
         const primaryQ = analysis.cleanTitle || rawQ;
         const searchVariants = buildSearchVariants(analysis);
 
-        // JioSaavn search — searchSongsSmart returns Song[], searchSongsOnly returns payload
-        const variantResults = await Promise.all(searchVariants.map(variant =>
-            searchSongsSmart(variant || primaryQ, { preferredLanguages: [], waitForFresh: true })
-                .catch(async () => {
-                    const payload = await searchSongsOnly(variant || primaryQ, page).catch(() => null);
-                    return payload?.data?.results ?? [];
-                })
-        ));
+        // Parallel multi-provider search: JioSaavn variants + Gaana direct
+        const [gaanaResults, ...variantResults] = await Promise.all([
+            searchGaanaSongsOnly(primaryQ, limit).catch(() => []),
+            ...searchVariants.map(variant =>
+                searchSongsSmart(variant || primaryQ, { preferredLanguages: [], waitForFresh: true })
+                    .catch(async () => {
+                        const payload = await searchSongsOnly(variant || primaryQ, page).catch(() => null);
+                        return payload?.data?.results ?? [];
+                    })
+            )
+        ]);
 
-        // Deduplicate → rank
-        let songs = filterRelevantSongs(
-            fuseSongCandidates(variantResults.map((songs, index) => ({
+        const candidateGroups = [
+            { source: 'gaana', weight: 0.90, songs: Array.isArray(gaanaResults) ? gaanaResults : [] },
+            ...variantResults.map((songs, index) => ({
                 source: index === 0 ? 'exact' : `variant:${index}`,
                 weight: Math.max(0.45, 1 - index * 0.15),
                 songs: Array.isArray(songs) ? songs : (songs?.data?.results ?? []),
-            })), analysis),
+            }))
+        ];
+
+        // Deduplicate → rank
+        let songs = filterRelevantSongs(
+            fuseSongCandidates(candidateGroups, analysis),
             analysis,
             { minKeep: Math.min(12, limit) },
         ).slice(0, limit);
@@ -180,7 +191,8 @@ router.get('/catalog/tracks/:id', async (req, res) => {
 
 router.get('/catalog/resolve/:id', async (req, res) => {
     const canonicalId = req.params.id;
-    if (!canonicalId?.startsWith('trk_')) {
+    const hasOverride = !!(req.query.title || req.query.artist);
+    if (!canonicalId?.startsWith('trk_') && !hasOverride) {
         return res.status(400).json({ error: 'Invalid canonical track ID' });
     }
 
@@ -189,15 +201,63 @@ router.get('/catalog/resolve/:id', async (req, res) => {
         const failedUrl = typeof req.query.failedUrl === 'string'
             ? req.query.failedUrl
             : undefined;
-        const result = await resolveStream(canonicalId, { forceRefresh, failedUrl });
+
+        let overrideTrack = null;
+        if (hasOverride) {
+            overrideTrack = {
+                title: req.query.title ?? '',
+                artist_name: req.query.artist ?? '',
+                album_name: req.query.album ?? '',
+                duration_ms: req.query.duration ? (parseInt(req.query.duration, 10) * 1000) : undefined,
+                language: req.query.language ?? ''
+            };
+        }
+
+        const track = overrideTrack || getTrack(canonicalId);
+        const durationSec = track && track.duration_ms ? Math.round(track.duration_ms / 1000) : 0;
+        const result = await resolveStream(canonicalId, { 
+            forceRefresh: forceRefresh || !!overrideTrack, 
+            failedUrl,
+            overrideTrack
+        });
         return res.json({
+            songId: canonicalId,
             canonicalId,
+            metadata: {
+                title: track?.title ?? '',
+                artist: track?.artist_name ?? '',
+                album: track?.album_name ?? '',
+                artwork: track?.artwork_url ?? null,
+                duration: durationSec,
+                language: track?.language ?? null,
+            },
+            playback: {
+                primary: result.provider,
+                primaryUrl: `/api/playback/song/${canonicalId}`,
+                streamUrl: result.url,
+                quality: result.quality,
+                fallback: result.fallbackProvider ?? null,
+                fallbackUrl: result.fallbackUrl ?? null,
+                validationStatus: result.validationStatus ?? 'verified-playable',
+                confidence: result.confidence ?? null,
+                resolvedAt: result.resolvedAt ?? new Date().toISOString(),
+            },
+            title: track?.title ?? '',
+            artist: track?.artist_name ?? '',
+            album: track?.album_name ?? '',
+            duration: durationSec,
             streamUrl: result.url,
             quality:   result.quality,
             provider:  result.provider,
             confidence: result.confidence ?? null,
             resolvedAt: result.resolvedAt ?? new Date().toISOString(),
             validationStatus: result.validationStatus ?? 'cached-or-provider',
+            stream: {
+                provider: result.provider,
+                url: result.url,
+                fallbackProvider: result.fallbackProvider ?? null,
+                fallbackUrl: result.fallbackUrl ?? null,
+            }
         });
     } catch (err) {
         if (err instanceof PlaybackResolveError) {
@@ -208,6 +268,56 @@ router.get('/catalog/resolve/:id', async (req, res) => {
         return res.status(500).json({ error: 'Resolution failed' });
     }
 });
+
+// ─── GET /v1/catalog/play/:id ────────────────────────────────────────────────
+// Stable playback URL redirect endpoint. Audio players stream directly from this.
+
+async function handlePlaybackRedirect(req, res) {
+    const canonicalId = req.params.id;
+    const hasOverride = !!(req.query.title || req.query.artist);
+    if (!canonicalId?.startsWith('trk_') && !hasOverride) {
+        return res.status(400).json({ error: 'Invalid canonical track ID' });
+    }
+
+    try {
+        const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
+        const failedUrl = typeof req.query.failedUrl === 'string' ? req.query.failedUrl : undefined;
+
+        let overrideTrack = null;
+        if (hasOverride) {
+            overrideTrack = {
+                title: req.query.title ?? '',
+                artist_name: req.query.artist ?? '',
+                album_name: req.query.album ?? '',
+                duration_ms: req.query.duration ? (parseInt(req.query.duration, 10) * 1000) : undefined,
+                language: req.query.language ?? ''
+            };
+        }
+
+        const result = await resolveStream(canonicalId, { 
+            forceRefresh: forceRefresh || !!overrideTrack, 
+            failedUrl,
+            overrideTrack
+        });
+
+        if (result.url) {
+            // Redirect to the resolved media stream URL (typically Akamai or JioSaavn CDN)
+            res.redirect(302, result.url);
+        } else {
+            res.status(404).json({ error: 'No playable stream found for this track' });
+        }
+    } catch (err) {
+        if (err instanceof PlaybackResolveError) {
+            const status = err.code === 'NOT_FOUND' ? 404 : 503;
+            return res.status(status).json({ error: err.message, code: err.code });
+        }
+        console.error('[catalog/play]', err);
+        return res.status(500).json({ error: 'Playback resolution failed' });
+    }
+}
+
+router.get('/catalog/play/:id', handlePlaybackRedirect);
+router.get('/playback/song/:id', handlePlaybackRedirect);
 
 // ─── GET /v1/home ─────────────────────────────────────────────────────────────
 // Returns dynamic sections. Each section type is rendered by HomeScreen.

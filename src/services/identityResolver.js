@@ -284,9 +284,10 @@ export function attachCanonicalIds(songs) {
         const provId = song.id ?? song.songId ?? '';
         if (!provId) return { ...song, canonicalId: null };
 
+        const provider = song.provider === 'gaana' ? 'gaana' : 'jiosaavn';
         const meta = _saavnToMeta(song);
         const { canonicalId } = resolveOrCreate(
-            meta, 'jiosaavn', provId,
+            meta, provider, provId,
             song.albumId ?? song.album?.id ?? null,
             song.artistId ?? null,
         );
