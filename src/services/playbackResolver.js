@@ -107,13 +107,23 @@ function _fieldSimilarity(left, right) {
     return bigramSimilarity(a, b);
 }
 
+function _cleanTextForMatch(text) {
+    return normText(text ?? '')
+        .replace(/\b(song|audio|video|full|track|ost|soundtrack|malayalam|tamil|telugu|hindi)\b/gi, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
 function _scoreMatch(canonical, candidate) {
-    const titleMatch = _fieldSimilarity(canonical.title, candidate.name ?? candidate.title);
-    if (titleMatch < 0.72) return 0;
+    const canonicalTitleClean = _cleanTextForMatch(canonical.title);
+    const candidateTitleClean = _cleanTextForMatch(candidate.name ?? candidate.title);
+
+    const titleMatch = _fieldSimilarity(canonicalTitleClean || canonical.title, candidateTitleClean || candidate.name || candidate.title);
+    if (titleMatch < 0.65) return 0;
     if (_versionKind(canonical.title) !== _versionKind(candidate.name ?? candidate.title)) return 0;
 
     const artistMatch = _fieldSimilarity(canonical.artist_name, _songArtist(candidate));
-    if (normText(canonical.artist_name ?? '') && artistMatch < 0.45) return 0;
+    if (normText(canonical.artist_name ?? '') && artistMatch < 0.35) return 0;
 
     const movieMatch = _fieldSimilarity(canonical.album_name, _songAlbum(candidate));
     const languageMatch = _fieldSimilarity(canonical.language, candidate.language);
@@ -121,13 +131,14 @@ function _scoreMatch(canonical, candidate) {
     if (canonical.duration_ms && candidate.duration) {
         const diff = Math.abs(canonical.duration_ms / 1000 - parseInt(candidate.duration, 10));
         if (diff <= 5) durationMatch = 1;
-        else if (diff <= 20) durationMatch = 0.7;
-        else if (diff <= 45) durationMatch = 0.25;
+        else if (diff <= 20) durationMatch = 0.75;
+        else if (diff <= 45) durationMatch = 0.35;
         else return 0;
     }
 
-    return (titleMatch * 0.35 + artistMatch * 0.30 + movieMatch * 0.15 +
-        languageMatch * 0.10 + durationMatch * 0.10) * 100;
+    // Weights: Title 40%, Artist 25%, Album/Movie 20%, Duration 10%, Language 5%
+    return (titleMatch * 0.40 + artistMatch * 0.25 + movieMatch * 0.20 +
+        durationMatch * 0.10 + languageMatch * 0.05) * 100;
 }
 
 function _bestStreamUrl(song) {
@@ -147,7 +158,13 @@ export async function resolveStream(canonicalId, opts = {}) {
     if (opts.forceRefresh || opts.overrideTrack) return resolveReplacementStream(canonicalId, opts);
 
     const cached = getCachedStreamUrl(canonicalId);
-    if (cached) return { ...cached, provider: 'jiosaavn', canonicalId };
+    if (cached) {
+        const isPlayable = await validateUrl(cached.url);
+        if (isPlayable) {
+            return { ...cached, provider: 'jiosaavn', canonicalId, validationStatus: 'cached-verified' };
+        }
+        invalidateStreamCache(canonicalId);
+    }
 
     const track = opts.overrideTrack || getTrack(canonicalId);
     if (!track) throw new PlaybackResolveError(`Unknown canonical ID: ${canonicalId}`, 'NOT_FOUND');
@@ -158,11 +175,31 @@ export async function resolveStream(canonicalId, opts = {}) {
             const response = await getSongById(providerId);
             const stream = _bestStreamUrl(response?.data?.[0] ?? response?.data);
             if (stream && !_isFailedUrl(stream.url)) {
-                cacheStreamUrl(canonicalId, stream.url, stream.quality);
-                return { ...stream, provider: 'jiosaavn', canonicalId };
+                const isPlayable = await validateUrl(stream.url);
+                if (isPlayable) {
+                    cacheStreamUrl(canonicalId, stream.url, stream.quality);
+                    return { ...stream, provider: 'jiosaavn', canonicalId, validationStatus: 'verified-playable' };
+                }
             }
         } catch (_) {
-            // The parallel resolver below is the intended fallback.
+            // Fall through to parallel resolver
+        }
+    }
+
+    const gaanaProviderId = getProviderTrackId(canonicalId, 'gaana');
+    if (gaanaProviderId) {
+        try {
+            const gaanaSong = await getGaanaSongById(gaanaProviderId);
+            const stream = _bestStreamUrl(gaanaSong);
+            if (stream && !_isFailedUrl(stream.url)) {
+                const isPlayable = await validateUrl(stream.url);
+                if (isPlayable) {
+                    cacheStreamUrl(canonicalId, stream.url, stream.quality);
+                    return { ...stream, provider: 'gaana', canonicalId, validationStatus: 'verified-playable' };
+                }
+            }
+        } catch (_) {
+            // Fall through to parallel resolver
         }
     }
 

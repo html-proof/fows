@@ -236,9 +236,10 @@ router.get('/catalog/resolve/:id', async (req, res) => {
                 language: track?.language ?? null,
             },
             playback: {
-                primary: result.provider,
-                primaryUrl: `/api/playback/song/${canonicalId}`,
-                streamUrl: result.url,
+                status: 'ready',
+                provider: result.provider,
+                streamUrl: `/v1/catalog/play/${canonicalId}`,
+                directStreamUrl: result.url,
                 quality: result.quality,
                 fallback: result.fallbackProvider ?? null,
                 fallbackUrl: result.fallbackUrl ?? null,
