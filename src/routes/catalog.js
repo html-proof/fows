@@ -27,7 +27,11 @@ import {
     getArtistById,
     getAlbumById,
 } from '../services/saavnApi.js';
-import { searchSongsOnly as searchGaanaSongsOnly } from '../services/gaanaApi.js';
+import { 
+    searchSongsOnly as searchGaanaSongsOnly,
+    getSongFromUrl,
+    getSongById as getGaanaSongById
+} from '../services/gaanaApi.js';
 import {
     attachCanonicalIds,
     getTrack,
@@ -318,6 +322,32 @@ async function handlePlaybackRedirect(req, res) {
 
 router.get('/catalog/play/:id', handlePlaybackRedirect);
 router.get('/playback/song/:id', handlePlaybackRedirect);
+
+// ─── GET /v1/catalog/gaana (Direct Gaana Link / URL Resolver) ─────────────────
+// Supports direct Gaana URLs (e.g. ?url=https://gaana.com/song/chaleya or ?url=chaleya)
+
+async function handleGaanaDirectUrl(req, res) {
+    const rawUrl = (req.query.url ?? req.query.link ?? req.query.song ?? req.query.q ?? '').trim();
+    if (!rawUrl) {
+        return res.status(400).json({ error: 'url or link query parameter is required' });
+    }
+
+    try {
+        const result = await getSongFromUrl(rawUrl);
+        if (!result.success) {
+            return res.status(404).json({ error: result.error || 'Song not found' });
+        }
+        return res.json(result.data);
+    } catch (err) {
+        console.error('[gaana/url]', err);
+        return res.status(500).json({ error: 'Failed to resolve Gaana song' });
+    }
+}
+
+router.get('/catalog/gaana', handleGaanaDirectUrl);
+router.get('/gaana', handleGaanaDirectUrl);
+router.get('/gaana/result', handleGaanaDirectUrl);
+router.get('/gaana/song', handleGaanaDirectUrl);
 
 // ─── GET /v1/home ─────────────────────────────────────────────────────────────
 // Returns dynamic sections. Each section type is rendered by HomeScreen.
