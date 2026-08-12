@@ -119,7 +119,7 @@ router.get('/search', async (req, res) => {
 
         // Fire songs from each variant + albums + artists in parallel
         const songFetches = searchVariants.map(variant =>
-            searchSongsSmart(variant, { preferredLanguages, waitForFresh: true })
+            searchSongsSmart(variant, { preferredLanguages, waitForFresh: false })
                 .catch(() => [])
         );
 
@@ -223,7 +223,10 @@ router.get('/search', async (req, res) => {
 
             if (matchedAlbum && (matchedAlbum.id || matchedAlbum.url)) {
                 try {
-                    const albumDetail = await getAlbumById(matchedAlbum.id, matchedAlbum.url);
+                    const albumDetail = await Promise.race([
+                        getAlbumById(matchedAlbum.id, matchedAlbum.url),
+                        new Promise((_, reject) => setTimeout(() => reject(new Error('album timeout')), 5000)),
+                    ]);
                     const albumSongs = albumDetail?.data?.songs ?? albumDetail?.data?.list ?? [];
                     if (albumSongs.length > 0) {
                         const ranked = filterRelevantSongs(
