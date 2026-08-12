@@ -97,11 +97,23 @@ export default {
                 try {
                     const body = await clone.json();
                     if (body?.success === false) return; // don't cache failures
-                    const toCache = new Response(JSON.stringify(body), clone);
-                    toCache.headers.set(
+                    // Build clean headers for the cached entry. The clone may carry
+                    // Content-Encoding: gzip (from the backend) but the body we store
+                    // is already decompressed (JSON.stringify produces plain UTF-8).
+                    // Keeping a mismatched Content-Encoding makes clients (Dart's
+                    // IOClient) attempt to gzip-decompress plain JSON and throw
+                    // "FormatException: Missing extension byte".
+                    const cachedHeaders = new Headers(clone.headers);
+                    cachedHeaders.delete('Content-Encoding');
+                    cachedHeaders.set('Content-Type', 'application/json; charset=utf-8');
+                    cachedHeaders.set(
                         'Cache-Control',
                         `public, max-age=60, s-maxage=${edgeTtl}`,
                     );
+                    const toCache = new Response(JSON.stringify(body), {
+                        status: clone.status,
+                        headers: cachedHeaders,
+                    });
                     await cache.put(cacheKey, toCache);
                 } catch (_) { /* non-JSON response — skip caching */ }
             })());
@@ -144,19 +156,27 @@ async function forwardToBackend(request, url) {
         init.body = request.body;
     }
 
+    // 25s timeout: returns a proper 504 instead of dropping the TCP connection.
+    // Without a timeout, Cloudflare's wall-clock limit kills the Worker mid-flight
+    // and the client sees "Connection closed before full header was received".
+    init.signal = AbortSignal.timeout(25000);
+
     try {
         const response = await fetch(backendUrl.toString(), init);
         const newHeaders = new Headers(response.headers);
         newHeaders.set('Access-Control-Allow-Origin', '*');
-        newHeaders.set('Vary', 'Accept-Encoding');
         return new Response(response.body, {
             status:  response.status,
             headers: newHeaders,
         });
     } catch (err) {
+        const isTimeout = err.name === 'TimeoutError' || err.name === 'AbortError';
         return new Response(
-            JSON.stringify({ error: 'Gateway error', detail: err.message }),
-            { status: 502, headers: { 'Content-Type': 'application/json' } },
+            JSON.stringify({ error: isTimeout ? 'Gateway timeout' : 'Gateway error', detail: err.message }),
+            {
+                status: isTimeout ? 504 : 502,
+                headers: { 'Content-Type': 'application/json' },
+            },
         );
     }
 }
