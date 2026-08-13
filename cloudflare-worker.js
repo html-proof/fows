@@ -25,6 +25,10 @@ const PRIVATE_PREFIXES = [
     '/api/activity',
     '/api/recommendations',
     '/api/playlist',
+    '/api/player/resolve',
+    '/api/stream',
+    '/v1/player/resolve',
+    '/v1/stream',
     '/api/songs/',        // /api/songs/:id/stream must not be cached as a static GET
     '/v1/catalog/play',   // stream redirects must not be cached as static GET
 ];
