@@ -1215,7 +1215,7 @@ router.get('/songs/:id/recommendations', async (req, res) => {
             }
         }
 
-        res.json({ success: true, data: recommendations.slice(0, limit) });
+        res.json({ success: true, data: attachCanonicalIds(recommendations.slice(0, limit)) });
     } catch (error) {
         console.error('Recommendations error:', error.message);
         res.status(500).json({ error: 'Internal server error' });
