@@ -32,7 +32,14 @@ import { rerankSongsForUser } from '../services/personalizationModel.js';
 import { attachCanonicalIds } from '../services/identityResolver.js';
 import { resolveStream } from '../services/playbackResolver.js';
 import { validatePlayableStream } from '../services/streamValidator.js';
-import { normalizeSongMetadata, normalizeSongList } from '../services/metadataService.js';
+import {
+    normalizeSongMetadata,
+    normalizeSongList,
+    normalizeAlbumMetadata,
+    normalizeAlbumList,
+    normalizeArtistMetadata,
+    normalizeArtistList,
+} from '../services/metadataService.js';
 
 const router = Router();
 const DEFAULT_LIMIT = 40;
@@ -267,12 +274,16 @@ router.get('/search', async (req, res) => {
 
         const songsOut = normalizeSongList(attachCanonicalIds(finalRanked.slice(0, limit)));
 
-        const albumsOut = albumsData.status === 'fulfilled'
-            ? (albumsData.value?.data?.results ?? []).slice(0, ALBUM_LIMIT)
-            : [];
-        const artistsOut = artistsData.status === 'fulfilled'
-            ? (artistsData.value?.data?.results ?? []).slice(0, ALBUM_LIMIT)
-            : [];
+        const albumsOut = normalizeAlbumList(
+            albumsData.status === 'fulfilled'
+                ? (albumsData.value?.data?.results ?? []).slice(0, ALBUM_LIMIT)
+                : []
+        );
+        const artistsOut = normalizeArtistList(
+            artistsData.status === 'fulfilled'
+                ? (artistsData.value?.data?.results ?? []).slice(0, ALBUM_LIMIT)
+                : []
+        );
 
         // ── Step 5: Resolve top result using engine scoring ──────────────────
         const topResult = engineResolveTopResult({
@@ -902,6 +913,11 @@ function trimUserLanguageCache() {
 router.get('/songs/:id', async (req, res) => {
     try {
         const data = await getSongById(req.params.id);
+        if (data?.data && Array.isArray(data.data)) {
+            data.data = normalizeSongList(data.data);
+        } else if (data?.data && typeof data.data === 'object') {
+            data.data = normalizeSongMetadata(data.data);
+        }
         res.json(data);
     } catch (error) {
         console.error('Song API error:', error.message);
@@ -978,6 +994,13 @@ router.get('/albums', async (req, res) => {
                     ...data.data,
                     songs: attachCanonicalIds(data.data.songs),
                 },
+            };
+        }
+
+        if (data?.data) {
+            data = {
+                success: true,
+                data: normalizeAlbumMetadata(data.data),
             };
         }
 
@@ -1073,8 +1096,14 @@ router.get('/albums/by-link', async (req, res) => {
     try {
         const { link } = req.query;
         if (!link) return res.status(400).json({ error: '"link" parameter is required' });
-        const data = await getAlbumById(null, link);
+        let data = await getAlbumById(null, link);
         if (!data?.data?.name) return res.status(404).json({ error: 'Album not found' });
+        if (data?.data) {
+            data = {
+                success: true,
+                data: normalizeAlbumMetadata(data.data),
+            };
+        }
         res.json(data);
     } catch (error) {
         console.error('Album by-link error:', error.message);

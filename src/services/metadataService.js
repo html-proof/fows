@@ -172,3 +172,145 @@ export function normalizeSongList(songs) {
         .map(song => normalizeSongMetadata(song))
         .filter(Boolean);
 }
+
+/**
+ * Normalize an album metadata object into the single canonical schema.
+ */
+export function normalizeAlbumMetadata(rawAlbum) {
+    if (!rawAlbum || typeof rawAlbum !== 'object') return null;
+
+    const id = String(rawAlbum.id || rawAlbum.albumId || rawAlbum.album_id || '').trim();
+    const name = String(rawAlbum.name || rawAlbum.title || rawAlbum.album || 'Unknown Album').trim();
+
+    let artist = '';
+    if (Array.isArray(rawAlbum.artists?.primary)) {
+        artist = rawAlbum.artists.primary.map(a => a.name || '').filter(Boolean).join(', ');
+    } else if (Array.isArray(rawAlbum.primaryArtists)) {
+        artist = rawAlbum.primaryArtists.map(a => typeof a === 'string' ? a : a.name || '').filter(Boolean).join(', ');
+    } else if (typeof rawAlbum.primaryArtists === 'string') {
+        artist = rawAlbum.primaryArtists.trim();
+    } else if (typeof rawAlbum.artist === 'string') {
+        artist = rawAlbum.artist.trim();
+    } else if (typeof rawAlbum.artist_name === 'string') {
+        artist = rawAlbum.artist_name.trim();
+    }
+
+    let imageUrl = '';
+    if (typeof rawAlbum.artwork_max === 'string' && rawAlbum.artwork_max.trim()) {
+        imageUrl = rawAlbum.artwork_max.trim();
+    } else if (typeof rawAlbum.artworkUrl === 'string' && rawAlbum.artworkUrl.trim()) {
+        imageUrl = rawAlbum.artworkUrl.trim();
+    } else if (typeof rawAlbum.artwork === 'string' && rawAlbum.artwork.trim()) {
+        imageUrl = rawAlbum.artwork.trim();
+    } else if (Array.isArray(rawAlbum.image) && rawAlbum.image.length > 0) {
+        const found500 = rawAlbum.image.find(img => img?.quality === '500x500' || img?.quality === 'high');
+        const candidate = found500?.url
+            || (typeof rawAlbum.image[rawAlbum.image.length - 1] === 'string' ? rawAlbum.image[rawAlbum.image.length - 1] : rawAlbum.image[rawAlbum.image.length - 1]?.url)
+            || (typeof rawAlbum.image[0] === 'string' ? rawAlbum.image[0] : rawAlbum.image[0]?.url)
+            || '';
+        imageUrl = String(candidate).trim();
+    } else if (typeof rawAlbum.imageUrl === 'string') {
+        imageUrl = rawAlbum.imageUrl.trim();
+    } else if (typeof rawAlbum.image === 'string') {
+        imageUrl = rawAlbum.image.trim();
+    }
+
+    if (!imageUrl && Array.isArray(rawAlbum.songs) && rawAlbum.songs.length > 0) {
+        const firstSong = rawAlbum.songs[0];
+        if (typeof firstSong.imageUrl === 'string' && firstSong.imageUrl.trim()) {
+            imageUrl = firstSong.imageUrl.trim();
+        } else if (typeof firstSong.artwork === 'string' && firstSong.artwork.trim()) {
+            imageUrl = firstSong.artwork.trim();
+        } else if (Array.isArray(firstSong.image) && firstSong.image.length > 0) {
+            const found500 = firstSong.image.find(img => img?.quality === '500x500' || img?.quality === 'high');
+            const candidate = found500?.url
+                || (typeof firstSong.image[firstSong.image.length - 1] === 'string' ? firstSong.image[firstSong.image.length - 1] : firstSong.image[firstSong.image.length - 1]?.url)
+                || (typeof firstSong.image[0] === 'string' ? firstSong.image[0] : firstSong.image[0]?.url)
+                || '';
+            imageUrl = String(candidate).trim();
+        }
+    }
+
+    if (imageUrl.startsWith('http://')) {
+        imageUrl = imageUrl.replace(/^http:\/\//, 'https://');
+    }
+    if (imageUrl.includes('50x50.jpg') || imageUrl.includes('150x150.jpg')) {
+        imageUrl = imageUrl.replace(/(50x50|150x150)\.jpg/g, '500x500.jpg');
+    }
+
+    const year = rawAlbum.year ? String(rawAlbum.year) : (rawAlbum.release_year ? String(rawAlbum.release_year) : null);
+    const songCount = Number(rawAlbum.songCount || rawAlbum.song_count || (Array.isArray(rawAlbum.songs) ? rawAlbum.songs.length : 0)) || 0;
+    const songs = Array.isArray(rawAlbum.songs) ? normalizeSongList(rawAlbum.songs) : [];
+
+    return {
+        id,
+        name,
+        title: name,
+        artist: artist || 'Various Artists',
+        primaryArtists: artist || 'Various Artists',
+        year,
+        language: rawAlbum.language || null,
+        songCount: songCount || songs.length,
+        imageUrl,
+        artwork: imageUrl,
+        image: Array.isArray(rawAlbum.image)
+            ? rawAlbum.image
+            : (imageUrl ? [{ quality: '500x500', url: imageUrl }] : []),
+        songs,
+        type: rawAlbum.type || rawAlbum.header_desc || 'album',
+        url: rawAlbum.url || rawAlbum.perma_url || null,
+    };
+}
+
+export function normalizeAlbumList(albums) {
+    if (!Array.isArray(albums)) return [];
+    return albums.map(a => normalizeAlbumMetadata(a)).filter(Boolean);
+}
+
+/**
+ * Normalize artist metadata into canonical schema.
+ */
+export function normalizeArtistMetadata(rawArtist) {
+    if (!rawArtist || typeof rawArtist !== 'object') return null;
+
+    const id = String(rawArtist.id || rawArtist.artistId || rawArtist.artist_id || '').trim();
+    const name = String(rawArtist.name || rawArtist.title || 'Unknown Artist').trim();
+
+    let imageUrl = '';
+    if (Array.isArray(rawArtist.image) && rawArtist.image.length > 0) {
+        const found500 = rawArtist.image.find(img => img?.quality === '500x500' || img?.quality === 'high');
+        const candidate = found500?.url
+            || (typeof rawArtist.image[rawArtist.image.length - 1] === 'string' ? rawArtist.image[rawArtist.image.length - 1] : rawArtist.image[rawArtist.image.length - 1]?.url)
+            || (typeof rawArtist.image[0] === 'string' ? rawArtist.image[0] : rawArtist.image[0]?.url)
+            || '';
+        imageUrl = String(candidate).trim();
+    } else if (typeof rawArtist.imageUrl === 'string') {
+        imageUrl = rawArtist.imageUrl.trim();
+    } else if (typeof rawArtist.image === 'string') {
+        imageUrl = rawArtist.image.trim();
+    }
+
+    if (imageUrl.startsWith('http://')) {
+        imageUrl = imageUrl.replace(/^http:\/\//, 'https://');
+    }
+    if (imageUrl.includes('50x50.jpg') || imageUrl.includes('150x150.jpg')) {
+        imageUrl = imageUrl.replace(/(50x50|150x150)\.jpg/g, '500x500.jpg');
+    }
+
+    return {
+        id,
+        name,
+        role: rawArtist.role || 'artist',
+        imageUrl,
+        image: Array.isArray(rawArtist.image)
+            ? rawArtist.image
+            : (imageUrl ? [{ quality: '500x500', url: imageUrl }] : []),
+        followerCount: Number(rawArtist.followerCount || rawArtist.follower_count || 0),
+        isRadioPresent: Boolean(rawArtist.isRadioPresent || rawArtist.is_radio_present),
+    };
+}
+
+export function normalizeArtistList(artists) {
+    if (!Array.isArray(artists)) return [];
+    return artists.map(a => normalizeArtistMetadata(a)).filter(Boolean);
+}
