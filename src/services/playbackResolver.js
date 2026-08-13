@@ -109,7 +109,12 @@ function _scoreCandidate(targetTitle, targetArtist, candidate) {
     const candArtist = normText(_songArtist(candidate));
     const titleSim = bigramSimilarity(normText(targetTitle || ''), candTitle);
     const artistSim = targetArtist ? bigramSimilarity(normText(targetArtist), candArtist) : 0.6;
-    return titleSim * 0.7 + artistSim * 0.3;
+    let score = titleSim * 0.7 + artistSim * 0.3;
+    // Boost direct progressive download candidates (JioSaavn MP4/AAC) for instant universal compatibility
+    if (Array.isArray(candidate?.downloadUrl) && candidate.downloadUrl.length > 0) {
+        score += 0.20;
+    }
+    return score;
 }
 
 /**
@@ -224,8 +229,14 @@ async function _resolveBySearch(title, artist = '', album = '') {
             });
 
             const probeResults = await Promise.all(probePromises);
-            const valid = probeResults.find(r => r !== null);
-            if (valid) return valid;
+            const validResults = probeResults.filter(r => r !== null);
+            validResults.sort((a, b) => {
+                // Prefer non-HLS (direct progressive MP4/AAC) over HLS .m3u8 for instant mobile playback
+                if (!a.isHls && b.isHls) return -1;
+                if (a.isHls && !b.isHls) return 1;
+                return 0;
+            });
+            if (validResults.length > 0) return validResults[0];
         } catch (_) {}
     }
 
