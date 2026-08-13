@@ -300,8 +300,23 @@ export async function resolvePlayableStream(params = {}) {
         let winner = await _resolveDirectById(songId);
 
         // Step B: Fallback search if direct lookup gave no playable stream
-        if (!winner && (songTitle.length > 0 || songArtist.length > 0)) {
-            winner = await _resolveBySearch(songTitle || songId, songArtist, songAlbum);
+        if (!winner) {
+            let searchTitle = songTitle;
+            let searchArtist = songArtist;
+            let searchAlbum = songAlbum;
+
+            if (!searchTitle && songId) {
+                const dbTrack = await getTrack(songId).catch(() => null);
+                if (dbTrack) {
+                    searchTitle = dbTrack.title || dbTrack.name || '';
+                    searchArtist = dbTrack.artist || '';
+                    searchAlbum = dbTrack.album || '';
+                }
+            }
+
+            if (searchTitle.length > 0 || searchArtist.length > 0) {
+                winner = await _resolveBySearch(searchTitle, searchArtist, searchAlbum);
+            }
         }
 
         if (!winner || !winner.streamUrl) {
