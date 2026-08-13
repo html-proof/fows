@@ -3,11 +3,12 @@
  *
  * What this does:
  *  - Routes all requests through Cloudflare's 300+ global edge nodes
- *  - Caches GET responses at the edge (honoring Cache-Control and avoiding empty result pollution)
+ *  - Passes through Range headers & 206 Partial Content for streaming audio byte probes & seeking
+ *  - Unconditionally bypasses edge caching for stream resolvers (/api/stream/resolve) and stream proxies
+ *  - Caches catalog & search responses at the edge with proper TTLs
  *  - Supports full CORS preflight (OPTIONS)
- *  - Passes through Range headers for streaming audio byte probes
- *  - Keeps the Render backend warm with periodic pings (avoids cold-start delays)
- *  - Adds Brotli/Gzip compression automatically at the edge
+ *  - Keeps the Render backend warm with periodic pings
+ *  - Adds Brotli/Gzip compression for non-range JSON/API payloads
  *
  * Deploy steps:
  *  1. Go to https://dash.cloudflare.com → Workers & Pages → Create Worker
@@ -19,7 +20,7 @@
 
 const BACKEND_URL = 'https://fows.onrender.com';
 
-// Routes that must never be cached (user-specific, streaming audio, or write operations)
+// Routes that must never be cached at the edge (user-specific, stream resolving, or proxy audio)
 const PRIVATE_PREFIXES = [
     '/api/user',
     '/api/activity',
@@ -44,7 +45,6 @@ const EDGE_CACHE_TTLS = {
     '/v1/home':            300,   // 5 min
     '/v1/catalog/search':  600,   // 10 min
     '/v1/catalog/tracks':  86400, // 24 h
-    '/v1/catalog/resolve': 1800,  // 30 min — stream URLs expire
 };
 
 function getEdgeTtl(pathname) {
@@ -55,8 +55,14 @@ function getEdgeTtl(pathname) {
 }
 
 function isPrivate(pathname) {
-    // Specifically allow /api/songs?id=... but bypass /api/songs/:id/stream
-    if (pathname.includes('/stream') || pathname.includes('/play/')) return true;
+    if (
+        pathname.includes('/stream') ||
+        pathname.includes('/play/') ||
+        pathname.includes('/resolve') ||
+        pathname.endsWith('/stream')
+    ) {
+        return true;
+    }
     return PRIVATE_PREFIXES.some(p => pathname.startsWith(p));
 }
 
@@ -88,6 +94,7 @@ export default {
     async fetch(request, _env, ctx) {
         const url = new URL(request.url);
         const pathname = url.pathname;
+        const hasRangeHeader = request.headers.has('range');
 
         // 1. Handle CORS Pre-flight (OPTIONS)
         if (request.method === 'OPTIONS') {
@@ -96,15 +103,15 @@ export default {
                 headers: {
                     'Access-Control-Allow-Origin': '*',
                     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS, HEAD',
-                    'Access-Control-Allow-Headers': 'Authorization, Content-Type, Range, Cache-Control, Accept, X-Forwarded-For, X-Requested-With',
-                    'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, X-Cache',
+                    'Access-Control-Allow-Headers': 'Authorization, Content-Type, Range, Cache-Control, Accept, X-Forwarded-For, X-Requested-With, Origin, User-Agent',
+                    'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, Content-Type, X-Cache',
                     'Access-Control-Max-Age': '86400',
                 },
             });
         }
 
-        // 2. Only cache GET requests; pass everything else straight through
-        if (request.method !== 'GET' || isPrivate(pathname)) {
+        // 2. Only cache GET requests without Range headers; pass everything else straight through
+        if (request.method !== 'GET' || isPrivate(pathname) || hasRangeHeader) {
             return forwardToBackend(request, url);
         }
 
@@ -127,13 +134,14 @@ export default {
                 const response = new Response(cached.body, cached);
                 response.headers.set('X-Cache', 'HIT');
                 response.headers.set('Access-Control-Allow-Origin', '*');
+                response.headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges, Content-Type, X-Cache');
                 return response;
             }
         }
 
         // Cache miss — fetch from backend and store.
         const backendResponse = await forwardToBackend(request, url);
-        if (backendResponse.ok) {
+        if (backendResponse.ok && backendResponse.status === 200) {
             const clone = backendResponse.clone();
             ctx.waitUntil((async () => {
                 try {
@@ -149,6 +157,7 @@ export default {
                         `public, max-age=60, s-maxage=${edgeTtl}`,
                     );
                     cachedHeaders.set('Access-Control-Allow-Origin', '*');
+                    cachedHeaders.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges, Content-Type, X-Cache');
                     const toCache = new Response(JSON.stringify(body), {
                         status: clone.status,
                         headers: cachedHeaders,
@@ -161,6 +170,7 @@ export default {
         const response = new Response(backendResponse.body, backendResponse);
         response.headers.set('X-Cache', 'MISS');
         response.headers.set('Access-Control-Allow-Origin', '*');
+        response.headers.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges, Content-Type, X-Cache');
         return response;
     },
 
@@ -184,7 +194,12 @@ async function forwardToBackend(request, url) {
 
     const headers = new Headers(request.headers);
     headers.set('X-Forwarded-Host', url.hostname);
-    headers.set('Accept-Encoding', 'gzip, br');
+
+    // If client requested byte ranges, do NOT force compression encoding
+    // (compression breaks Range chunking and Content-Range calculation)
+    if (!request.headers.has('range')) {
+        headers.set('Accept-Encoding', 'gzip, br');
+    }
 
     const init = {
         method: request.method,
@@ -205,8 +220,8 @@ async function forwardToBackend(request, url) {
         const newHeaders = new Headers(response.headers);
         newHeaders.set('Access-Control-Allow-Origin', '*');
         newHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, HEAD');
-        newHeaders.set('Access-Control-Allow-Headers', 'Authorization, Content-Type, Range, Cache-Control, Accept');
-        newHeaders.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges, X-Cache');
+        newHeaders.set('Access-Control-Allow-Headers', 'Authorization, Content-Type, Range, Cache-Control, Accept, Origin, User-Agent');
+        newHeaders.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges, Content-Type, X-Cache');
 
         return new Response(response.body, {
             status: response.status,

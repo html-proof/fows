@@ -1,182 +1,101 @@
 import express from 'express';
 import { request } from 'undici';
-import { getSongDirect, searchSongsDirect } from '../services/jiosaavnDirect.js';
-import { getSongById as getSaavnSongById } from '../services/saavnApi.js';
-import { getSongById as getGaanaSongById, searchSongsOnly as searchGaanaSongsOnly } from '../services/gaanaApi.js';
-import { getSpoofedHeaders } from '../middleware/spoofHeaders.js';
+import {
+    resolvePlayableStream,
+    getCachedStream,
+    PlaybackResolveError,
+} from '../services/playbackResolver.js';
+import { getHeadersForStreamUrl } from '../services/streamValidator.js';
 
 const router = express.Router();
 
-// Fast memory cache for resolved stream URLs
-const resolvedUrlCache = new Map();
-const URL_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+// ─── POST & GET /resolve (Stream Resolution Endpoint) ────────────────────────
+// Request Body / Query: { id, title, artist, album, language }
+// Returns validated direct streamUrl, proxyUrl, headers, and metadata.
 
-function getCachedUrl(songId) {
-    const entry = resolvedUrlCache.get(songId);
-    if (!entry) return null;
-    if (Date.now() > entry.expiresAt) {
-        resolvedUrlCache.delete(songId);
-        return null;
+async function handleStreamResolve(req, res) {
+    const params = {
+        id: req.body?.id || req.query?.id || '',
+        title: req.body?.title || req.query?.title || req.query?.q || '',
+        artist: req.body?.artist || req.query?.artist || '',
+        album: req.body?.album || req.query?.album || '',
+        language: req.body?.language || req.query?.language || '',
+    };
+
+    if (!params.id && !params.title) {
+        return res.status(400).json({
+            success: false,
+            error: 'Song ID or title is required for stream resolution',
+            code: 'BAD_REQUEST',
+        });
     }
-    return entry.url;
-}
 
-function setCachedUrl(songId, url) {
-    resolvedUrlCache.set(songId, {
-        url,
-        expiresAt: Date.now() + URL_CACHE_TTL_MS,
-    });
-}
-
-function _extractDownloadUrl(song) {
-    if (!song) return null;
-    const urls = Array.isArray(song.downloadUrl) ? song.downloadUrl : [];
-    return urls.find(u => u.quality === '320kbps')?.url
-        || urls.find(u => u.quality === '160kbps')?.url
-        || urls[urls.length - 1]?.url
-        || song.streamUrl
-        || song.stream_url
-        || null;
-}
-
-/**
- * Validate that an upstream URL is active, returns HTTP 200/206, and has an audio/stream content-type.
- * Fast 1.5s probe timeout to never block playback.
- */
-async function validateStreamUrl(url) {
-    if (!url || typeof url !== 'string' || !url.startsWith('http')) {
-        return false;
-    }
     try {
-        const outboundHeaders = getSpoofedHeaders('stream', {
-            'Range': 'bytes=0-1023',
+        const resolved = await resolvePlayableStream(params);
+        return res.json({
+            success: true,
+            data: resolved,
         });
-        const res = await request(url, {
-            method: 'GET',
-            headers: outboundHeaders,
-            headersTimeout: 2000,
-            bodyTimeout: 2000,
-        });
-
-        const status = res.statusCode;
-        const contentType = (res.headers['content-type'] ?? '').toLowerCase();
-
-        const isValidStatus = status === 200 || status === 206;
-        const isValidContentType =
-            contentType.startsWith('audio/') ||
-            contentType.startsWith('video/mp4') ||
-            contentType.includes('mp4') ||
-            contentType.includes('mpeg') ||
-            contentType.includes('x-mpegurl') ||
-            contentType.includes('vnd.apple.mpegurl') ||
-            contentType.includes('octet-stream');
-
-        await res.body.dump();
-        return isValidStatus && isValidContentType;
-    } catch {
-        return false;
-    }
-}
-
-/**
- * Fast parallel upstream playable audio URL resolver.
- */
-async function resolveUpstreamAudioUrl(songId, queryHint = '', songTitle = '', songArtist = '') {
-    // 1. Check memory cache first (instant 0ms)
-    const cached = getCachedUrl(songId);
-    if (cached) return cached;
-
-    // 2. Parallel direct lookups on JioSaavn and Gaana
-    const [jioRes, gaanaRes] = await Promise.allSettled([
-        (async () => {
-            const jioSong = await getSongDirect(songId).catch(() => null)
-                || await getSaavnSongById(songId).then(r => r?.data?.[0]).catch(() => null);
-            const jioUrl = _extractDownloadUrl(jioSong);
-            if (jioUrl && await validateStreamUrl(jioUrl)) {
-                return jioUrl;
-            }
-            return null;
-        })(),
-        (async () => {
-            const gaanaDetail = await getGaanaSongById(songId).catch(() => null);
-            const gaanaSong = gaanaDetail?.data?.[0];
-            const gaanaUrl = _extractDownloadUrl(gaanaSong);
-            if (gaanaUrl && await validateStreamUrl(gaanaUrl)) {
-                return gaanaUrl;
-            }
-            return null;
-        })(),
-    ]);
-
-    const directWinner = (jioRes.status === 'fulfilled' ? jioRes.value : null)
-        || (gaanaRes.status === 'fulfilled' ? gaanaRes.value : null);
-
-    if (directWinner) {
-        setCachedUrl(songId, directWinner);
-        return directWinner;
-    }
-
-    // 3. Fallback parallel search if direct lookups yielded no stream
-    const searchTarget = [songTitle, songArtist, queryHint, songId.replace(/[-_]/g, ' ')].filter(Boolean)[0] || '';
-    if (searchTarget.length > 1) {
-        try {
-            const [jioResults, gaanaResults] = await Promise.allSettled([
-                searchSongsDirect(searchTarget, 5),
-                searchGaanaSongsOnly(searchTarget, 5),
-            ]);
-
-            const jioSongs = jioResults.status === 'fulfilled' && Array.isArray(jioResults.value) ? jioResults.value : [];
-            const gaanaSongs = gaanaResults.status === 'fulfilled' && Array.isArray(gaanaResults.value) ? gaanaResults.value : [];
-            const candidates = [...gaanaSongs, ...jioSongs];
-
-            // Probe top candidates in parallel
-            const probePromises = candidates.map(async (cand) => {
-                const candUrl = _extractDownloadUrl(cand);
-                if (candUrl && await validateStreamUrl(candUrl)) {
-                    return candUrl;
-                }
-                return null;
+    } catch (err) {
+        if (err instanceof PlaybackResolveError) {
+            const status = err.code === 'BAD_REQUEST' ? 400 : 404;
+            return res.status(status).json({
+                success: false,
+                error: err.message,
+                code: err.code,
             });
-
-            const results = await Promise.all(probePromises);
-            const validWinner = results.find(url => url !== null);
-            if (validWinner) {
-                setCachedUrl(songId, validWinner);
-                return validWinner;
-            }
-        } catch (_) {}
+        }
+        console.error('[stream/resolve] Error:', err);
+        return res.status(500).json({
+            success: false,
+            error: 'Failed to resolve playable stream',
+            code: 'RESOLVER_ERROR',
+        });
     }
-
-    return null;
 }
 
-/**
- * Stream proxy handler supporting byte-range requests (GET /stream/:songId)
- */
-async function handleStreamRequest(req, res) {
-    const songId = req.params.songId;
-    const queryHint = req.query.title || req.query.q || '';
-    const songTitle = req.query.title || '';
-    const songArtist = req.query.artist || '';
+router.post('/resolve', handleStreamResolve);
+router.get('/resolve', handleStreamResolve);
 
-    if (!songId) {
+// ─── GET & HEAD /:songId (Byte-Range Audio Proxy) ─────────────────────────────
+// Supports HTTP Range header (bytes=start-end) for mobile audio buffering & seeking.
+
+async function handleStreamProxy(req, res) {
+    const songId = req.params.songId;
+    if (!songId || songId === 'resolve') {
         return res.status(400).json({ error: 'Song ID is required' });
     }
 
-    // 1. Fast parallel resolution
-    const realAudioUrl = await resolveUpstreamAudioUrl(songId, queryHint, songTitle, songArtist);
-    if (!realAudioUrl) {
-        return res.status(404).json({
-            error: 'Unable to resolve playable audio stream for this song',
-            code: 'STREAM_NOT_FOUND',
-        });
+    const queryHint = req.query.title || req.query.q || '';
+    const songTitle = req.query.title || '';
+    const songArtist = req.query.artist || '';
+    const songAlbum = req.query.album || '';
+
+    let streamData = getCachedStream(songId);
+
+    if (!streamData || !streamData.streamUrl) {
+        try {
+            streamData = await resolvePlayableStream({
+                id: songId,
+                title: songTitle || queryHint,
+                artist: songArtist,
+                album: songAlbum,
+            });
+        } catch (err) {
+            return res.status(404).json({
+                error: 'Stream expired or not found',
+                code: 'STREAM_NOT_FOUND',
+                detail: err.message,
+            });
+        }
     }
 
-    // 2. Forward Range headers
+    const realAudioUrl = streamData.streamUrl;
     const rangeHeader = req.headers['range'];
-    const outboundHeaders = getSpoofedHeaders('stream', {
+    const outboundHeaders = {
+        ...getHeadersForStreamUrl(realAudioUrl),
         ...(rangeHeader ? { 'Range': rangeHeader } : {}),
-    });
+    };
 
     try {
         const upstreamRes = await request(realAudioUrl, {
@@ -184,17 +103,19 @@ async function handleStreamRequest(req, res) {
             headers: outboundHeaders,
             headersTimeout: 6000,
             bodyTimeout: 30000,
+            maxRedirections: 3,
         });
 
         const statusCode = upstreamRes.statusCode;
         const headers = upstreamRes.headers;
 
+        // Set streaming CORS & Range headers
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
         res.setHeader('Access-Control-Allow-Headers', 'Range, Accept, Content-Type');
         res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges');
         res.setHeader('Accept-Ranges', 'bytes');
-        res.setHeader('Cache-Control', 'public, max-age=3600');
+        res.setHeader('Cache-Control', 'public, max-age=1800');
 
         if (headers['content-type']) {
             res.setHeader('Content-Type', headers['content-type']);
@@ -235,7 +156,7 @@ async function handleStreamRequest(req, res) {
     }
 }
 
-router.get('/:songId', handleStreamRequest);
-router.head('/:songId', handleStreamRequest);
+router.get('/:songId', handleStreamProxy);
+router.head('/:songId', handleStreamProxy);
 
 export default router;
