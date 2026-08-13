@@ -61,11 +61,18 @@ const db = admin.database();
 const firestore = admin.firestore();
 const auth = admin.auth();
 
-if (process.env.DEBUG) {
-    admin.app().options.credential.getAccessToken()
-        .then(() => console.log('✅ Firebase Admin credential verified.'))
-        .catch(err => console.error('Firebase Admin warning:', err?.message ?? err));
-}
+admin.app().options.credential.getAccessToken()
+    .then(() => console.log('✅ Firebase Admin credential verified (OAuth2 token obtained).'))
+    .catch(err => {
+        console.error(
+            '❌ Firebase Admin credential FAILED to obtain an OAuth2 token.',
+            '\n   Likely causes:',
+            '\n   1. FIREBASE_SERVICE_ACCOUNT private_key has escaped \\\\n — check Render env var encoding.',
+            '\n   2. The service account has been deleted or its key revoked in GCP Console.',
+            '\n   3. Render cannot reach oauth2.googleapis.com (transient network issue — will retry automatically).',
+            '\n   Error:', err?.message ?? err,
+        );
+    });
 
 export { admin, db, firestore, auth };
 export default admin;
