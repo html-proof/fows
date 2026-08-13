@@ -3,9 +3,11 @@
  *
  * What this does:
  *  - Routes all requests through Cloudflare's 300+ global edge nodes
- *  - Caches GET responses at the edge (honoring Cache-Control from the backend)
+ *  - Caches GET responses at the edge (honoring Cache-Control and avoiding empty result pollution)
+ *  - Supports full CORS preflight (OPTIONS)
+ *  - Passes through Range headers for streaming audio byte probes
  *  - Keeps the Render backend warm with periodic pings (avoids cold-start delays)
- *  - Adds Brotli compression automatically (Cloudflare handles this at the edge)
+ *  - Adds Brotli/Gzip compression automatically at the edge
  *
  * Deploy steps:
  *  1. Go to https://dash.cloudflare.com → Workers & Pages → Create Worker
@@ -13,29 +15,29 @@
  *  3. Click Deploy — you get a URL like https://music-hub.YOUR-NAME.workers.dev
  *  4. Update BACKEND_URL below if your Render URL ever changes
  *  5. Update baseUrl in lib/services/api_service.dart to your workers.dev URL
- *
- * Optional — keep Render warm (prevents 15-20s cold starts):
- *  In the Worker dashboard → Triggers → Cron Triggers → Add: * /10 * * * *
- *  (runs every 10 minutes; Render free tier sleeps after 15 min of inactivity)
  */
 
 const BACKEND_URL = 'https://fows.onrender.com';
 
-// Routes that must never be cached (user-specific or write operations)
+// Routes that must never be cached (user-specific, streaming audio, or write operations)
 const PRIVATE_PREFIXES = [
     '/api/user',
     '/api/activity',
     '/api/recommendations',
     '/api/playlist',
+    '/api/songs/',        // /api/songs/:id/stream must not be cached as a static GET
+    '/v1/catalog/play',   // stream redirects must not be cached as static GET
 ];
 
 // Cache TTLs (seconds) for edge caching — overrides backend headers when needed
 const EDGE_CACHE_TTLS = {
-    '/api/songs':    86400,  // 24 h  — song metadata is stable
-    '/api/albums':   21600,  // 6 h
-    '/api/artists':  7200,   // 2 h
-    '/api/search':   600,    // 10 min
-    '/api/trending': 600,    // 10 min
+    '/api/songs':          86400, // 24 h — song metadata is stable
+    '/api/albums':         21600, // 6 h
+    '/api/artists':        7200,  // 2 h
+    '/api/search':         600,   // 10 min
+    '/api/trending':       600,   // 10 min
+    '/v1/home':            300,   // 5 min
+    '/v1/catalog/search':  600,   // 10 min
     '/v1/catalog/tracks':  86400, // 24 h
     '/v1/catalog/resolve': 1800,  // 30 min — stream URLs expire
 };
@@ -48,7 +50,32 @@ function getEdgeTtl(pathname) {
 }
 
 function isPrivate(pathname) {
+    // Specifically allow /api/songs?id=... but bypass /api/songs/:id/stream
+    if (pathname.includes('/stream') || pathname.includes('/play/')) return true;
     return PRIVATE_PREFIXES.some(p => pathname.startsWith(p));
+}
+
+function isPayloadEmpty(body) {
+    if (!body || typeof body !== 'object') return true;
+    if (body.success === false) return true;
+
+    const data = body.data;
+    if (!data) return true;
+
+    // Direct arrays (e.g. songs or albums)
+    if (Array.isArray(data) && data.length === 0) return true;
+
+    // Nested structures (e.g. search responses with { songs: [], albums: [], artists: [] })
+    if (Array.isArray(data.results) && data.results.length === 0) return true;
+    if (
+        Array.isArray(data.songs) && data.songs.length === 0 &&
+        (!Array.isArray(data.albums) || data.albums.length === 0) &&
+        (!Array.isArray(data.artists) || data.artists.length === 0)
+    ) {
+        return true;
+    }
+
+    return false;
 }
 
 export default {
@@ -57,7 +84,21 @@ export default {
         const url = new URL(request.url);
         const pathname = url.pathname;
 
-        // Only cache GET requests; pass everything else straight through
+        // 1. Handle CORS Pre-flight (OPTIONS)
+        if (request.method === 'OPTIONS') {
+            return new Response(null, {
+                status: 204,
+                headers: {
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS, HEAD',
+                    'Access-Control-Allow-Headers': 'Authorization, Content-Type, Range, Cache-Control, Accept, X-Forwarded-For, X-Requested-With',
+                    'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, X-Cache',
+                    'Access-Control-Max-Age': '86400',
+                },
+            });
+        }
+
+        // 2. Only cache GET requests; pass everything else straight through
         if (request.method !== 'GET' || isPrivate(pathname)) {
             return forwardToBackend(request, url);
         }
@@ -67,11 +108,11 @@ export default {
             return forwardToBackend(request, url);
         }
 
-        // Honour Cache-Control: no-cache from the client (used by force-refresh paths).
+        // Honour Cache-Control: no-cache from the client (used by force-refresh paths)
         const clientCacheControl = request.headers.get('Cache-Control') ?? '';
         const bypassCache = clientCacheControl.includes('no-cache') || clientCacheControl.includes('no-store');
 
-        // Cache key is URL-only — Authorization header must not leak across users.
+        // Cache key is URL-only — Authorization header must not leak across users
         const cacheKey = new Request(url.toString());
         const cache = caches.default;
 
@@ -80,29 +121,21 @@ export default {
             if (cached) {
                 const response = new Response(cached.body, cached);
                 response.headers.set('X-Cache', 'HIT');
+                response.headers.set('Access-Control-Allow-Origin', '*');
                 return response;
             }
         }
 
         // Cache miss — fetch from backend and store.
-        // Do NOT cache failure responses (success:false at HTTP 200, or any 4xx/5xx).
-        // A cached failure would serve stale errors for hours (e.g. album not found
-        // during a Render cold-start).
         const backendResponse = await forwardToBackend(request, url);
         if (backendResponse.ok) {
             const clone = backendResponse.clone();
-            // Peek at the body to check the success flag without consuming the
-            // original response. Only cache confirmed-good payloads.
             ctx.waitUntil((async () => {
                 try {
                     const body = await clone.json();
-                    if (body?.success === false) return; // don't cache failures
-                    // Build clean headers for the cached entry. The clone may carry
-                    // Content-Encoding: gzip (from the backend) but the body we store
-                    // is already decompressed (JSON.stringify produces plain UTF-8).
-                    // Keeping a mismatched Content-Encoding makes clients (Dart's
-                    // IOClient) attempt to gzip-decompress plain JSON and throw
-                    // "FormatException: Missing extension byte".
+                    // DO NOT cache failure responses or empty result arrays at edge
+                    if (isPayloadEmpty(body)) return;
+
                     const cachedHeaders = new Headers(clone.headers);
                     cachedHeaders.delete('Content-Encoding');
                     cachedHeaders.set('Content-Type', 'application/json; charset=utf-8');
@@ -110,6 +143,7 @@ export default {
                         'Cache-Control',
                         `public, max-age=60, s-maxage=${edgeTtl}`,
                     );
+                    cachedHeaders.set('Access-Control-Allow-Origin', '*');
                     const toCache = new Response(JSON.stringify(body), {
                         status: clone.status,
                         headers: cachedHeaders,
@@ -121,6 +155,7 @@ export default {
 
         const response = new Response(backendResponse.body, backendResponse);
         response.headers.set('X-Cache', 'MISS');
+        response.headers.set('Access-Control-Allow-Origin', '*');
         return response;
     },
 
@@ -132,7 +167,7 @@ export default {
                 signal: AbortSignal.timeout(10000),
             });
         } catch (_) {
-            // Ignore — ping is best-effort
+            // Ping is best-effort
         }
     },
 };
@@ -147,26 +182,29 @@ async function forwardToBackend(request, url) {
     headers.set('Accept-Encoding', 'gzip, br');
 
     const init = {
-        method:  request.method,
+        method: request.method,
         headers,
         redirect: 'follow',
     };
-    // Don't attach a body to GET/HEAD (some runtimes reject it)
+
+    // Don't attach a body to GET/HEAD
     if (request.method !== 'GET' && request.method !== 'HEAD') {
         init.body = request.body;
     }
 
-    // 25s timeout: returns a proper 504 instead of dropping the TCP connection.
-    // Without a timeout, Cloudflare's wall-clock limit kills the Worker mid-flight
-    // and the client sees "Connection closed before full header was received".
+    // 25s timeout: returns a proper 504 instead of dropping the TCP connection
     init.signal = AbortSignal.timeout(25000);
 
     try {
         const response = await fetch(backendUrl.toString(), init);
         const newHeaders = new Headers(response.headers);
         newHeaders.set('Access-Control-Allow-Origin', '*');
+        newHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, HEAD');
+        newHeaders.set('Access-Control-Allow-Headers', 'Authorization, Content-Type, Range, Cache-Control, Accept');
+        newHeaders.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges, X-Cache');
+
         return new Response(response.body, {
-            status:  response.status,
+            status: response.status,
             headers: newHeaders,
         });
     } catch (err) {
@@ -175,7 +213,10 @@ async function forwardToBackend(request, url) {
             JSON.stringify({ error: isTimeout ? 'Gateway timeout' : 'Gateway error', detail: err.message }),
             {
                 status: isTimeout ? 504 : 502,
-                headers: { 'Content-Type': 'application/json' },
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                },
             },
         );
     }
