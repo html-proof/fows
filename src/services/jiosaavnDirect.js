@@ -121,7 +121,7 @@ async function _apiCall(params) {
     for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
     url.searchParams.set('_format', 'json');
     url.searchParams.set('_marker', '0');
-    url.searchParams.set('ctx', 'web6dot0');
+    if (!params.ctx) url.searchParams.set('ctx', 'web6dot0');
 
     let lastError;
     for (let attempt = 1; attempt <= MAX_REQUEST_ATTEMPTS; attempt++) {
@@ -426,3 +426,101 @@ export async function searchArtistsDirect(query, limit = 20) {
 
     return results.slice(0, limit);
 }
+
+/**
+ * Get artist details (including top songs and top albums) using JioSaavn direct API.
+ */
+export async function getArtistByIdDirect(artistId) {
+    const data = await _apiCall({
+        '__call': 'artist.getArtistPageDetails',
+        'artistId': String(artistId),
+        'ctx': 'android',
+    });
+
+    if (!data || !data.artistId) {
+        throw new Error('Artist not found in direct API');
+    }
+
+    const imgRaw = String(data.image ?? '');
+    const img500 = imgRaw.replace(/\d+x\d+/g, '500x500');
+    const image = [
+        { quality: '50x50',   url: imgRaw.replace(/\d+x\d+/g, '50x50')   },
+        { quality: '150x150', url: imgRaw.replace(/\d+x\d+/g, '150x150') },
+        { quality: '500x500', url: img500 },
+    ];
+
+    const rawTopSongs = Array.isArray(data.topSongs) ? data.topSongs : (Array.isArray(data.topSongs?.songs) ? data.topSongs.songs : []);
+    const topSongs = rawTopSongs.map(_normalise);
+
+    const rawTopAlbums = Array.isArray(data.topAlbums) ? data.topAlbums : (Array.isArray(data.topAlbums?.albums) ? data.topAlbums.albums : []);
+    const topAlbums = rawTopAlbums.map(r => ({
+        id: String(r.albumid ?? r.id ?? ''),
+        name: _htmlDecode(r.album ?? r.title ?? r.name ?? ''),
+        year: r.year ?? null,
+        language: (r.language ?? '').toLowerCase(),
+        image: r.imageUrl ? [{ quality: '150x150', url: r.imageUrl }] : (r.image ? [{ quality: '150x150', url: r.image }] : []),
+        songCount: r.numSongs ?? r.songCount ?? 0,
+    }));
+
+    return {
+        success: true,
+        data: {
+            id: String(data.artistId),
+            name: _htmlDecode(data.name ?? ''),
+            followerCount: parseInt(data.fan_count ?? data.follower_count ?? 0, 10),
+            isVerified: data.isVerified === 'true' || data.isVerified === true,
+            dominantLanguage: data.dominantLanguage ?? '',
+            bio: data.bio ?? '',
+            image,
+            imageUrl: img500,
+            topSongs,
+            topAlbums,
+            similarArtists: data.similarArtists ?? [],
+        },
+    };
+}
+
+/**
+ * Get artist songs by artist ID.
+ */
+export async function getArtistSongsDirect(artistId, page = 1, limit = 20) {
+    const data = await _apiCall({
+        '__call': 'artist.getArtistMoreSong',
+        'artistId': String(artistId),
+        'p': String(page),
+        'n': String(limit),
+    });
+
+    const list = Array.isArray(data?.topSongs?.songs) ? data.topSongs.songs
+        : Array.isArray(data?.topSongs) ? data.topSongs
+        : Array.isArray(data?.songs) ? data.songs
+        : Array.isArray(data) ? data
+        : [];
+
+    const songs = list.map(_normalise).filter(s => s.name);
+
+    return {
+        success: true,
+        data: {
+            songs,
+            total: parseInt(data?.topSongs?.total ?? data?.total ?? songs.length, 10),
+            lastPage: Boolean(data?.topSongs?.last_page ?? data?.last_page ?? false),
+        },
+    };
+}
+
+/**
+ * Get artist albums by artist ID.
+ */
+export async function getArtistAlbumsDirect(artistId, page = 1, limit = 20) {
+    const artistDetails = await getArtistByIdDirect(artistId);
+    const albums = artistDetails?.data?.topAlbums ?? [];
+    return {
+        success: true,
+        data: {
+            albums: albums.slice((page - 1) * limit, page * limit),
+            total: albums.length,
+        },
+    };
+}
+

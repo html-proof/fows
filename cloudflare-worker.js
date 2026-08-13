@@ -35,16 +35,16 @@ const PRIVATE_PREFIXES = [
     '/v1/catalog/play',   // stream redirects must not be cached as static GET
 ];
 
-// Cache TTLs (seconds) for edge caching — overrides backend headers when needed
 const EDGE_CACHE_TTLS = {
-    '/api/songs':          86400, // 24 h — song metadata is stable
-    '/api/albums':         21600, // 6 h
-    '/api/artists':        7200,  // 2 h
-    '/api/search':         600,   // 10 min
-    '/api/trending':       600,   // 10 min
-    '/v1/home':            300,   // 5 min
-    '/v1/catalog/search':  600,   // 10 min
-    '/v1/catalog/tracks':  86400, // 24 h
+    '/api/songs':                 86400, // 24 h — song metadata is stable
+    '/api/albums':                21600, // 6 h
+    '/api/artists':               7200,  // 2 h
+    '/api/search':                600,   // 10 min
+    '/api/trending':              600,   // 10 min
+    '/api/recommendations/moods': 86400, // 24 h — static mood presets
+    '/v1/home':                   300,   // 5 min
+    '/v1/catalog/search':         600,   // 10 min
+    '/v1/catalog/tracks':         86400, // 24 h
 };
 
 function getEdgeTtl(pathname) {
@@ -55,6 +55,7 @@ function getEdgeTtl(pathname) {
 }
 
 function isPrivate(pathname) {
+    if (pathname === '/api/recommendations/moods') return false;
     if (
         pathname.includes('/stream') ||
         pathname.includes('/play/') ||
@@ -212,8 +213,8 @@ async function forwardToBackend(request, url) {
         init.body = request.body;
     }
 
-    // 25s timeout: returns a proper 504 instead of dropping the TCP connection
-    init.signal = AbortSignal.timeout(25000);
+    // 15s timeout: returns a proper 504 instead of dropping the TCP connection
+    init.signal = AbortSignal.timeout(15000);
 
     try {
         const response = await fetch(backendUrl.toString(), init);

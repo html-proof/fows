@@ -1,10 +1,14 @@
 import { request } from 'undici';
 import {
+    searchSongsDirect,
     searchSongsOnlyDirect,
     getSongDirect,
     searchAlbumsDirect,
     getAlbumByIdDirect,
     searchArtistsDirect,
+    getArtistByIdDirect,
+    getArtistSongsDirect,
+    getArtistAlbumsDirect,
 } from './jiosaavnDirect.js';
 import { getSongById as getGaanaSongById, searchSongsOnly as searchGaanaSongsOnly } from './gaanaApi.js';
 
@@ -132,100 +136,70 @@ async function requestJsonWithTimeout(url, { timeoutMs, label }) {
 }
 
 export async function searchSongs(query, page = 1) {
+    try {
+        const directPayload = await searchSongsOnlyDirect(query, 20);
+        if (directPayload?.data?.results?.length > 0) {
+            return directPayload;
+        }
+    } catch (_) {}
+
     return requestJsonWithTimeout(
         `${BASE_URL}/api/search?query=${encodeURIComponent(query)}&page=${page}`,
         {
-            timeoutMs: PRIMARY_SEARCH_TIMEOUT_MS,
+            timeoutMs: 1500,
             label: 'Saavn search',
         }
-    );
+    ).catch(() => ({ data: { results: [] } }));
 }
 
 export async function searchSongsOnly(query, page = 1) {
     const pageNumber = Number.parseInt(page, 10) || 1;
 
-    let primaryPayload = null;
+    // 1. Direct JioSaavn API is primary (fastest, direct DES decryption, no proxy downtime)
     try {
-        primaryPayload = await searchSongsOnlyPrimary(query, pageNumber);
-    } catch (_primaryError) {
-        // Fallback has no pagination support — returning page 1 data for page 2+
-        // would cause duplicate results on the client, so return empty instead.
-        if (pageNumber > 1) {
-            return wrapSongsOnlyResponse([]);
+        const directPayload = await searchSongsOnlyDirect(query, 40);
+        if (directPayload?.data?.results?.length > 0) {
+            return directPayload;
         }
-    }
+    } catch (_) {}
 
-    // Check if primary returned useful results (with download URLs)
-    const primarySongs = primaryPayload?.data?.results ?? [];
-    const primaryHasUrls = primarySongs.some(s => s.downloadUrl?.length > 0);
+    // 2. Gaana fallback
+    try {
+        const gaanaSongs = await searchGaanaSongsOnly(query, 30);
+        if (Array.isArray(gaanaSongs) && gaanaSongs.length > 0) {
+            return wrapSongsOnlyResponse(gaanaSongs);
+        }
+    } catch (_) {}
 
-    if (primarySongs.length >= SMART_SEARCH_MIN_RESULTS && primaryHasUrls && pageNumber > 1) {
-        return primaryPayload;
-    }
+    // 3. Third-party proxy fallback (best effort with short timeout)
+    try {
+        const primaryPayload = await searchSongsOnlyPrimary(query, pageNumber);
+        if (primaryPayload?.data?.results?.length > 0) {
+            return primaryPayload;
+        }
+    } catch (_) {}
 
-    // Try proxy fallback
-    const fallbackSongs = primaryPayload
-        ? await searchSongsOnlyFallback(query).catch(() => [])
-        : await searchSongsOnlyFallback(query);
-
-    const fallbackHasUrls = fallbackSongs.some(s => s.downloadUrl?.length > 0);
-
-    // Try direct JioSaavn API when both proxies either fail or return songs without download URLs
-    if ((!primaryHasUrls && !fallbackHasUrls) || (!primaryPayload && fallbackSongs.length === 0)) {
-        try {
-            const directPayload = await searchSongsOnlyDirect(query, 40);
-            if (directPayload?.data?.results?.length > 0) {
-                return directPayload;
-            }
-        } catch (_) {}
-    }
-
-    if (!primaryPayload) {
-        return wrapSongsOnlyResponse(fallbackSongs);
-    }
-
-    if (primarySongs.length >= SMART_SEARCH_MIN_RESULTS || pageNumber > 1) {
-        return primaryPayload;
-    }
-
-    if (fallbackSongs.length === 0) {
-        return primaryPayload;
-    }
-
-    const mergedSongs = mergeUniqueSongs(primarySongs, fallbackSongs);
-    return mergeSongsIntoPayload(primaryPayload, mergedSongs);
+    return wrapSongsOnlyResponse([]);
 }
 
 async function searchSongsOnlyPrimary(query, page = 1) {
     return requestJsonWithTimeout(
         `${BASE_URL}/api/search/songs?query=${encodeURIComponent(query)}&page=${page}`,
         {
-            timeoutMs: PRIMARY_SEARCH_TIMEOUT_MS,
+            timeoutMs: 1500,
             label: 'Saavn song search',
         }
     );
 }
 
-/**
- * Fallback song search using alternate provider.
- * Response is normalized into the same shape expected by current clients.
- *
- * @param {string} query
- * @returns {Promise<object[]>}
- */
 export async function searchSongsOnlyFallback(query) {
     try {
-        const payload = await requestJsonWithTimeout(
-            `${FALLBACK_BASE_URL}/api/search/songs?query=${encodeURIComponent(query)}`,
-            {
-                timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
-                label: 'Fallback song search',
-            }
-        );
-        return payload?.data?.results ?? [];
-    } catch (error) {
-        return [];
-    }
+        const gaanaSongs = await searchGaanaSongsOnly(query, 20);
+        if (Array.isArray(gaanaSongs) && gaanaSongs.length > 0) {
+            return gaanaSongs;
+        }
+    } catch (_) {}
+    return [];
 }
 
 /**
@@ -334,16 +308,12 @@ async function computeSmartSearchResults({
         const shouldFetchBroad = i < 2 || ranked.size < SMART_SEARCH_MIN_RESULTS;
         const shouldFetchFallback = i === 0 || ranked.size < Math.ceil(SMART_SEARCH_MIN_RESULTS / 2);
         const jobs = [
-            { key: 'primary', promise: searchSongsOnlyPrimary(variant, 1) },
-            { key: 'direct', promise: searchSongsOnlyDirect(variant, 20) },
+            { key: 'direct', promise: searchSongsOnlyDirect(variant, 25) },
+            { key: 'gaana', promise: searchGaanaSongsOnly(variant, 20) },
         ];
 
-        if (shouldFetchBroad) {
-            jobs.push({ key: 'broad', promise: searchSongs(variant, 1) });
-        }
-        if (shouldFetchFallback) {
-            jobs.push({ key: 'fallback', promise: searchSongsOnlyFallback(variant) });
-            jobs.push({ key: 'gaana', promise: searchGaanaSongsOnly(variant, 20) });
+        if (shouldFetchBroad && ranked.size < Math.ceil(SMART_SEARCH_MIN_RESULTS / 2)) {
+            jobs.push({ key: 'primary', promise: searchSongsOnlyPrimary(variant, 1).catch(() => null) });
         }
 
         const settled = await Promise.allSettled(jobs.map(job => job.promise));
@@ -352,55 +322,22 @@ async function computeSmartSearchResults({
             resultsByKey[jobs[j].key] = settled[j];
         }
 
-        const primarySongs = resultsByKey.primary?.status === 'fulfilled'
-            ? (resultsByKey.primary.value?.data?.results ?? [])
-            : [];
         const directSongs = resultsByKey.direct?.status === 'fulfilled'
             ? (resultsByKey.direct.value?.data?.results ?? [])
-            : [];
-        const broadSongs = resultsByKey.broad?.status === 'fulfilled'
-            ? (resultsByKey.broad.value?.data?.results ?? [])
-            : [];
-        const fallbackSongs = resultsByKey.fallback?.status === 'fulfilled'
-            ? resultsByKey.fallback.value
             : [];
         const gaanaSongs = resultsByKey.gaana?.status === 'fulfilled'
             ? (Array.isArray(resultsByKey.gaana.value) ? resultsByKey.gaana.value : [])
             : [];
+        const primarySongs = resultsByKey.primary?.status === 'fulfilled'
+            ? (resultsByKey.primary.value?.data?.results ?? [])
+            : [];
 
-        addRankedSongs({
-            ranked,
-            songs: primarySongs,
-            query: normalizedQuery,
-            variantIndex: i,
-            sourceWeight: 15,
-            languageHint,
-            preferredLanguageSet,
-        });
         addRankedSongs({
             ranked,
             songs: directSongs,
             query: normalizedQuery,
             variantIndex: i,
-            sourceWeight: 14,
-            languageHint,
-            preferredLanguageSet,
-        });
-        addRankedSongs({
-            ranked,
-            songs: broadSongs,
-            query: normalizedQuery,
-            variantIndex: i,
-            sourceWeight: 8,
-            languageHint,
-            preferredLanguageSet,
-        });
-        addRankedSongs({
-            ranked,
-            songs: fallbackSongs,
-            query: normalizedQuery,
-            variantIndex: i,
-            sourceWeight: 5,
+            sourceWeight: 20,
             languageHint,
             preferredLanguageSet,
         });
@@ -409,10 +346,21 @@ async function computeSmartSearchResults({
             songs: gaanaSongs,
             query: normalizedQuery,
             variantIndex: i,
-            sourceWeight: 12,
+            sourceWeight: 15,
             languageHint,
             preferredLanguageSet,
         });
+        if (primarySongs.length > 0) {
+            addRankedSongs({
+                ranked,
+                songs: primarySongs,
+                query: normalizedQuery,
+                variantIndex: i,
+                sourceWeight: 10,
+                languageHint,
+                preferredLanguageSet,
+            });
+        }
 
         // Stop once we have enough candidates or we hit our time budget.
         if (ranked.size >= SMART_SEARCH_MIN_RESULTS) {
@@ -425,32 +373,32 @@ async function computeSmartSearchResults({
 
     if (!hasExactRankedMatch(ranked)) {
         const globalSettled = await Promise.allSettled([
-            searchSongs(normalizedQuery, 1),
-            searchSongsOnlyFallback(normalizedQuery),
+            searchSongsOnlyDirect(normalizedQuery, 40),
+            searchGaanaSongsOnly(normalizedQuery, 20),
         ]);
 
-        const globalSongs = globalSettled[0]?.status === 'fulfilled'
+        const directSongs = globalSettled[0]?.status === 'fulfilled'
             ? (globalSettled[0].value?.data?.results ?? [])
             : [];
-        const fallbackSongs = globalSettled[1]?.status === 'fulfilled'
-            ? globalSettled[1].value
+        const gaanaSongs = globalSettled[1]?.status === 'fulfilled'
+            ? (Array.isArray(globalSettled[1].value) ? globalSettled[1].value : [])
             : [];
 
         addRankedSongs({
             ranked,
-            songs: globalSongs,
+            songs: directSongs,
             query: normalizedQuery,
             variantIndex: SMART_SEARCH_MAX_VARIANTS + 1,
-            sourceWeight: 6,
+            sourceWeight: 10,
             languageHint,
             preferredLanguageSet,
         });
         addRankedSongs({
             ranked,
-            songs: fallbackSongs,
+            songs: gaanaSongs,
             query: normalizedQuery,
             variantIndex: SMART_SEARCH_MAX_VARIANTS + 1,
-            sourceWeight: 4,
+            sourceWeight: 8,
             languageHint,
             preferredLanguageSet,
         });
@@ -493,29 +441,21 @@ export async function getSongById(id) {
         }
     } catch (_) {}
 
-    // Fallback: proxy
-    try {
-        return await requestJsonWithTimeout(
-            `${BASE_URL}/api/songs/${encodeURIComponent(id)}`,
-            { timeoutMs: CATALOG_SEARCH_TIMEOUT_MS, label: 'Saavn song fetch' }
-        );
-    } catch (_) {}
-
-    try {
-        const fallbackData = await requestJsonWithTimeout(
-            `${FALLBACK_BASE_URL}/api/songs?id=${encodeURIComponent(id)}`,
-            { timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS, label: 'Fallback song fetch' }
-        );
-        const songs = fallbackData?.data ?? [];
-        const hasDlUrl = (Array.isArray(songs) ? songs : [songs]).some(s => s?.downloadUrl?.length > 0);
-        if (hasDlUrl) return { success: true, data: songs };
-    } catch (_) {}
-
+    // Secondary: Gaana API
     try {
         const gaanaRes = await getGaanaSongById(id);
         if (gaanaRes && gaanaRes.success && gaanaRes.data?.length > 0) {
             return gaanaRes;
         }
+    } catch (_) {}
+
+    // Tertiary: proxy fallback with tight timeout
+    try {
+        const res = await requestJsonWithTimeout(
+            `${BASE_URL}/api/songs/${encodeURIComponent(id)}`,
+            { timeoutMs: 1500, label: 'Saavn song fetch' }
+        );
+        if (res?.data) return res;
     } catch (_) {}
 
     return { success: false, error: 'Service temporarily unavailable', data: [] };
@@ -527,49 +467,35 @@ export async function getSongById(id) {
  * @returns {Promise<object>} Album details
  */
 export async function getAlbumById(id, url) {
-    // Fetching by perma_url (?link=) is more reliable than numeric ID on the proxy.
+    // Primary: direct JioSaavn API by album ID
+    if (id) {
+        try {
+            const res = await getAlbumByIdDirect(id);
+            if (_albumHasSongs(res)) return res;
+        } catch (_) {}
+    }
+
+    // Secondary: fetching by perma_url (?link=)
     if (url) {
         try {
             const res = await requestJsonWithTimeout(
                 `${BASE_URL}/api/albums?link=${encodeURIComponent(url)}`,
-                { timeoutMs: ALBUM_FETCH_TIMEOUT_MS, label: 'Saavn album fetch (link)' }
+                { timeoutMs: 2000, label: 'Saavn album fetch (link)' }
             );
             if (_albumHasSongs(res)) return res;
         } catch (_) { /* fall through */ }
     }
 
-    // Primary: proxy path-style
-    try {
-        const res = await requestJsonWithTimeout(
-            `${BASE_URL}/api/albums/${encodeURIComponent(id)}`,
-            { timeoutMs: ALBUM_FETCH_TIMEOUT_MS, label: 'Saavn album fetch (path)' }
-        );
-        if (_albumHasSongs(res)) return res;
-    } catch (_) { /* fall through */ }
-
-    // Secondary: proxy query-style
-    try {
-        const res = await requestJsonWithTimeout(
-            `${BASE_URL}/api/albums?id=${encodeURIComponent(id)}`,
-            { timeoutMs: ALBUM_FETCH_TIMEOUT_MS, label: 'Saavn album fetch (query)' }
-        );
-        if (_albumHasSongs(res)) return res;
-    } catch (_) { /* fall through */ }
-
-    // Tertiary: fallback proxy
-    try {
-        const res = await requestJsonWithTimeout(
-            `${FALLBACK_BASE_URL}/api/albums?id=${encodeURIComponent(id)}`,
-            { timeoutMs: ALBUM_FETCH_TIMEOUT_MS, label: 'Saavn album fetch (fallback)' }
-        );
-        if (_albumHasSongs(res)) return res;
-    } catch (_) { /* fall through */ }
-
-    // Last resort: JioSaavn direct API via undici
-    try {
-        const res = await getAlbumByIdDirect(id);
-        if (_albumHasSongs(res)) return res;
-    } catch (_) {}
+    // Tertiary: proxy path-style fallback
+    if (id) {
+        try {
+            const res = await requestJsonWithTimeout(
+                `${BASE_URL}/api/albums/${encodeURIComponent(id)}`,
+                { timeoutMs: 1500, label: 'Saavn album fetch (path)' }
+            );
+            if (_albumHasSongs(res)) return res;
+        } catch (_) { /* fall through */ }
+    }
 
     return { success: false, error: 'Service temporarily unavailable', data: null };
 }
@@ -587,8 +513,6 @@ function _albumHasSongs(res) {
  * @returns {Promise<object>} Album search results
  */
 export async function searchAlbums(query) {
-    // Prefer the direct JioSaavn endpoint — it ranks albums correctly (e.g. the
-    // actual "Chotta Mumbai" film album surfaces above coincidental OST matches).
     try {
         return await searchAlbumsDirect(query, 20);
     } catch (_) { /* fall through to proxy */ }
@@ -597,7 +521,7 @@ export async function searchAlbums(query) {
         return await requestJsonWithTimeout(
             `${BASE_URL}/api/search/albums?query=${encodeURIComponent(query)}`,
             {
-                timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+                timeoutMs: 1500,
                 label: 'Saavn album search',
             }
         );
@@ -617,37 +541,29 @@ export async function searchAlbums(query) {
  */
 export async function searchArtists(query) {
     try {
+        const directResults = await searchArtistsDirect(query, 20);
+        if (directResults.length > 0) {
+            return {
+                success: true,
+                data: { results: directResults },
+            };
+        }
+    } catch (_) {}
+
+    try {
         return await requestJsonWithTimeout(
             `${BASE_URL}/api/search/artists?query=${encodeURIComponent(query)}`,
             {
-                timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+                timeoutMs: 1500,
                 label: 'Saavn artist search',
             }
         );
     } catch (error) {
-        try {
-            const fallbackData = await requestJsonWithTimeout(
-                `${FALLBACK_BASE_URL}/api/search/artists?query=${encodeURIComponent(query)}`,
-                {
-                    timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
-                    label: 'Fallback artist search',
-                }
-            );
-            return {
-                success: true,
-                data: {
-                    results: fallbackData?.data?.results ?? [],
-                },
-            };
-        } catch (fallbackError) {
-            return {
-                success: false,
-                error: fallbackError.message,
-                data: {
-                    results: [],
-                },
-            };
-        }
+        return {
+            success: false,
+            error: error.message,
+            data: { results: [] },
+        };
     }
 }
 
@@ -658,22 +574,22 @@ export async function searchArtists(query) {
  */
 export async function getArtistSongs(artistId) {
     try {
+        const directRes = await getArtistSongsDirect(artistId, 1, 30);
+        if (directRes?.data?.songs?.length > 0) {
+            return directRes;
+        }
+    } catch (_) {}
+
+    try {
         return await requestJsonWithTimeout(
             `${BASE_URL}/api/artists/${encodeURIComponent(artistId)}/songs`,
             {
-                timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+                timeoutMs: 1500,
                 label: 'Saavn artist songs',
             }
         );
     } catch (error) {
-        // Fallback or secondary pattern search
-        return await requestJsonWithTimeout(
-            `${FALLBACK_BASE_URL}/api/artists/${encodeURIComponent(artistId)}/songs`,
-            {
-                timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
-                label: 'Fallback artist fetch (songs)',
-            }
-        ).catch(() => ({ success: true, data: { songs: [] } }));
+        return { success: true, data: { songs: [] } };
     }
 }
 
@@ -690,22 +606,22 @@ export async function getArtistAlbums(artistId, options = {}) {
     const page = Number.isNaN(parsedPage) ? 1 : Math.max(parsedPage, 1);
 
     try {
+        const directRes = await getArtistAlbumsDirect(artistId, page, limit);
+        if (directRes?.data?.albums?.length > 0) {
+            return directRes;
+        }
+    } catch (_) {}
+
+    try {
         return await requestJsonWithTimeout(
             `${BASE_URL}/api/artists/${encodeURIComponent(artistId)}/albums?limit=${limit}&page=${page}`,
             {
-                timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+                timeoutMs: 1500,
                 label: 'Saavn artist albums',
             }
         );
     } catch (error) {
-        // Fallback for artist albums
-        return await requestJsonWithTimeout(
-            `${FALLBACK_BASE_URL}/api/artists/${encodeURIComponent(artistId)}/albums`,
-            {
-                timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
-                label: 'Fallback artist albums',
-            }
-        ).catch(() => ({ success: true, data: { albums: [] } }));
+        return { success: true, data: { albums: [] } };
     }
 }
 
@@ -716,29 +632,26 @@ export async function getArtistAlbums(artistId, options = {}) {
  */
 export async function getArtistById(artistId) {
     try {
+        const directRes = await getArtistByIdDirect(artistId);
+        if (directRes?.data) {
+            return directRes;
+        }
+    } catch (_) {}
+
+    try {
         return await requestJsonWithTimeout(
             `${BASE_URL}/api/artists/${encodeURIComponent(artistId)}`,
             {
-                timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+                timeoutMs: 1500,
                 label: 'Saavn artist fetch',
             }
         );
     } catch (error) {
-        try {
-            return await requestJsonWithTimeout(
-                `${FALLBACK_BASE_URL}/api/artists/${encodeURIComponent(artistId)}`,
-                {
-                    timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
-                    label: 'Fallback artist fetch',
-                }
-            );
-        } catch (fallbackError) {
-            return {
-                success: false,
-                error: fallbackError.message,
-                data: null,
-            };
-        }
+        return {
+            success: false,
+            error: error.message,
+            data: null,
+        };
     }
 }
 
@@ -790,37 +703,37 @@ const LANGUAGE_ARTIST_SEEDS = {
  */
 export async function getArtistsByLanguage(language) {
     const artistMap = new Map();
-
-    // Try proxy providers first (fast path with rich metadata).
-    const proxyQueries = [`Top ${language} Artists`, `Popular ${language} singers`];
-    const proxyResults = await Promise.allSettled(
-        proxyQueries.map(q => searchArtists(q))
-    );
-    for (const result of proxyResults) {
-        if (result.status === 'fulfilled' && result.value?.data?.results) {
-            for (const artist of result.value.data.results) {
-                if (artist.id) artistMap.set(String(artist.id), artist);
-            }
-        }
-    }
-    if (artistMap.size >= 5) return Array.from(artistMap.values());
-
-    // Both proxies are down (or returned too few results) — use the JioSaavn
-    // direct API with curated per-language artist names as seed queries.
-    // Searching by exact artist name reliably returns the correct profile as
-    // the first result, unlike generic "Top Hindi Artists" which returns noise.
-    const lang = language.toLowerCase();
+    const lang = (language || 'hindi').toLowerCase();
     const seeds = LANGUAGE_ARTIST_SEEDS[lang] ?? LANGUAGE_ARTIST_SEEDS.hindi;
 
+    // Use JioSaavn direct API with curated per-language artist names as seed queries.
+    // Searching by exact artist name reliably returns the correct profile as
+    // the first result instantly without depending on dead proxies.
     const directResults = await Promise.allSettled(
-        seeds.map(name => searchArtistsDirect(name, 3))
+        seeds.map(name => searchArtistsDirect(name, 2))
     );
     for (const result of directResults) {
         if (result.status !== 'fulfilled' || !Array.isArray(result.value)) continue;
-        // Take only the top result per seed — it's the artist we searched for.
         const top = result.value[0];
         if (top?.id) artistMap.set(String(top.id), top);
     }
+
+    if (artistMap.size >= 5) return Array.from(artistMap.values());
+
+    // Optional proxy fallback if direct returns < 5
+    try {
+        const proxyQueries = [`Top ${language} Artists`, `Popular ${language} singers`];
+        const proxyResults = await Promise.allSettled(
+            proxyQueries.map(q => searchArtists(q))
+        );
+        for (const result of proxyResults) {
+            if (result.status === 'fulfilled' && result.value?.data?.results) {
+                for (const artist of result.value.data.results) {
+                    if (artist.id) artistMap.set(String(artist.id), artist);
+                }
+            }
+        }
+    } catch (_) {}
 
     return Array.from(artistMap.values());
 }
@@ -834,30 +747,20 @@ export async function getLyricsBySongId(id) {
     const encoded = encodeURIComponent(id);
     const candidates = [
         requestJsonWithTimeout(`${BASE_URL}/api/songs/${encoded}/lyrics`, {
-            timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+            timeoutMs: 1500,
             label: 'Saavn lyrics fetch (path)',
         }),
         requestJsonWithTimeout(`${BASE_URL}/api/lyrics?id=${encoded}`, {
-            timeoutMs: CATALOG_SEARCH_TIMEOUT_MS,
+            timeoutMs: 1500,
             label: 'Saavn lyrics fetch (query)',
-        }),
-        requestJsonWithTimeout(`${FALLBACK_BASE_URL}/api/lyrics?id=${encoded}`, {
-            timeoutMs: FALLBACK_SEARCH_TIMEOUT_MS,
-            label: 'Fallback lyrics fetch',
         }),
     ];
 
-    // Race all three providers — first non-null, non-error response wins.
-    const results = await Promise.allSettled(candidates);
-    for (const result of results) {
-        if (result.status === 'fulfilled' && result.value != null) {
-            const data = result.value?.data ?? result.value;
-            if (data?.lyrics || data?.syncedLyrics) {
-                return result.value;
-            }
-        }
-    }
-    // All failed or returned empty — return a safe empty response
+    try {
+        const winner = await Promise.any(candidates);
+        if (winner && (winner.data || winner.lyrics)) return winner;
+    } catch (_) {}
+
     return { success: false, data: null };
 }
 
