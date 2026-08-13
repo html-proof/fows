@@ -43,7 +43,7 @@ import {
 } from '../services/playbackResolver.js';
 import { getUserPreferences, getGlobalTrending, getRecentActivity } from '../services/database.js';
 import { rerankSongsForUser } from '../services/personalizationModel.js';
-import { generateRecommendations } from '../services/recommendation.js';
+import { normalizeSongMetadata, normalizeSongList } from '../services/metadataService.js';
 
 const router = Router();
 
@@ -63,33 +63,7 @@ async function resolveUid(req) {
 // ─── Shape a canonical song for API responses ─────────────────────────────────
 
 function shapeSong(song) {
-    const artwork = Array.isArray(song.image)
-        ? (song.image.find(i => i.quality === '500x500')?.url ?? song.image.slice(-1)[0]?.url)
-        : (song.image ?? null);
-
-    const artist = Array.isArray(song.artists?.primary)
-        ? song.artists.primary.map(a => ({ id: a.id, name: a.name }))
-        : [{ id: null, name: song.primaryArtists ?? song.artist ?? '' }];
-
-    const albumName = typeof song.album === 'string' ? song.album
-        : (song.album?.name ?? song.albumName ?? '');
-
-    return {
-        type:          'song',
-        id:            song.canonicalId ?? song.id,
-        providerId:    song.id,
-        title:         song.name ?? song.title ?? '',
-        artist,
-        album: {
-            id:        song.album?.id ?? song.albumId ?? null,
-            name:      albumName,
-        },
-        artwork,
-        durationMs:    (parseInt(song.duration ?? 0, 10) || 0) * 1000,
-        language:      song.language ?? null,
-        hasDownloadUrl: !!(song.downloadUrl?.length || song.streamUrl?.length),
-        year:          song.year ? parseInt(song.year, 10) : null,
-    };
+    return normalizeSongMetadata(song);
 }
 
 // ─── GET /v1/catalog/search ───────────────────────────────────────────────────

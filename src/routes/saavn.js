@@ -32,6 +32,7 @@ import { rerankSongsForUser } from '../services/personalizationModel.js';
 import { attachCanonicalIds } from '../services/identityResolver.js';
 import { resolveStream } from '../services/playbackResolver.js';
 import { validatePlayableStream } from '../services/streamValidator.js';
+import { normalizeSongMetadata, normalizeSongList } from '../services/metadataService.js';
 
 const router = Router();
 const DEFAULT_LIMIT = 40;
@@ -101,7 +102,7 @@ router.get('/search', async (req, res) => {
             const finalSongs = uid
                 ? await rerankSongsForUser({ uid, songs: orderedSongs, query: rawQuery, preferredLanguages, mode: 'search' })
                 : orderedSongs;
-            const songs = finalSongs.slice(0, limit);
+            const songs = normalizeSongList(finalSongs.slice(0, limit));
             return res.json({
                 success: true,
                 data: {
@@ -264,7 +265,7 @@ router.get('/search', async (req, res) => {
             }
         }
 
-        const songsOut = attachCanonicalIds(finalRanked.slice(0, limit));
+        const songsOut = normalizeSongList(attachCanonicalIds(finalRanked.slice(0, limit)));
 
         const albumsOut = albumsData.status === 'fulfilled'
             ? (albumsData.value?.data?.results ?? []).slice(0, ALBUM_LIMIT)
