@@ -82,18 +82,30 @@ export function normalizeSongMetadata(rawSong, options = {}) {
         imageUrl = rawSong.itunesArtwork.trim();
     } else if (typeof rawSong.artworkUrl === 'string' && rawSong.artworkUrl.trim()) {
         imageUrl = rawSong.artworkUrl.trim();
+    } else if (typeof rawSong.artwork === 'string' && rawSong.artwork.trim()) {
+        imageUrl = rawSong.artwork.trim();
     } else if (typeof rawSong.album_art === 'string' && rawSong.album_art.trim()) {
         imageUrl = rawSong.album_art.trim();
-    } else if (Array.isArray(rawSong.image)) {
-        const found500 = rawSong.image.find(img => img?.quality === '500x500');
-        imageUrl = found500?.url
-            || rawSong.image[rawSong.image.length - 1]?.url
-            || rawSong.image[0]?.url
+    } else if (Array.isArray(rawSong.image) && rawSong.image.length > 0) {
+        const found500 = rawSong.image.find(img => img?.quality === '500x500' || img?.quality === 'high');
+        const candidate = found500?.url
+            || (typeof rawSong.image[rawSong.image.length - 1] === 'string' ? rawSong.image[rawSong.image.length - 1] : rawSong.image[rawSong.image.length - 1]?.url)
+            || (typeof rawSong.image[0] === 'string' ? rawSong.image[0] : rawSong.image[0]?.url)
             || '';
+        imageUrl = String(candidate).trim();
     } else if (typeof rawSong.imageUrl === 'string') {
         imageUrl = rawSong.imageUrl.trim();
+    } else if (typeof rawSong.image_url === 'string') {
+        imageUrl = rawSong.image_url.trim();
     } else if (typeof rawSong.image === 'string') {
         imageUrl = rawSong.image.trim();
+    }
+
+    if (imageUrl.startsWith('http://')) {
+        imageUrl = imageUrl.replace(/^http:\/\//, 'https://');
+    }
+    if (imageUrl.includes('50x50.jpg') || imageUrl.includes('150x150.jpg')) {
+        imageUrl = imageUrl.replace(/(50x50|150x150)\.jpg/g, '500x500.jpg');
     }
 
     // 7. Standardize Stream and Download URLs
