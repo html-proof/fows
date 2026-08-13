@@ -1,6 +1,8 @@
 import express from 'express';
 import { request } from 'undici';
 import { getSongById as getGaanaSongById, searchSongsOnly as searchGaanaSongsOnly } from '../services/gaanaApi.js';
+import { getSongById as getSaavnSongById, searchSongsOnly as searchSaavnSongsOnly } from '../services/saavnApi.js';
+import { getSongDirect, searchSongsDirect } from '../services/jiosaavnDirect.js';
 import { normText, bigramSimilarity } from '../services/searchEngine.js';
 
 const router = express.Router();
@@ -84,27 +86,35 @@ async function validateStreamUrl(url) {
     }
 }
 
+function _extractStreamUrlFromCandidate(candidate) {
+    if (!candidate) return null;
+    const urls = Array.isArray(candidate.downloadUrl) ? candidate.downloadUrl : [];
+    return urls.find(u => u.quality === '320kbps')?.url
+        || urls.find(u => u.quality === '160kbps')?.url
+        || urls[urls.length - 1]?.url
+        || candidate.streamUrl
+        || candidate.stream_url
+        || null;
+}
+
 /**
  * Resolve the real stream URL from Gaana.
  */
-async function resolveGaanaStream({ id, title, artist, album, language }) {
-    // 1. Direct Gaana ID resolution if available
+async function resolveFromGaana({ id, title, artist, album }) {
     if (id && !id.startsWith('trk_') && isNaN(Number(id)) === false) {
         try {
             const detail = await getGaanaSongById(id);
             if (detail?.success && Array.isArray(detail.data) && detail.data.length > 0) {
                 const song = detail.data[0];
-                const urls = song.downloadUrl || [];
-                const candidateUrl = urls.find(u => u.quality === '320kbps')?.url
-                    || urls[0]?.url
-                    || song.streamUrl;
-                if (candidateUrl) {
-                    const validation = await validateStreamUrl(candidateUrl);
+                const streamUrl = _extractStreamUrlFromCandidate(song);
+                if (streamUrl) {
+                    const validation = await validateStreamUrl(streamUrl);
                     if (validation.valid) {
                         return {
-                            url: candidateUrl,
+                            url: streamUrl,
                             quality: '320kbps',
                             contentType: validation.contentType,
+                            provider: 'gaana',
                             song,
                         };
                     }
@@ -113,7 +123,6 @@ async function resolveGaanaStream({ id, title, artist, album, language }) {
         } catch (_) {}
     }
 
-    // 2. Search Gaana with title + artist + album variants
     const searchQueries = [
         [title, artist].filter(Boolean).join(' '),
         [title, album].filter(Boolean).join(' '),
@@ -125,7 +134,6 @@ async function resolveGaanaStream({ id, title, artist, album, language }) {
             const candidates = await searchGaanaSongsOnly(q, 10);
             if (!Array.isArray(candidates) || candidates.length === 0) continue;
 
-            // Pick the best match based on title and artist similarity
             let bestCandidate = null;
             let highestScore = -1;
 
@@ -136,7 +144,7 @@ async function resolveGaanaStream({ id, title, artist, album, language }) {
                 const artistSim = artist ? bigramSimilarity(normText(artist), candArtist) : 0.5;
 
                 const score = titleSim * 0.7 + artistSim * 0.3;
-                if (score > highestScore && score >= 0.5) {
+                if (score > highestScore && score >= 0.45) {
                     highestScore = score;
                     bestCandidate = cand;
                 }
@@ -144,18 +152,15 @@ async function resolveGaanaStream({ id, title, artist, album, language }) {
 
             if (!bestCandidate) continue;
 
-            const urls = bestCandidate.downloadUrl || [];
-            const candidateUrl = urls.find(u => u.quality === '320kbps')?.url
-                || urls[0]?.url
-                || bestCandidate.streamUrl;
-
-            if (candidateUrl) {
-                const validation = await validateStreamUrl(candidateUrl);
+            const streamUrl = _extractStreamUrlFromCandidate(bestCandidate);
+            if (streamUrl) {
+                const validation = await validateStreamUrl(streamUrl);
                 if (validation.valid) {
                     return {
-                        url: candidateUrl,
+                        url: streamUrl,
                         quality: '320kbps',
                         contentType: validation.contentType,
+                        provider: 'gaana',
                         song: bestCandidate,
                     };
                 }
@@ -166,9 +171,101 @@ async function resolveGaanaStream({ id, title, artist, album, language }) {
     return null;
 }
 
+/**
+ * Resolve the real stream URL from JioSaavn.
+ */
+async function resolveFromJioSaavn({ id, title, artist, album }) {
+    if (id && !id.startsWith('trk_')) {
+        try {
+            const song = await getSongDirect(id).catch(() => null)
+                || await getSaavnSongById(id).then(r => r?.data?.[0]).catch(() => null);
+            if (song) {
+                const streamUrl = _extractStreamUrlFromCandidate(song);
+                if (streamUrl) {
+                    const validation = await validateStreamUrl(streamUrl);
+                    if (validation.valid) {
+                        return {
+                            url: streamUrl,
+                            quality: '320kbps',
+                            contentType: validation.contentType,
+                            provider: 'jiosaavn',
+                            song,
+                        };
+                    }
+                }
+            }
+        } catch (_) {}
+    }
+
+    const searchQueries = [
+        [title, artist].filter(Boolean).join(' '),
+        [title, album].filter(Boolean).join(' '),
+        title,
+    ].filter(Boolean);
+
+    for (const q of searchQueries) {
+        try {
+            const candidates = await searchSongsDirect(q, 10).catch(() => [])
+                || await searchSaavnSongsOnly(q, 1).then(r => r?.data?.results || []).catch(() => []);
+            if (!Array.isArray(candidates) || candidates.length === 0) continue;
+
+            let bestCandidate = null;
+            let highestScore = -1;
+
+            for (const cand of candidates) {
+                const candTitle = normText(cand.name || cand.title || '');
+                const candArtist = normText(cand.primaryArtists || cand.artist || '');
+                const titleSim = bigramSimilarity(normText(title || ''), candTitle);
+                const artistSim = artist ? bigramSimilarity(normText(artist), candArtist) : 0.5;
+
+                const score = titleSim * 0.7 + artistSim * 0.3;
+                if (score > highestScore && score >= 0.45) {
+                    highestScore = score;
+                    bestCandidate = cand;
+                }
+            }
+
+            if (!bestCandidate) continue;
+
+            const streamUrl = _extractStreamUrlFromCandidate(bestCandidate);
+            if (streamUrl) {
+                const validation = await validateStreamUrl(streamUrl);
+                if (validation.valid) {
+                    return {
+                        url: streamUrl,
+                        quality: '320kbps',
+                        contentType: validation.contentType,
+                        provider: 'jiosaavn',
+                        song: bestCandidate,
+                    };
+                }
+            }
+        } catch (_) {}
+    }
+
+    return null;
+}
+
+/**
+ * Resolve stream concurrently from Gaana + JioSaavn.
+ */
+async function resolveDualStream(params) {
+    // Fire Gaana and JioSaavn resolvers in parallel
+    const [gaanaRes, saavnRes] = await Promise.allSettled([
+        resolveFromGaana(params),
+        resolveFromJioSaavn(params),
+    ]);
+
+    const gaana = gaanaRes.status === 'fulfilled' ? gaanaRes.value : null;
+    const saavn = saavnRes.status === 'fulfilled' ? saavnRes.value : null;
+
+    // Pick first verified valid stream
+    return gaana || saavn || null;
+}
+
 // ─── POST /api/player/resolve ────────────────────────────────────────────────
 // Request: { id, title, artist, album, language }
-// Response: { success: true, data: { trackId, streamUrl, proxyUrl, isPlayable: true } }
+// Response: { success: true, data: { trackId, streamUrl, proxyUrl, isPlayable: true, provider } }
 
 async function handlePlayerResolve(req, res) {
     const params = {
@@ -201,18 +298,18 @@ async function handlePlayerResolve(req, res) {
                 proxyUrl: `/api/stream/${trackKey}`,
                 isPlayable: true,
                 bitrate: cached.quality || '320kbps',
-                provider: 'gaana',
+                provider: cached.provider || 'gaana',
                 cached: true,
             },
         });
     }
 
     try {
-        const resolved = await resolveGaanaStream(params);
+        const resolved = await resolveDualStream(params);
         if (!resolved || !resolved.url) {
             return res.status(404).json({
                 success: false,
-                error: `No playable Gaana stream found for "${params.title}"`,
+                error: `No playable Gaana/JioSaavn stream found for "${params.title}"`,
                 code: 'NOT_PLAYABLE',
             });
         }
@@ -222,6 +319,7 @@ async function handlePlayerResolve(req, res) {
             upstreamUrl: resolved.url,
             quality: resolved.quality,
             contentType: resolved.contentType,
+            provider: resolved.provider,
             title: params.title,
             artist: params.artist,
         });
@@ -234,7 +332,7 @@ async function handlePlayerResolve(req, res) {
                 proxyUrl: `/api/stream/${trackKey}`,
                 isPlayable: true,
                 bitrate: resolved.quality || '320kbps',
-                provider: 'gaana',
+                provider: resolved.provider,
                 cached: false,
             },
         });
@@ -242,7 +340,7 @@ async function handlePlayerResolve(req, res) {
         console.error('[player/resolve]', err);
         return res.status(500).json({
             success: false,
-            error: 'Failed to resolve stream from Gaana',
+            error: 'Failed to resolve stream from Gaana/JioSaavn',
             code: 'RESOLVER_ERROR',
         });
     }
