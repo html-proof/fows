@@ -12,7 +12,8 @@ import {
     searchAlbums,
     getLyricsBySongId,
 } from '../services/saavnApi.js';
-import { searchAlbumsDirect, autocompleteAlbumSearch, getTrendingDirect } from '../services/jiosaavnDirect.js';
+import { searchSongsDirect, searchAlbumsDirect, autocompleteAlbumSearch, getTrendingDirect } from '../services/jiosaavnDirect.js';
+import { searchSongsOnly as searchGaanaSongsOnly } from '../services/gaanaApi.js';
 import { auth } from '../config/firebase.js';
 import { getGlobalTrending } from '../services/database.js';
 import {
@@ -132,13 +133,31 @@ router.get('/search', async (req, res) => {
         ]);
 
         // ── Step 4: Merge + deduplicate + rank songs ─────────────────────────
-        const candidateGroups = songResults.status === 'fulfilled'
+        let candidateGroups = songResults.status === 'fulfilled'
             ? songResults.value.map((songs, index) => ({
                 source: index === 0 ? 'exact' : `variant:${index}`,
                 weight: Math.max(0.45, 1 - index * 0.15),
                 songs,
             }))
             : [];
+
+        // Fallback: If all primary search variants failed or yielded 0 songs,
+        // query direct JioSaavn and Gaana in parallel before giving up!
+        const totalVariantSongs = candidateGroups.reduce((acc, g) => acc + (Array.isArray(g.songs) ? g.songs.length : 0), 0);
+        if (totalVariantSongs === 0) {
+            console.warn(`[search] All variants empty for "${rawQuery}". Firing parallel direct fallback (JioSaavn + Gaana)...`);
+            const [directSaavn, gaanaResults] = await Promise.allSettled([
+                searchSongsDirect(rawQuery, 20),
+                searchGaanaSongsOnly(rawQuery, 20),
+            ]);
+            const fallbackList = [
+                ...(directSaavn.status === 'fulfilled' && Array.isArray(directSaavn.value) ? directSaavn.value : []),
+                ...(gaanaResults.status === 'fulfilled' && Array.isArray(gaanaResults.value) ? gaanaResults.value : []),
+            ];
+            if (fallbackList.length > 0) {
+                candidateGroups.push({ source: 'direct-fallback', weight: 1.0, songs: fallbackList });
+            }
+        }
 
         const rankedByEngine = filterRelevantSongs(
             fuseSongCandidates(candidateGroups, analysis),

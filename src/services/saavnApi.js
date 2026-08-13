@@ -1609,6 +1609,7 @@ function getCachedSmartSearch(query) {
 }
 
 function setCachedSmartSearch(query, data) {
+    if (!data || (Array.isArray(data) && data.length === 0)) return;
     const now = Date.now();
     smartSearchCache.set(query, {
         updatedAt: now,
