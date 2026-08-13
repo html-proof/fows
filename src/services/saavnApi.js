@@ -177,9 +177,7 @@ export async function searchSongsOnly(query, page = 1) {
             if (directPayload?.data?.results?.length > 0) {
                 return directPayload;
             }
-        } catch (directErr) {
-            console.warn(`[saavnApi] Direct JioSaavn fallback failed: ${describeProviderError(directErr)}`);
-        }
+        } catch (_) {}
     }
 
     if (!primaryPayload) {
@@ -475,9 +473,7 @@ async function computeSmartSearchResults({
                     preferredLanguageSet,
                 });
             }
-        } catch (err) {
-            console.warn(`[saavnApi] Direct fallback failed: ${describeProviderError(err)}`);
-        }
+        } catch (_) {}
     }
 
     return buildRankedOutput(ranked);

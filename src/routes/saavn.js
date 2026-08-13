@@ -153,7 +153,6 @@ router.get('/search', async (req, res) => {
         // query direct JioSaavn and Gaana in parallel before giving up!
         const totalVariantSongs = candidateGroups.reduce((acc, g) => acc + (Array.isArray(g.songs) ? g.songs.length : 0), 0);
         if (totalVariantSongs === 0) {
-            console.warn(`[search] All variants empty for "${rawQuery}". Firing parallel direct fallback (JioSaavn + Gaana)...`);
             const [directSaavn, gaanaResults] = await Promise.allSettled([
                 searchSongsDirect(rawQuery, 20),
                 searchGaanaSongsOnly(rawQuery, 20),

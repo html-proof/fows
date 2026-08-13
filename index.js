@@ -20,15 +20,10 @@ const sockets = new Set();
 async function selfPing() {
     if (!KEEPALIVE_URL) return;
     try {
-        const res = await fetch(KEEPALIVE_URL, {
+        await fetch(KEEPALIVE_URL, {
             signal: AbortSignal.timeout(10_000),
         });
-        console.log(
-            `[keepalive] ${new Date().toISOString()} -> ${res.status}`
-        );
-    } catch (err) {
-        console.warn(`[keepalive] ping failed: ${err.message}`);
-    }
+    } catch (_) {}
 }
 
 function clearKeepaliveTimers() {
