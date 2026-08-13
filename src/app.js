@@ -11,6 +11,7 @@ import recommendationRoutes from './routes/recommendations.js';
 import playlistImportRoutes from './routes/playlistImport.js';
 import catalogRoutes from './routes/catalog.js';
 import playerRoutes from './routes/player.js';
+import streamRoutes from './routes/stream.js';
 import { isShuttingDown } from './runtimeState.js';
 
 const app = express();
@@ -113,6 +114,8 @@ app.use('/api/songs', cachePublic(3600, 86400));             // 1 h / 24 h
 app.use('/api/albums', cachePublic(3600, 21600));            // 1 h / 6 h
 app.use('/api/artists', cachePublic(1800, 7200));            // 30 min / 2 h
 app.use('/api/search', cachePublic(300, 600));               // 5 min / 10 min
+app.use('/stream', streamRoutes);
+app.use('/api/stream', streamRoutes);
 app.use('/api', playerRoutes);
 app.use('/api', saavnRoutes);
 
