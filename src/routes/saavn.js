@@ -29,6 +29,8 @@ import {
 import { getUserPreferences } from '../services/database.js';
 import { rerankSongsForUser } from '../services/personalizationModel.js';
 import { attachCanonicalIds } from '../services/identityResolver.js';
+import { resolveStream } from '../services/playbackResolver.js';
+import { validatePlayableStream } from '../services/streamValidator.js';
 
 const router = Router();
 const DEFAULT_LIMIT = 40;
@@ -1077,42 +1079,71 @@ router.get('/songs/:id/stream', async (req, res) => {
 
     try {
         const now = Date.now();
-        let urls;
+        let urls = null;
 
         const cached = _streamCache.get(songId);
         if (cached && cached.expiresAt > now) {
             urls = cached.urls;
         } else {
-            const data = await getSongById(songId);
-            const song = data?.data?.[0] ?? data?.data ?? null;
-            if (!song) return res.status(404).json({ error: 'Song not found' });
+            try {
+                const data = await getSongById(songId);
+                const song = data?.data?.[0] ?? data?.data ?? null;
+                if (song) {
+                    urls = song.downloadUrl ?? song.streamUrl ?? [];
+                    if (urls.length) {
+                        _streamCache.set(songId, { urls, expiresAt: now + _STREAM_TTL_MS });
+                        if (_streamCache.size > 1000) _streamCache.delete(_streamCache.keys().next().value);
+                    }
+                }
+            } catch (_) {}
+        }
 
-            urls = song.downloadUrl ?? song.streamUrl ?? [];
-            if (urls.length) {
-                _streamCache.set(songId, { urls, expiresAt: now + _STREAM_TTL_MS });
-                if (_streamCache.size > 1000) _streamCache.delete(_streamCache.keys().next().value);
+        if (urls && urls.length) {
+            // Pick requested quality, fall back down the chain
+            const urlMap = Object.fromEntries(urls.map(u => [u.quality, u.url]));
+            const startIdx = Math.max(0, QUALITY_ORDER.indexOf(quality));
+            let chosenUrl = null;
+            let chosenQuality = null;
+            for (const q of QUALITY_ORDER.slice(startIdx)) {
+                if (urlMap[q]) { chosenUrl = urlMap[q]; chosenQuality = q; break; }
+            }
+            if (!chosenUrl) { chosenUrl = urls[0].url; chosenQuality = urls[0].quality; }
+
+            const isValid = await validatePlayableStream(chosenUrl);
+            if (isValid) {
+                return res.json({
+                    success: true,
+                    data: {
+                        songId,
+                        streamUrl: chosenUrl,
+                        quality: chosenQuality,
+                        allQualities: urls.map(u => ({ quality: u.quality, url: u.url })),
+                    },
+                });
             }
         }
 
-        if (!urls.length) return res.status(404).json({ error: 'No stream URL available' });
+        // Fallback to verified parallel playback resolver
+        const resolved = await resolveStream(songId, {
+            forceRefresh: true,
+            overrideTrack: {
+                title: req.query.title ?? '',
+                artist_name: req.query.artist ?? '',
+                album_name: req.query.album ?? '',
+                duration_ms: req.query.duration ? parseInt(req.query.duration, 10) * 1000 : undefined,
+                language: req.query.language ?? '',
+            }
+        });
 
-        // Pick requested quality, fall back down the chain
-        const urlMap = Object.fromEntries(urls.map(u => [u.quality, u.url]));
-        const startIdx = Math.max(0, QUALITY_ORDER.indexOf(quality));
-        let chosenUrl = null;
-        let chosenQuality = null;
-        for (const q of QUALITY_ORDER.slice(startIdx)) {
-            if (urlMap[q]) { chosenUrl = urlMap[q]; chosenQuality = q; break; }
-        }
-        if (!chosenUrl) { chosenUrl = urls[0].url; chosenQuality = urls[0].quality; }
-
-        res.json({
+        return res.json({
             success: true,
             data: {
                 songId,
-                streamUrl: chosenUrl,
-                quality: chosenQuality,
-                allQualities: urls.map(u => ({ quality: u.quality, url: u.url })),
+                streamUrl: resolved.url,
+                quality: resolved.quality,
+                provider: resolved.provider,
+                validationStatus: resolved.validationStatus,
+                allQualities: [{ quality: resolved.quality, url: resolved.url }],
             },
         });
     } catch (error) {
