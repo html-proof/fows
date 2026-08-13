@@ -6,7 +6,7 @@ import {
     getAlbumByIdDirect,
     searchArtistsDirect,
 } from './jiosaavnDirect.js';
-import { getSongById as getGaanaSongById } from './gaanaApi.js';
+import { getSongById as getGaanaSongById, searchSongsOnly as searchGaanaSongsOnly } from './gaanaApi.js';
 
 function describeProviderError(error) {
     const message = String(error?.message ?? '').trim();
@@ -337,6 +337,7 @@ async function computeSmartSearchResults({
         const shouldFetchFallback = i === 0 || ranked.size < Math.ceil(SMART_SEARCH_MIN_RESULTS / 2);
         const jobs = [
             { key: 'primary', promise: searchSongsOnlyPrimary(variant, 1) },
+            { key: 'direct', promise: searchSongsOnlyDirect(variant, 20) },
         ];
 
         if (shouldFetchBroad) {
@@ -344,6 +345,7 @@ async function computeSmartSearchResults({
         }
         if (shouldFetchFallback) {
             jobs.push({ key: 'fallback', promise: searchSongsOnlyFallback(variant) });
+            jobs.push({ key: 'gaana', promise: searchGaanaSongsOnly(variant, 20) });
         }
 
         const settled = await Promise.allSettled(jobs.map(job => job.promise));
@@ -355,11 +357,17 @@ async function computeSmartSearchResults({
         const primarySongs = resultsByKey.primary?.status === 'fulfilled'
             ? (resultsByKey.primary.value?.data?.results ?? [])
             : [];
+        const directSongs = resultsByKey.direct?.status === 'fulfilled'
+            ? (resultsByKey.direct.value?.data?.results ?? [])
+            : [];
         const broadSongs = resultsByKey.broad?.status === 'fulfilled'
             ? (resultsByKey.broad.value?.data?.results ?? [])
             : [];
         const fallbackSongs = resultsByKey.fallback?.status === 'fulfilled'
             ? resultsByKey.fallback.value
+            : [];
+        const gaanaSongs = resultsByKey.gaana?.status === 'fulfilled'
+            ? (Array.isArray(resultsByKey.gaana.value) ? resultsByKey.gaana.value : [])
             : [];
 
         addRankedSongs({
@@ -368,6 +376,15 @@ async function computeSmartSearchResults({
             query: normalizedQuery,
             variantIndex: i,
             sourceWeight: 15,
+            languageHint,
+            preferredLanguageSet,
+        });
+        addRankedSongs({
+            ranked,
+            songs: directSongs,
+            query: normalizedQuery,
+            variantIndex: i,
+            sourceWeight: 14,
             languageHint,
             preferredLanguageSet,
         });
@@ -386,6 +403,15 @@ async function computeSmartSearchResults({
             query: normalizedQuery,
             variantIndex: i,
             sourceWeight: 5,
+            languageHint,
+            preferredLanguageSet,
+        });
+        addRankedSongs({
+            ranked,
+            songs: gaanaSongs,
+            query: normalizedQuery,
+            variantIndex: i,
+            sourceWeight: 12,
             languageHint,
             preferredLanguageSet,
         });
