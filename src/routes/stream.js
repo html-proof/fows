@@ -1,16 +1,15 @@
 import express from 'express';
 import { request } from 'undici';
 import { getSongDirect, searchSongsDirect } from '../services/jiosaavnDirect.js';
-import { getSongById as getSaavnSongById, searchSongsOnly as searchSaavnSongsOnly } from '../services/saavnApi.js';
+import { getSongById as getSaavnSongById } from '../services/saavnApi.js';
 import { getSongById as getGaanaSongById, searchSongsOnly as searchGaanaSongsOnly } from '../services/gaanaApi.js';
-import { normText, bigramSimilarity } from '../services/searchEngine.js';
 import { getSpoofedHeaders } from '../middleware/spoofHeaders.js';
 
 const router = express.Router();
 
-// Memory cache for resolved stream URLs to avoid re-resolving on every chunk request
+// Fast memory cache for resolved stream URLs
 const resolvedUrlCache = new Map();
-const URL_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const URL_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 function getCachedUrl(songId) {
     const entry = resolvedUrlCache.get(songId);
@@ -42,6 +41,7 @@ function _extractDownloadUrl(song) {
 
 /**
  * Validate that an upstream URL is active, returns HTTP 200/206, and has an audio/stream content-type.
+ * Fast 1.5s probe timeout to never block playback.
  */
 async function validateStreamUrl(url) {
     if (!url || typeof url !== 'string' || !url.startsWith('http')) {
@@ -54,14 +54,13 @@ async function validateStreamUrl(url) {
         const res = await request(url, {
             method: 'GET',
             headers: outboundHeaders,
-            headersTimeout: 4000,
-            bodyTimeout: 4000,
+            headersTimeout: 2000,
+            bodyTimeout: 2000,
         });
 
         const status = res.statusCode;
         const contentType = (res.headers['content-type'] ?? '').toLowerCase();
 
-        // Valid if 200/206 and content-type is audio, mp4, or hls
         const isValidStatus = status === 200 || status === 206;
         const isValidContentType =
             contentType.startsWith('audio/') ||
@@ -80,49 +79,45 @@ async function validateStreamUrl(url) {
 }
 
 /**
- * Resolve the upstream playable audio URL from JioSaavn or Gaana.
+ * Fast parallel upstream playable audio URL resolver.
  */
 async function resolveUpstreamAudioUrl(songId, queryHint = '', songTitle = '', songArtist = '') {
-    // 1. Check memory cache first
+    // 1. Check memory cache first (instant 0ms)
     const cached = getCachedUrl(songId);
     if (cached) return cached;
 
-    let searchHint = (queryHint || '').trim();
-
-    // 2. Direct JioSaavn lookup by ID
-    try {
-        const jioSong = await getSongDirect(songId).catch(() => null)
-            || await getSaavnSongById(songId).then(r => r?.data?.[0]).catch(() => null);
-        if (jioSong) {
-            if (!searchHint) {
-                searchHint = [jioSong.name || jioSong.title, jioSong.primaryArtists || jioSong.artist].filter(Boolean).join(' ');
-            }
+    // 2. Parallel direct lookups on JioSaavn and Gaana
+    const [jioRes, gaanaRes] = await Promise.allSettled([
+        (async () => {
+            const jioSong = await getSongDirect(songId).catch(() => null)
+                || await getSaavnSongById(songId).then(r => r?.data?.[0]).catch(() => null);
             const jioUrl = _extractDownloadUrl(jioSong);
             if (jioUrl && await validateStreamUrl(jioUrl)) {
-                setCachedUrl(songId, jioUrl);
                 return jioUrl;
             }
-        }
-    } catch (_) {}
-
-    // 3. Direct Gaana lookup by ID
-    try {
-        const gaanaDetail = await getGaanaSongById(songId).catch(() => null);
-        const gaanaSong = gaanaDetail?.data?.[0];
-        if (gaanaSong) {
-            if (!searchHint) {
-                searchHint = [gaanaSong.name || gaanaSong.title, gaanaSong.primaryArtists || gaanaSong.artist].filter(Boolean).join(' ');
-            }
+            return null;
+        })(),
+        (async () => {
+            const gaanaDetail = await getGaanaSongById(songId).catch(() => null);
+            const gaanaSong = gaanaDetail?.data?.[0];
             const gaanaUrl = _extractDownloadUrl(gaanaSong);
             if (gaanaUrl && await validateStreamUrl(gaanaUrl)) {
-                setCachedUrl(songId, gaanaUrl);
                 return gaanaUrl;
             }
-        }
-    } catch (_) {}
+            return null;
+        })(),
+    ]);
 
-    // 4. Fallback parallel search on JioSaavn and Gaana
-    const searchTarget = [songTitle, songArtist, searchHint, songId.replace(/[-_]/g, ' ')].filter(Boolean)[0] || '';
+    const directWinner = (jioRes.status === 'fulfilled' ? jioRes.value : null)
+        || (gaanaRes.status === 'fulfilled' ? gaanaRes.value : null);
+
+    if (directWinner) {
+        setCachedUrl(songId, directWinner);
+        return directWinner;
+    }
+
+    // 3. Fallback parallel search if direct lookups yielded no stream
+    const searchTarget = [songTitle, songArtist, queryHint, songId.replace(/[-_]/g, ' ')].filter(Boolean)[0] || '';
     if (searchTarget.length > 1) {
         try {
             const [jioResults, gaanaResults] = await Promise.allSettled([
@@ -132,13 +127,22 @@ async function resolveUpstreamAudioUrl(songId, queryHint = '', songTitle = '', s
 
             const jioSongs = jioResults.status === 'fulfilled' && Array.isArray(jioResults.value) ? jioResults.value : [];
             const gaanaSongs = gaanaResults.status === 'fulfilled' && Array.isArray(gaanaResults.value) ? gaanaResults.value : [];
+            const candidates = [...gaanaSongs, ...jioSongs];
 
-            for (const cand of [...gaanaSongs, ...jioSongs]) {
+            // Probe top candidates in parallel
+            const probePromises = candidates.map(async (cand) => {
                 const candUrl = _extractDownloadUrl(cand);
                 if (candUrl && await validateStreamUrl(candUrl)) {
-                    setCachedUrl(songId, candUrl);
                     return candUrl;
                 }
+                return null;
+            });
+
+            const results = await Promise.all(probePromises);
+            const validWinner = results.find(url => url !== null);
+            if (validWinner) {
+                setCachedUrl(songId, validWinner);
+                return validWinner;
             }
         } catch (_) {}
     }
@@ -159,7 +163,7 @@ async function handleStreamRequest(req, res) {
         return res.status(400).json({ error: 'Song ID is required' });
     }
 
-    // 1. Resolve real audio URL from JioSaavn / Gaana with validation
+    // 1. Fast parallel resolution
     const realAudioUrl = await resolveUpstreamAudioUrl(songId, queryHint, songTitle, songArtist);
     if (!realAudioUrl) {
         return res.status(404).json({
@@ -168,31 +172,29 @@ async function handleStreamRequest(req, res) {
         });
     }
 
-    // 2. Prepare headers with browser spoofing and incoming Range
+    // 2. Forward Range headers
     const rangeHeader = req.headers['range'];
     const outboundHeaders = getSpoofedHeaders('stream', {
         ...(rangeHeader ? { 'Range': rangeHeader } : {}),
     });
 
     try {
-        // 3. Make server-side request to upstream real URL
         const upstreamRes = await request(realAudioUrl, {
             method: req.method === 'HEAD' ? 'HEAD' : 'GET',
             headers: outboundHeaders,
-            headersTimeout: 10000,
+            headersTimeout: 6000,
             bodyTimeout: 30000,
         });
 
         const statusCode = upstreamRes.statusCode;
         const headers = upstreamRes.headers;
 
-        // 4. Set standard streaming & CORS headers
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
         res.setHeader('Access-Control-Allow-Headers', 'Range, Accept, Content-Type');
         res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges');
         res.setHeader('Accept-Ranges', 'bytes');
-        res.setHeader('Cache-Control', 'public, max-age=1800');
+        res.setHeader('Cache-Control', 'public, max-age=3600');
 
         if (headers['content-type']) {
             res.setHeader('Content-Type', headers['content-type']);
@@ -204,7 +206,6 @@ async function handleStreamRequest(req, res) {
             res.setHeader('Content-Range', headers['content-range']);
         }
 
-        // 5. Set status 206 for Range responses, 200 otherwise
         res.status(statusCode);
 
         if (req.method === 'HEAD') {
@@ -212,7 +213,6 @@ async function handleStreamRequest(req, res) {
             return res.end();
         }
 
-        // 6. Pipe upstream stream directly to client
         const stream = upstreamRes.body;
         req.on('close', () => {
             try {
