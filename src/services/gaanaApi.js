@@ -202,7 +202,6 @@ export async function getSongById(idOrUrl) {
     if (!seokey) return { success: false, data: [] };
 
     try {
-        console.log(`[gaanaApi] getSongById: ${seokey}`);
         const songDetailUrl = `https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seokey)}`;
         const songDetails = await fetchFromGaana(songDetailUrl, 'POST');
 
@@ -259,7 +258,6 @@ export async function getSongFromUrl(url) {
 
 export async function searchSongsOnly(query, limit = 20) {
     try {
-        console.log(`[gaanaApi] searchSongsOnly: "${query}"`);
         const searchUrl = `https://gaana.com/apiv2?country=IN&page=0&secType=track&type=search&keyword=${encodeURIComponent(query)}`;
         const searchResult = await fetchFromGaana(searchUrl, 'POST');
 
