@@ -146,8 +146,19 @@ async function _resolveDirectById(songId) {
                 || await getSongById(jioId).then(r => r?.data?.[0] || r?.data).catch(() => null);
             const extracted = _extractDownloadUrl(song);
             if (!extracted) return null;
-            // Trust JioSaavn's own CDN URL directly — no probe needed here.
-            // The /api/v1/playback proxy handles 403/expired URLs with re-resolve.
+
+            // Fast HEAD probe check — verify JioSaavn CDN file actually exists (not 404/deleted)
+            try {
+                const probeRes = await fetch(extracted.url, {
+                    method: 'HEAD',
+                    headers: getHeadersForStreamUrl(extracted.url),
+                    signal: AbortSignal.timeout(1500),
+                });
+                if (probeRes.status === 404 || probeRes.status === 410) {
+                    return null;
+                }
+            } catch (_) {}
+
             return {
                 streamUrl: extracted.url,
                 quality: extracted.quality,

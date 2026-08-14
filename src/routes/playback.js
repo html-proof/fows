@@ -128,14 +128,14 @@ async function handlePlayback(req, res) {
 
             const { status } = upstreamRes;
 
-            // CDN token expired / revoked — re-resolve once, then retry
-            if ((status === 401 || status === 403 || status === 410) && attempt === 1) {
+            // CDN token expired / revoked / deleted — re-resolve once via fallback search, then retry
+            if ((status === 404 || status === 401 || status === 403 || status === 410) && attempt === 1) {
                 console.warn(`[playback] CDN returned ${status} for ${songId} — re-resolving URL`);
                 invalidateStreamCache(trackKey);
                 invalidateStreamCache(songId);
                 try {
                     streamData = await resolvePlayableStream({
-                        id: songId, title: songTitle, artist: songArtist, album: songAlbum, language,
+                        id: '', title: songTitle, artist: songArtist, album: songAlbum, language,
                     });
                     realAudioUrl = streamData.streamUrl;
                 } catch (resolveErr) {

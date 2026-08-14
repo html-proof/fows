@@ -216,9 +216,9 @@ async function forwardToBackend(request, url) {
         redirect: 'follow',
     };
 
-    // Don't attach a body to GET/HEAD
+    // Buffer body for POST/PUT/PATCH to prevent Cloudflare Worker streaming deadlock
     if (request.method !== 'GET' && request.method !== 'HEAD') {
-        init.body = request.body;
+        init.body = await request.arrayBuffer();
     }
 
     // 90s for streaming audio routes (progressive MP4/MP3 can take >15s to pipe
