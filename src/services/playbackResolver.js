@@ -241,8 +241,8 @@ async function _resolveBySearch(title, artist = '', album = '') {
             const probePromises = topCandidates.map(async ({ cand, provider }) => {
                 const extracted = _extractDownloadUrl(cand);
                 if (!extracted) return null;
-                // Use a short 1.5s probe timeout to fail fast
-                const probe = await probeStreamUrl(extracted.url, { timeoutMs: 1500 });
+                // 3.5s probe timeout to accommodate cloud container network latencies
+                const probe = await probeStreamUrl(extracted.url, { timeoutMs: 3500 });
                 if (probe.isValid) {
                     return {
                         streamUrl: extracted.url,

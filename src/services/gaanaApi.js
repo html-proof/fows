@@ -258,7 +258,14 @@ export async function getSongFromUrl(url) {
 
 export async function searchSongsOnly(query, limit = 20) {
     try {
-        const searchUrl = `https://gaana.com/apiv2?country=IN&page=0&secType=track&type=search&keyword=${encodeURIComponent(query)}`;
+        const cleanQuery = String(query || '')
+            .replace(/[,\-_&]/g, ' ')
+            .replace(/\(.*?\)/g, '')
+            .replace(/\[.*?\]/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+        if (!cleanQuery) return [];
+        const searchUrl = `https://gaana.com/apiv2?country=IN&page=0&secType=track&type=search&keyword=${encodeURIComponent(cleanQuery)}`;
         const searchResult = await fetchFromGaana(searchUrl, 'POST');
 
         const gr = searchResult.gr ?? [];
