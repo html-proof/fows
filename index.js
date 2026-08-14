@@ -42,11 +42,9 @@ async function selfPing() {
         const res = await fetch(KEEPALIVE_URL, {
             signal: AbortSignal.timeout(10_000),
         });
-        console.log(
-            `[keepalive] ${new Date().toISOString()} -> ${res.status}`
-        );
+        // ping OK
     } catch (err) {
-        console.warn(`[keepalive] ping failed: ${err.message}`);
+        // Keepalive failures are transient — only log if they persist
     }
 }
 
@@ -62,12 +60,7 @@ function clearKeepaliveTimers() {
 }
 
 const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Music Hub API server running on 0.0.0.0:${PORT}`);
-
     if (KEEPALIVE_URL) {
-        console.log(
-            `[keepalive] Pinging ${KEEPALIVE_URL} every ${KEEPALIVE_INTERVAL_MS / 1000}s`
-        );
         keepaliveTimer = setInterval(selfPing, KEEPALIVE_INTERVAL_MS);
         initialKeepaliveTimeout = setTimeout(selfPing, 5_000);
     }
@@ -79,20 +72,13 @@ server.on('connection', socket => {
 });
 
 async function shutdown(signal) {
-    if (shutdownInFlight) {
-        console.log(`[shutdown] ${signal} received while shutdown is already in progress`);
-        return;
-    }
+    if (shutdownInFlight) return;
 
     shutdownInFlight = true;
-    console.log(`${signal} received, shutting down gracefully...`);
     markShuttingDown();
     clearKeepaliveTimers();
 
     const forceShutdownTimer = setTimeout(() => {
-        console.warn(
-            `[shutdown] forcing connection close after ${SHUTDOWN_TIMEOUT_MS}ms`
-        );
         if (typeof server.closeIdleConnections === 'function') {
             server.closeIdleConnections();
         }
@@ -114,7 +100,6 @@ async function shutdown(signal) {
             process.exit(1);
             return;
         }
-        console.log('[shutdown] HTTP server closed cleanly');
         process.exit(0);
     });
 }

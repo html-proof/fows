@@ -296,7 +296,6 @@ export async function resolvePlayableStream(params = {}) {
     // 1. Fast Memory Cache Check (Instant 0ms)
     const cached = getCachedStream(trackKey);
     if (cached && cached.streamUrl) {
-        console.log(`[StreamResolver] Cache HIT for "${songTitle || songId}" in ${Date.now() - startTime}ms`);
         return {
             id: trackKey,
             title: songTitle || cached.title,
@@ -322,7 +321,6 @@ export async function resolvePlayableStream(params = {}) {
     }
 
     const resolvePromise = (async () => {
-        console.log(`[StreamResolver] Resolving stream for "${songTitle}" (${songArtist}) ID: ${songId}`);
 
         // Overall 12s timeout — fail fast rather than cascade for 90s
         const timeoutPromise = new Promise((_, reject) =>
@@ -356,7 +354,7 @@ export async function resolvePlayableStream(params = {}) {
         }
 
         if (!winner || !winner.streamUrl) {
-            console.warn(`[StreamResolver] FAILED to resolve playable stream for "${songTitle || songId}" after ${Date.now() - startTime}ms`);
+            console.error(`[StreamResolver] No stream found for "${songTitle || songId}" after ${Date.now() - startTime}ms`);
             throw new PlaybackResolveError(`No playable stream found for "${songTitle || songId}"`, 'STREAM_NOT_FOUND');
         }
 
@@ -385,7 +383,6 @@ export async function resolvePlayableStream(params = {}) {
             artist: songArtist,
         });
 
-        console.log(`[StreamResolver] Resolved "${songTitle || songId}" via ${winner.provider} (${winner.quality}) in ${Date.now() - startTime}ms`);
         return resolvedData;
         })()]); // end Promise.race
     })().finally(() => {
