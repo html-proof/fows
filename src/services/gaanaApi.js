@@ -265,18 +265,21 @@ export async function searchSongsOnly(query, limit = 20) {
             .replace(/\s+/g, ' ')
             .trim();
         if (!cleanQuery) return [];
-        const searchUrl = `https://gaana.com/apiv2?country=IN&page=0&secType=track&type=search&keyword=${encodeURIComponent(cleanQuery)}`;
+        const searchUrl = `https://gaana.com/apiv2?type=search&keyword=${encodeURIComponent(cleanQuery)}`;
         const searchResult = await fetchFromGaana(searchUrl, 'POST');
 
         const gr = searchResult.gr ?? [];
-        if (!gr.length || !gr[0].gd) return [];
+        if (!gr.length) return [];
 
         const trackSeokeys = [];
-        for (let i = 0; i < Math.min(limit, gr[0].gd.length); i++) {
-            const track = gr[0].gd[i];
-            if (track.seo) {
-                trackSeokeys.push(track.seo);
+        for (const group of gr) {
+            for (const item of (group.gd || [])) {
+                if (item.seo && !trackSeokeys.includes(item.seo)) {
+                    trackSeokeys.push(item.seo);
+                    if (trackSeokeys.length >= limit) break;
+                }
             }
+            if (trackSeokeys.length >= limit) break;
         }
 
         if (trackSeokeys.length === 0) return [];
