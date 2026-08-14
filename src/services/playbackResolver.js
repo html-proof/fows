@@ -147,17 +147,19 @@ async function _resolveDirectById(songId) {
             const extracted = _extractDownloadUrl(song);
             if (!extracted) return null;
 
-            // Fast HEAD probe check — verify JioSaavn CDN file actually exists (not 404/deleted)
+            // Fast probe check — only accept if status is 200 or 206 (not 404/deleted/timeout)
             try {
                 const probeRes = await fetch(extracted.url, {
                     method: 'HEAD',
                     headers: getHeadersForStreamUrl(extracted.url),
                     signal: AbortSignal.timeout(1500),
                 });
-                if (probeRes.status === 404 || probeRes.status === 410) {
+                if (probeRes.status !== 200 && probeRes.status !== 206) {
                     return null;
                 }
-            } catch (_) {}
+            } catch (_) {
+                return null;
+            }
 
             return {
                 streamUrl: extracted.url,
@@ -195,10 +197,15 @@ async function _resolveDirectById(songId) {
  * Fallback parallel search across JioSaavn and Gaana for song title + artist.
  */
 async function _resolveBySearch(title, artist = '', album = '') {
+    const cleanTitle = title.replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '').replace(/[,\-_]/g, ' ').trim();
+    const primaryArtist = artist.split(',')[0].split('&')[0].replace(/[,\-_]/g, ' ').trim();
+    const cleanAlbum = album.replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '').replace(/[,\-_]/g, ' ').trim();
+
     const queries = [
+        [cleanTitle, primaryArtist].filter(Boolean).join(' '),
+        cleanTitle,
+        [cleanTitle, cleanAlbum].filter(Boolean).join(' '),
         [title, artist].filter(Boolean).join(' '),
-        [title, album].filter(Boolean).join(' '),
-        title,
     ].filter(q => q && q.trim().length > 1);
 
     for (const query of queries) {
