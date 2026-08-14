@@ -33,6 +33,7 @@ const PRIVATE_PREFIXES = [
     '/v1/stream',
     '/api/songs/',        // /api/songs/:id/stream must not be cached as a static GET
     '/v1/catalog/play',   // stream redirects must not be cached as static GET
+    '/api/v1/playback',   // new clean playback gateway — never cache audio proxy
 ];
 
 const EDGE_CACHE_TTLS = {
@@ -213,16 +214,29 @@ async function forwardToBackend(request, url) {
         init.body = request.body;
     }
 
-    // 15s timeout: returns a proper 504 instead of dropping the TCP connection
-    init.signal = AbortSignal.timeout(15000);
+    // 90s for streaming audio routes (progressive MP4/MP3 can take >15s to pipe
+    // a full 5-8 MB track at slow CDN speeds). 15s for all other API calls.
+    const isStreamingRoute =
+        url.pathname.startsWith('/api/stream') ||
+        url.pathname.startsWith('/stream') ||
+        url.pathname.startsWith('/api/v1/playback');
+    init.signal = AbortSignal.timeout(isStreamingRoute ? 90000 : 15000);
 
     try {
         const response = await fetch(backendUrl.toString(), init);
         const newHeaders = new Headers(response.headers);
         newHeaders.set('Access-Control-Allow-Origin', '*');
         newHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, HEAD');
-        newHeaders.set('Access-Control-Allow-Headers', 'Authorization, Content-Type, Range, Cache-Control, Accept, Origin, User-Agent');
-        newHeaders.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges, Content-Type, X-Cache');
+        newHeaders.set('Access-Control-Allow-Headers', 'Authorization, Content-Type, Range, If-Range, Cache-Control, Accept, Origin, User-Agent');
+        newHeaders.set('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges, Content-Type, X-Cache, X-Stream-Provider');
+
+        // Strip Content-Encoding from audio/streaming responses — Cloudflare must
+        // not re-compress bytes that the backend has already served uncompressed.
+        // Applying gzip on top of raw audio corrupts Content-Length & Content-Range.
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.startsWith('audio/') || contentType.includes('octet-stream')) {
+            newHeaders.delete('Content-Encoding');
+        }
 
         return new Response(response.body, {
             status: response.status,

@@ -44,6 +44,8 @@ export const AUDIO_STREAM_HEADERS = {
     ...CHROME_CLIENT_HINTS,
     'Accept': '*/*',
     'Accept-Language': 'en-US,en;q=0.9',
+    // Explicitly forbid compression from CDN — gzip breaks Content-Length and
+    // Content-Range calculations that ExoPlayer/AVPlayer require for seeking.
     'Accept-Encoding': 'identity',
     'Sec-Fetch-Dest': 'audio',
     'Sec-Fetch-Mode': 'no-cors',

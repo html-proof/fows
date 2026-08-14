@@ -12,6 +12,7 @@ import playlistImportRoutes from './routes/playlistImport.js';
 import catalogRoutes from './routes/catalog.js';
 import playerRoutes from './routes/player.js';
 import streamRoutes from './routes/stream.js';
+import playbackRoutes from './routes/playback.js';
 import { isShuttingDown } from './runtimeState.js';
 
 const app = express();
@@ -21,7 +22,15 @@ app.set('trust proxy', 2);
 
 // Gzip / Brotli compression — reduces payload size 60-80% for JSON responses.
 // Cloudflare also compresses at the edge, but this covers direct Render traffic.
-app.use(compression({ level: 6, threshold: 512 }));
+// CRITICAL: Do NOT compress audio streaming routes — gzip breaks Content-Length
+// and Content-Range headers that ExoPlayer/AVPlayer need for byte-accurate seeking.
+const STREAMING_ROUTE_PREFIXES = ['/api/stream', '/stream', '/api/v1/playback'];
+app.use((req, res, next) => {
+    const path = req.path;
+    const isStreamingRoute = STREAMING_ROUTE_PREFIXES.some(prefix => path.startsWith(prefix));
+    if (isStreamingRoute) return next();
+    compression({ level: 6, threshold: 512 })(req, res, next);
+});
 
 // Security headers
 app.use(helmet());
@@ -103,6 +112,8 @@ app.use('/api/user', cachePrivate, userRoutes);
 app.use('/api/activity', cachePrivate, activityRoutes);
 app.use('/api/recommendations', cachePrivate, recommendationRoutes);
 app.use('/api/playlist', strictLimiter, cachePrivate, playlistImportRoutes);
+// Playback gateway — never cache, never compress (registered before catalogRoutes)
+app.use('/api/v1/playback', cachePrivate, playbackRoutes);
 app.use('/v1/catalog/resolve', cachePublic(600, 1800));      // stream URLs: 10 min / 30 min
 app.use('/v1/catalog/tracks', cachePublic(3600, 86400));     // track meta: 1 h / 24 h
 app.use('/v1', cachePublic(300, 600), catalogRoutes);
