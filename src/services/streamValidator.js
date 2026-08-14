@@ -1,4 +1,3 @@
-import { request } from 'undici';
 import { AUDIO_STREAM_HEADERS, GAANA_HEADERS, JIOSAAVN_HEADERS } from '../config/headers.js';
 
 const VALIDATION_TIMEOUT_MS = 2000;
@@ -66,7 +65,7 @@ export function isValidAudioContentType(contentType = '', url = '') {
 
 /**
  * Probe a stream URL via HEAD or Range GET to check HTTP status and media Content-Type.
- * Follows HTTP redirects if returned.
+ * Uses Node built-in fetch() so it respects the global IPv4 dispatcher and follows redirects.
  *
  * @param {string} rawUrl - Upstream media stream URL
  * @param {object} [options]
@@ -87,138 +86,68 @@ export async function probeStreamUrl(rawUrl, options = {}) {
     }
 
     const timeoutMs = options.timeoutMs || VALIDATION_TIMEOUT_MS;
-    let currentUrl = rawUrl;
-    let redirectCount = 0;
-    const maxRedirects = 3;
+    const outboundHeaders = options.headers || getHeadersForStreamUrl(rawUrl);
 
-    while (redirectCount <= maxRedirects) {
-        const outboundHeaders = options.headers || getHeadersForStreamUrl(currentUrl);
+    // Step 1: Fast HEAD probe using fetch()
+    try {
+        const res = await fetch(rawUrl, {
+            method: 'HEAD',
+            headers: outboundHeaders,
+            redirect: 'follow',
+            signal: AbortSignal.timeout(timeoutMs),
+        });
 
-        // Step 1: Fast HEAD probe
-        try {
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), timeoutMs);
+        const statusCode = res.status;
+        const contentType = String(res.headers.get('content-type') || '').toLowerCase();
+        const contentLength = res.headers.get('content-length') ? parseInt(res.headers.get('content-length'), 10) : null;
+        const isHls = contentType.includes('mpegurl') || rawUrl.includes('.m3u8') || res.url.includes('.m3u8');
+        const isValidStatus = statusCode === 200 || statusCode === 206;
+        const isValidType = isValidAudioContentType(contentType, rawUrl);
 
-            const res = await request(currentUrl, {
-                method: 'HEAD',
-                signal: controller.signal,
-                headersTimeout: timeoutMs,
-                bodyTimeout: timeoutMs,
-                headers: outboundHeaders,
-            });
-
-            clearTimeout(timeout);
-
-            const statusCode = res.statusCode;
-            const headers = res.headers;
-            await res.body.dump();
-
-            // Handle HTTP redirects
-            if ([301, 302, 307, 308].includes(statusCode) && headers.location) {
-                currentUrl = new URL(headers.location, currentUrl).toString();
-                redirectCount++;
-                continue;
-            }
-
-            const contentType = String(headers['content-type'] || '').toLowerCase();
-            const contentLength = headers['content-length'] ? parseInt(headers['content-length'], 10) : null;
-
-            const isHls = contentType.includes('mpegurl') || currentUrl.includes('.m3u8');
-            const isValidStatus = statusCode === 200 || statusCode === 206;
-            const isValidType = isValidAudioContentType(contentType, currentUrl);
-
-            if (isValidStatus && isValidType) {
-                return {
-                    isValid: true,
-                    contentType: headers['content-type'] || 'audio/mp4',
-                    contentLength,
-                    statusCode,
-                    isHls,
-                    durationMs: Date.now() - startTime,
-                };
-            }
-        } catch (_) {
-            // Fallback to partial Range GET probe
-        }
-
-        // Step 2: Partial Range GET probe (bytes=0-1023)
-        try {
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-            const res = await request(currentUrl, {
-                method: 'GET',
-                signal: controller.signal,
-                headersTimeout: timeoutMs,
-                bodyTimeout: timeoutMs,
-                headers: {
-                    ...outboundHeaders,
-                    'Range': 'bytes=0-1023',
-                },
-            });
-
-            clearTimeout(timeout);
-
-            const statusCode = res.statusCode;
-            const headers = res.headers;
-
-            // Handle HTTP redirects on GET
-            if ([301, 302, 307, 308].includes(statusCode) && headers.location) {
-                await res.body.dump();
-                currentUrl = new URL(headers.location, currentUrl).toString();
-                redirectCount++;
-                continue;
-            }
-
-            const contentType = String(headers['content-type'] || '').toLowerCase();
-            const contentLength = headers['content-length'] ? parseInt(headers['content-length'], 10) : null;
-
-            const isHls = contentType.includes('mpegurl') || currentUrl.includes('.m3u8');
-            const isValidStatus = statusCode === 200 || statusCode === 206;
-            const isValidType = isValidAudioContentType(contentType, currentUrl);
-
-            if (isValidStatus && isValidType) {
-                let hasBytes = false;
-                for await (const chunk of res.body) {
-                    if (chunk && chunk.length > 0) {
-                        hasBytes = true;
-                        break;
-                    }
-                }
-                if (hasBytes) {
-                    return {
-                        isValid: true,
-                        contentType: headers['content-type'] || 'audio/mp4',
-                        contentLength,
-                        statusCode,
-                        isHls,
-                        durationMs: Date.now() - startTime,
-                    };
-                }
-            } else {
-                await res.body.dump();
-            }
-
+        if (isValidStatus && isValidType) {
             return {
-                isValid: false,
-                contentType,
+                isValid: true,
+                contentType: res.headers.get('content-type') || 'audio/mp4',
                 contentLength,
                 statusCode,
                 isHls,
                 durationMs: Date.now() - startTime,
             };
-        } catch (err) {
+        }
+    } catch (_) {
+        // Fallback to partial Range GET probe
+    }
+
+    // Step 2: Partial Range GET probe (bytes=0-1023) using fetch()
+    try {
+        const res = await fetch(rawUrl, {
+            method: 'GET',
+            headers: {
+                ...outboundHeaders,
+                'Range': 'bytes=0-1023',
+            },
+            redirect: 'follow',
+            signal: AbortSignal.timeout(timeoutMs),
+        });
+
+        const statusCode = res.status;
+        const contentType = String(res.headers.get('content-type') || '').toLowerCase();
+        const contentLength = res.headers.get('content-length') ? parseInt(res.headers.get('content-length'), 10) : null;
+        const isHls = contentType.includes('mpegurl') || rawUrl.includes('.m3u8') || res.url.includes('.m3u8');
+        const isValidStatus = statusCode === 200 || statusCode === 206;
+        const isValidType = isValidAudioContentType(contentType, rawUrl);
+
+        if (isValidStatus && isValidType) {
             return {
-                isValid: false,
-                contentType: '',
-                contentLength: null,
-                statusCode: null,
-                isHls: false,
+                isValid: true,
+                contentType: res.headers.get('content-type') || 'audio/mp4',
+                contentLength,
+                statusCode,
+                isHls,
                 durationMs: Date.now() - startTime,
-                error: err.message,
             };
         }
-    }
+    } catch (_) {}
 
     return {
         isValid: false,
@@ -227,7 +156,7 @@ export async function probeStreamUrl(rawUrl, options = {}) {
         statusCode: null,
         isHls: false,
         durationMs: Date.now() - startTime,
-        error: 'Too many redirects',
+        error: 'Validation failed or timed out',
     };
 }
 
