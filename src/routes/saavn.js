@@ -30,7 +30,7 @@ import {
 import { getUserPreferences } from '../services/database.js';
 import { rerankSongsForUser } from '../services/personalizationModel.js';
 import { attachCanonicalIds } from '../services/identityResolver.js';
-import { resolveStream } from '../services/playbackResolver.js';
+import { resolveStream, setCachedStream, generateTrackKey } from '../services/playbackResolver.js';
 import { validatePlayableStream } from '../services/streamValidator.js';
 import {
     normalizeSongMetadata,
@@ -997,9 +997,31 @@ router.get('/albums', async (req, res) => {
         }
 
         if (data?.data) {
+            const normalized = normalizeAlbumMetadata(data.data);
+            // Pre-warm playbackResolver stream cache for every track in this album
+            if (Array.isArray(normalized?.songs)) {
+                for (const song of normalized.songs) {
+                    if (song.streamUrl) {
+                        const streamInfo = {
+                            streamUrl: song.streamUrl,
+                            bitrate: '320kbps',
+                            contentType: song.streamUrl.includes('.mp4') ? 'audio/mp4' : 'audio/mpeg',
+                            isHls: song.streamUrl.includes('.m3u8'),
+                            provider: 'jiosaavn',
+                            title: song.name || song.title,
+                            artist: song.artist || song.primaryArtists,
+                        };
+                        if (song.id) setCachedStream(song.id, streamInfo);
+                        if (song.canonicalId) setCachedStream(song.canonicalId, streamInfo);
+                        if (song.providerId) setCachedStream(song.providerId, streamInfo);
+                        const trackKey = generateTrackKey(song.id, song.name, song.artist, normalized.name);
+                        setCachedStream(trackKey, streamInfo);
+                    }
+                }
+            }
             data = {
                 success: true,
-                data: normalizeAlbumMetadata(data.data),
+                data: normalized,
             };
         }
 

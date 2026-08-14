@@ -121,12 +121,29 @@ function _scoreCandidate(targetTitle, targetArtist, candidate) {
  * Direct parallel lookup for a song on JioSaavn and Gaana by ID.
  */
 async function _resolveDirectById(songId) {
-    if (!songId || songId.startsWith('trk_')) return null;
+    if (!songId) return null;
+
+    let jioId = songId;
+    let gaanaId = songId;
+
+    // If songId is a canonical ID (trk_...), look up mapped provider IDs from SQLite
+    if (songId.startsWith('trk_')) {
+        try {
+            const mappedJio = getProviderTrackId(songId, 'jiosaavn');
+            if (mappedJio) jioId = mappedJio;
+            const mappedGaana = getProviderTrackId(songId, 'gaana');
+            if (mappedGaana) gaanaId = mappedGaana;
+            if (!mappedJio && !mappedGaana) return null;
+        } catch (_) {
+            return null;
+        }
+    }
 
     const [jioResult, gaanaResult] = await Promise.allSettled([
         (async () => {
-            const song = await getSongDirect(songId).catch(() => null)
-                || await getSongById(songId).then(r => r?.data?.[0] || r?.data).catch(() => null);
+            if (!jioId || jioId.startsWith('trk_')) return null;
+            const song = await getSongDirect(jioId).catch(() => null)
+                || await getSongById(jioId).then(r => r?.data?.[0] || r?.data).catch(() => null);
             const extracted = _extractDownloadUrl(song);
             if (!extracted) return null;
             // Trust JioSaavn's own CDN URL directly — no probe needed here.
@@ -141,7 +158,8 @@ async function _resolveDirectById(songId) {
             };
         })(),
         (async () => {
-            const detail = await getGaanaSongById(songId).catch(() => null);
+            if (!gaanaId || gaanaId.startsWith('trk_')) return null;
+            const detail = await getGaanaSongById(gaanaId).catch(() => null);
             const song = detail?.data?.[0] || detail?.data;
             const extracted = _extractDownloadUrl(song);
             if (!extracted) return null;
