@@ -197,9 +197,16 @@ async function forwardToBackend(request, url) {
     const headers = new Headers(request.headers);
     headers.set('X-Forwarded-Host', url.hostname);
 
-    // If client requested byte ranges, do NOT force compression encoding
-    // (compression breaks Range chunking and Content-Range calculation)
-    if (!request.headers.has('range')) {
+    const isStreamingRoute =
+        url.pathname.startsWith('/api/stream') ||
+        url.pathname.startsWith('/stream') ||
+        url.pathname.startsWith('/api/v1/playback') ||
+        url.pathname.includes('/chunk');
+
+    // Never compress audio streams, HLS playlists, or byte-range requests.
+    if (isStreamingRoute || request.headers.has('range')) {
+        headers.set('Accept-Encoding', 'identity');
+    } else {
         headers.set('Accept-Encoding', 'gzip, br');
     }
 
@@ -216,10 +223,6 @@ async function forwardToBackend(request, url) {
 
     // 90s for streaming audio routes (progressive MP4/MP3 can take >15s to pipe
     // a full 5-8 MB track at slow CDN speeds). 15s for all other API calls.
-    const isStreamingRoute =
-        url.pathname.startsWith('/api/stream') ||
-        url.pathname.startsWith('/stream') ||
-        url.pathname.startsWith('/api/v1/playback');
     init.signal = AbortSignal.timeout(isStreamingRoute ? 90000 : 15000);
 
     try {
@@ -232,9 +235,8 @@ async function forwardToBackend(request, url) {
 
         // Strip Content-Encoding from audio/streaming responses — Cloudflare must
         // not re-compress bytes that the backend has already served uncompressed.
-        // Applying gzip on top of raw audio corrupts Content-Length & Content-Range.
         const contentType = response.headers.get('content-type') || '';
-        if (contentType.startsWith('audio/') || contentType.includes('octet-stream')) {
+        if (contentType.startsWith('audio/') || contentType.includes('octet-stream') || contentType.includes('mpegurl')) {
             newHeaders.delete('Content-Encoding');
         }
 
