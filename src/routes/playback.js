@@ -23,7 +23,9 @@ import {
     generateTrackKey,
     PlaybackResolveError,
 } from '../services/playbackResolver.js';
-import { getHeadersForStreamUrl } from '../services/streamValidator.js';
+import { getHeadersForStreamUrl, probeStreamUrl } from '../services/streamValidator.js';
+import { getSongDirect } from '../services/jiosaavnDirect.js';
+import { searchSongsOnly as searchGaanaSongsOnly } from '../services/gaanaApi.js';
 
 const router = express.Router();
 
@@ -200,10 +202,6 @@ async function handlePlayback(req, res) {
         }
     }
 }
-
-import { getSongDirect } from '../services/jiosaavnDirect.js';
-import { searchSongsOnly as searchGaanaSongsOnly } from '../services/gaanaApi.js';
-import { probeStreamUrl } from '../services/streamValidator.js';
 
 // ─── GET /api/v1/playback/diagnostics/:songId ──────────────────────────────────
 router.get('/diagnostics/:songId', async (req, res) => {
