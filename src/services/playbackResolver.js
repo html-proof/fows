@@ -226,10 +226,10 @@ async function _resolveBySearch(title, artist = '', album = '') {
                 if (score >= 0.45) scoredCandidates.push({ cand, score, provider: 'gaana' });
             }
 
-            scoredCandidates.sort((a, b) => b.score - a.score);
-            // Limit to top 2 candidates — probing more adds latency without
-            // meaningful quality improvement. The proxy handles bad URLs.
-            const topCandidates = scoredCandidates.slice(0, 2);
+            // Collect top candidates from each distinct provider so a dead provider (e.g. JioSaavn 404) doesn't crowd out valid ones
+            const topJio = scoredCandidates.filter(c => c.provider === 'jiosaavn').slice(0, 2);
+            const topGaana = scoredCandidates.filter(c => c.provider === 'gaana').slice(0, 2);
+            const topCandidates = [...topJio, ...topGaana];
 
             if (topCandidates.length === 0) continue;
 
