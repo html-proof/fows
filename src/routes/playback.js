@@ -12,7 +12,11 @@
  */
 
 import express from 'express';
-import { request } from 'undici';
+import { request, Agent, interceptors } from 'undici';
+
+// Redirect-following agent (undici v6+ requires interceptor instead of maxRedirections option)
+const redirectAgent = new Agent().compose(interceptors.redirect({ maxRedirections: 5 }));
+
 import {
     resolvePlayableStream,
     getCachedStream,
@@ -124,10 +128,10 @@ async function handlePlayback(req, res) {
                 method: req.method === 'HEAD' ? 'HEAD' : 'GET',
                 headers: buildOutboundHeaders(realAudioUrl, req),
                 headersTimeout: 8000,
-                // 120s body timeout: streams a 5 MB 320kbps song at even slow
-                // CDN speeds without Cloudflare's 90s Worker hard-cutting us.
+                // 120s: gives Render time to stream large progressive files without
+                // Cloudflare's 90s Worker timeout becoming the bottleneck.
                 bodyTimeout: 120000,
-                maxRedirections: 5,
+                dispatcher: redirectAgent,
             });
 
             const { statusCode } = upstreamRes;

@@ -42,19 +42,20 @@ const allowedOrigins = (process.env.CORS_ORIGINS || '')
 
 const corsOptions = {
     origin: (origin, callback) => {
-        // No origin = server-to-server or curl; allow only in non-production
-        if (!origin) {
-            if (process.env.NODE_ENV === 'production') return callback(null, false);
-            return callback(null, true);
-        }
+        // No Origin header = mobile app (Flutter), server-to-server, or curl.
+        // Mobile clients like Flutter never send an Origin header — blocking them
+        // in production would reject ALL Flutter playback requests.
+        if (!origin) return callback(null, true);
+
         if (allowedOrigins.length === 0) {
-            // Deny all browser cross-origin requests when no allowlist is configured
-            return callback(null, false);
+            // No allowlist configured — public API, allow all browser origins.
+            return callback(null, true);
         }
         return callback(null, allowedOrigins.includes(origin));
     },
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Range', 'If-Range'],
+    exposedHeaders: ['Content-Range', 'Content-Length', 'Accept-Ranges', 'X-Stream-Provider'],
     credentials: true,
     maxAge: 86400,
     optionsSuccessStatus: 204,

@@ -1,5 +1,8 @@
 import express from 'express';
-import { request } from 'undici';
+import { request, Agent, interceptors } from 'undici';
+
+// Redirect-following agent (undici v6+ requires interceptor instead of maxRedirections option)
+const redirectAgent = new Agent().compose(interceptors.redirect({ maxRedirections: 5 }));
 import {
     resolvePlayableStream,
     getCachedStream,
@@ -134,7 +137,7 @@ async function handleChunkProxy(req, res) {
             headersTimeout: 6000,
             // HLS .ts chunks are small; 30s is enough
             bodyTimeout: 30000,
-            maxRedirections: 5,
+            dispatcher: redirectAgent,
         });
 
         setStreamCorsHeaders(res);
@@ -211,7 +214,7 @@ async function handleStreamProxy(req, res) {
                 // 120s: gives Render time to stream large progressive files without
                 // Cloudflare's 90s Worker timeout becoming the bottleneck.
                 bodyTimeout: 120000,
-                maxRedirections: 5,
+                dispatcher: redirectAgent,
             });
 
             const statusCode = upstreamRes.statusCode;
