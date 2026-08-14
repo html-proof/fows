@@ -1,4 +1,5 @@
 import { createDecipheriv } from 'crypto';
+import { GEO_CLIENT_IP, GAANA_COOKIE } from '../config/headers.js';
 
 // Primary Modern apiv2 stream decryption key (constructed safely to avoid shell variable expansion)
 const PRIMARY_KEY = Buffer.from(['g','y','1','t','#','b','@','j','l','(','b','$','w','t','m','e'].join(''), 'utf8');
@@ -92,9 +93,9 @@ async function fetchFromGaana(url, method = 'GET', body = null) {
         'Accept-Language': 'en-IN,en;q=0.9,hi;q=0.8,ml;q=0.7',
         'Origin': 'https://gaana.com',
         'Referer': 'https://gaana.com/',
-        'X-Forwarded-For': '103.212.157.1',
-        'Client-IP': '103.212.157.1',
-        'Cookie': 'country=IN; gaana_country=IN; geo_country=IN',
+        'X-Forwarded-For': GEO_CLIENT_IP,
+        'Client-IP': GEO_CLIENT_IP,
+        'Cookie': GAANA_COOKIE,
     };
 
     if (body) {

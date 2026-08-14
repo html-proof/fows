@@ -11,6 +11,10 @@ export const CHROME_CLIENT_HINTS = {
     'sec-ch-ua-platform': '"Windows"',
 };
 
+export const GEO_CLIENT_IP = process.env.GEO_CLIENT_IP || '103.212.157.1';
+export const JIOSAAVN_COOKIE = process.env.JIOSAAVN_COOKIE || 'country=IN; geo_country=IN; DL=english,hindi,malayalam,tamil';
+export const GAANA_COOKIE = process.env.GAANA_COOKIE || 'country=IN; gaana_country=IN; geo_country=IN';
+
 export const JIOSAAVN_HEADERS = {
     'User-Agent': BROWSER_USER_AGENT,
     ...CHROME_CLIENT_HINTS,
@@ -23,9 +27,9 @@ export const JIOSAAVN_HEADERS = {
     'Sec-Fetch-Site': 'same-site',
     'Cache-Control': 'no-cache',
     'Pragma': 'no-cache',
-    'X-Forwarded-For': '103.212.157.1',
-    'Client-IP': '103.212.157.1',
-    'Cookie': 'country=IN; geo_country=IN; DL=english,hindi,malayalam,tamil',
+    'X-Forwarded-For': GEO_CLIENT_IP,
+    'Client-IP': GEO_CLIENT_IP,
+    'Cookie': JIOSAAVN_COOKIE,
 };
 
 export const GAANA_HEADERS = {
@@ -40,9 +44,9 @@ export const GAANA_HEADERS = {
     'Sec-Fetch-Site': 'same-site',
     'Cache-Control': 'no-cache',
     'Pragma': 'no-cache',
-    'X-Forwarded-For': '103.212.157.1',
-    'Client-IP': '103.212.157.1',
-    'Cookie': 'country=IN; gaana_country=IN; geo_country=IN',
+    'X-Forwarded-For': GEO_CLIENT_IP,
+    'Client-IP': GEO_CLIENT_IP,
+    'Cookie': GAANA_COOKIE,
 };
 
 export const AUDIO_STREAM_HEADERS = {
