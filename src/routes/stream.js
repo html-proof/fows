@@ -259,13 +259,13 @@ async function handleStreamProxy(req, res) {
         }
     }
 
-    const statusCode  = upstreamRes.statusCode;
+    const statusCode  = upstreamRes.status;
     const headers     = upstreamRes.headers;
-    const contentType = String(headers['content-type'] || '').toLowerCase();
+    const contentType = String(headers.get ? headers.get('content-type') : (headers['content-type'] || '')).toLowerCase();
 
     // ── HLS playlist rewriting ────────────────────────────────────────────────
     if (isHls || contentType.includes('mpegurl') || realAudioUrl.includes('.m3u8')) {
-        const rawBody = await upstreamRes.body.text();
+        const rawBody = await upstreamRes.text();
         if (rawBody.includes('#EXTM3U')) {
             const baseUrl  = realAudioUrl.substring(0, realAudioUrl.lastIndexOf('/') + 1);
             const hostUrl  = `${req.protocol}://${req.get('host')}`;
