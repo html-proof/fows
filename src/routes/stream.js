@@ -65,6 +65,44 @@ async function pipeBody(upstreamBody, req, res) {
     });
 }
 
+// ─── Recursive HLS Playlist Flattener ─────────────────────────────────────────
+async function fetchAndFlattenM3u8(playlistUrl, hostUrl, depth = 0) {
+    if (depth > 3) return null;
+    try {
+        const headers = getHeadersForStreamUrl(playlistUrl);
+        const res = await fetch(playlistUrl, {
+            headers: { ...headers, 'Accept-Encoding': 'identity' },
+            redirect: 'follow',
+            signal: AbortSignal.timeout(15000),
+        });
+        if (!res.ok) return null;
+        const text = await res.text();
+        if (!text.includes('#EXTM3U')) return null;
+
+        // If master playlist with sub-playlists (#EXT-X-STREAM-INF), recursively resolve child playlist
+        if (text.includes('#EXT-X-STREAM-INF')) {
+            const lines = text.split('\n').map(l => l.trim());
+            const subPath = lines.find(l => l && !l.startsWith('#'));
+            if (subPath) {
+                const baseUrl = playlistUrl.substring(0, playlistUrl.lastIndexOf('/') + 1);
+                const childUrl = subPath.startsWith('http') ? subPath : new URL(subPath, baseUrl).toString();
+                return fetchAndFlattenM3u8(childUrl, hostUrl, depth + 1);
+            }
+        }
+
+        // Rewrite segment paths (e.g. segment-0.ts) to /api/stream/chunk?url=...
+        const baseUrl = playlistUrl.substring(0, playlistUrl.lastIndexOf('/') + 1);
+        return text.split('\n').map(line => {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) return line;
+            const absUrl = trimmed.startsWith('http') ? trimmed : new URL(trimmed, baseUrl).toString();
+            return `${hostUrl}/api/stream/chunk?url=${encodeURIComponent(absUrl)}`;
+        }).join('\n');
+    } catch (_) {
+        return null;
+    }
+}
+
 // ─── POST & GET /resolve (Stream Resolution Endpoint) ────────────────────────
 // Request Body / Query: { id, title, artist, album, language }
 // Returns validated direct streamUrl, proxyUrl, headers, and metadata.
@@ -137,6 +175,19 @@ async function handleChunkProxy(req, res) {
             redirect: 'follow',
             signal: AbortSignal.timeout(30000),
         });
+
+        const contentType = String(upstreamRes.headers.get ? upstreamRes.headers.get('content-type') : (upstreamRes.headers['content-type'] || '')).toLowerCase();
+        if (contentType.includes('mpegurl') || chunkUrl.includes('.m3u8')) {
+            const hostUrl = `${req.protocol}://${req.get('host')}`;
+            const rewritten = await fetchAndFlattenM3u8(chunkUrl, hostUrl);
+            if (rewritten) {
+                setStreamCorsHeaders(res);
+                res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+                res.setHeader('Cache-Control', 'public, max-age=300');
+                res.status(200);
+                return res.send(rewritten);
+            }
+        }
 
         setStreamCorsHeaders(res);
         res.setHeader('Cache-Control', 'public, max-age=3600');
@@ -263,25 +314,15 @@ async function handleStreamProxy(req, res) {
     const headers     = upstreamRes.headers;
     const contentType = String(headers.get ? headers.get('content-type') : (headers['content-type'] || '')).toLowerCase();
 
-    // ── HLS playlist rewriting ────────────────────────────────────────────────
+    // ── HLS playlist rewriting (flattens master to segment-level playlist) ──
     if (isHls || contentType.includes('mpegurl') || realAudioUrl.includes('.m3u8')) {
-        const rawBody = await upstreamRes.text();
-        if (rawBody.includes('#EXTM3U')) {
-            const baseUrl  = realAudioUrl.substring(0, realAudioUrl.lastIndexOf('/') + 1);
-            const hostUrl  = `${req.protocol}://${req.get('host')}`;
-            const rewritten = rawBody.split('\n').map(line => {
-                const trimmed = line.trim();
-                if (!trimmed || trimmed.startsWith('#')) return line;
-                const absoluteTarget = trimmed.startsWith('http')
-                    ? trimmed
-                    : new URL(trimmed, baseUrl).toString();
-                return `${hostUrl}/api/stream/chunk?url=${encodeURIComponent(absoluteTarget)}`;
-            }).join('\n');
-
+        const hostUrl = `${req.protocol}://${req.get('host')}`;
+        const rewritten = await fetchAndFlattenM3u8(realAudioUrl, hostUrl);
+        if (rewritten) {
             setStreamCorsHeaders(res);
             res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
             res.setHeader('Cache-Control', 'public, max-age=300');
-            res.setHeader('X-Stream-Provider', streamData.provider || 'unknown');
+            res.setHeader('X-Stream-Provider', streamData.provider || 'gaana');
             res.status(200);
             return res.send(rewritten);
         }
