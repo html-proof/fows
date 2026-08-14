@@ -111,8 +111,6 @@ async function fetchFromGaana(url, method = 'GET', body = null) {
         'Accept': 'application/json, text/plain, */*',
         'Origin': 'https://gaana.com',
         'Referer': 'https://gaana.com/',
-        'Host': 'gaana.com',
-        'Connection': 'keep-alive'
     };
 
     if (body) {
@@ -122,7 +120,9 @@ async function fetchFromGaana(url, method = 'GET', body = null) {
     const { statusCode, body: resBody } = await request(url, {
         method,
         headers,
-        body: body ? body.toString() : undefined
+        body: body ? body.toString() : undefined,
+        connectTimeout: 5000,
+        bodyTimeout: 7000,
     });
 
     if (statusCode !== 200) {
