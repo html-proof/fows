@@ -1,8 +1,13 @@
 import express from 'express';
+import dns from 'node:dns';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import compression from 'compression';
+
+try {
+    dns.setDefaultResultOrder('ipv4first');
+} catch (_) {}
 
 import saavnRoutes from './routes/saavn.js';
 import userRoutes from './routes/user.js';

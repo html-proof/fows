@@ -1,7 +1,26 @@
 import 'dotenv/config';
+import dns from 'node:dns';
+import { setGlobalDispatcher, Agent } from 'undici';
 import app from './src/app.js';
 import { markShuttingDown } from './src/runtimeState.js';
-// the library is imported
+
+// Force Node.js & Undici to resolve and connect via IPv4.
+// Render containers do not have outbound IPv6 routing; without this, Happy Eyeballs
+// tries IPv6 addresses (2600:1413:...) first and throws ENETUNREACH / ETIMEDOUT.
+try {
+    dns.setDefaultResultOrder('ipv4first');
+} catch (_) {}
+
+try {
+    setGlobalDispatcher(new Agent({
+        connect: {
+            family: 4,
+            timeout: 10_000,
+        },
+        pipelining: 0,
+    }));
+} catch (_) {}
+
 const PORT = process.env.PORT || 3000;
 const SHUTDOWN_TIMEOUT_MS = Number(process.env.SHUTDOWN_TIMEOUT_MS || 10_000);
 
