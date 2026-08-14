@@ -66,7 +66,7 @@ async function pipeBody(upstreamBody, req, res) {
 }
 
 // ─── Recursive HLS Playlist Flattener ─────────────────────────────────────────
-async function fetchAndFlattenM3u8(playlistUrl, hostUrl, depth = 0) {
+export async function fetchAndFlattenM3u8(playlistUrl, hostUrl, depth = 0) {
     if (depth > 3) return null;
     try {
         const headers = getHeadersForStreamUrl(playlistUrl);

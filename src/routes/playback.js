@@ -26,6 +26,7 @@ import {
 import { getHeadersForStreamUrl, probeStreamUrl } from '../services/streamValidator.js';
 import { getSongDirect } from '../services/jiosaavnDirect.js';
 import { searchSongsOnly as searchGaanaSongsOnly } from '../services/gaanaApi.js';
+import { fetchAndFlattenM3u8 } from './stream.js';
 
 const router = express.Router();
 
@@ -103,10 +104,18 @@ async function handlePlayback(req, res) {
 
     const isHls = streamData.isHls || (streamData.streamUrl || '').includes('.m3u8');
 
-    // For HLS redirect to the existing /api/stream/:songId which handles .m3u8 rewriting
+    // ── HLS playlist direct delivery (flatten master playlist to segment-level) ──
     if (isHls) {
-        const hlsProxyUrl = `/api/stream/${encodeURIComponent(songId)}?title=${encodeURIComponent(songTitle)}&artist=${encodeURIComponent(songArtist)}&album=${encodeURIComponent(songAlbum)}`;
-        return res.redirect(307, hlsProxyUrl);
+        const hostUrl = `${req.protocol}://${req.get('host')}`;
+        const rewritten = await fetchAndFlattenM3u8(streamData.streamUrl, hostUrl);
+        if (rewritten) {
+            setCorsHeaders(res);
+            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+            res.setHeader('Cache-Control', 'public, max-age=300');
+            res.setHeader('X-Stream-Provider', streamData.provider || 'gaana');
+            res.status(200);
+            return res.send(rewritten);
+        }
     }
 
     // ── 2. Fetch from CDN using Node built-in fetch() ─────────────────────────
