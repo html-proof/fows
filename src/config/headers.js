@@ -29,7 +29,7 @@ export const GAANA_HEADERS = {
     'User-Agent': BROWSER_USER_AGENT,
     ...CHROME_CLIENT_HINTS,
     'Accept': 'application/json, text/plain, */*',
-    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Language': 'en-IN,en;q=0.9,hi;q=0.8,ml;q=0.7',
     'Referer': 'https://gaana.com/',
     'Origin': 'https://gaana.com',
     'Sec-Fetch-Dest': 'empty',
@@ -37,6 +37,9 @@ export const GAANA_HEADERS = {
     'Sec-Fetch-Site': 'same-site',
     'Cache-Control': 'no-cache',
     'Pragma': 'no-cache',
+    'X-Forwarded-For': '103.212.157.1',
+    'Client-IP': '103.212.157.1',
+    'Cookie': 'country=IN; gaana_country=IN; geo_country=IN',
 };
 
 export const AUDIO_STREAM_HEADERS = {

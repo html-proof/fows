@@ -109,8 +109,12 @@ async function fetchFromGaana(url, method = 'GET', body = null) {
     const headers = {
         'User-Agent': USER_AGENT,
         'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-IN,en;q=0.9,hi;q=0.8,ml;q=0.7',
         'Origin': 'https://gaana.com',
         'Referer': 'https://gaana.com/',
+        'X-Forwarded-For': '103.212.157.1',
+        'Client-IP': '103.212.157.1',
+        'Cookie': 'country=IN; gaana_country=IN; geo_country=IN',
     };
 
     if (body) {
