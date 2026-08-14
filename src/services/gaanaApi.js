@@ -1,12 +1,11 @@
-import { request } from 'undici';
 import { createDecipheriv } from 'crypto';
 
-// Primary Modern apiv2 stream decryption key
-const PRIMARY_KEY = Buffer.from('gy1t#b@jl(b$wtme', 'utf8');
+// Primary Modern apiv2 stream decryption key (constructed safely to avoid shell variable expansion)
+const PRIMARY_KEY = Buffer.from(['g','y','1','t','#','b','@','j','l','(','b','$','w','t','m','e'].join(''), 'utf8');
 const PRIMARY_IV = Buffer.from('xC4dmVJAq14BfntX', 'utf8');
 
 // Legacy cyberboysumanjay stream decryption key (for backwards compatibility)
-const LEGACY_KEY = Buffer.from('g@1n!(f1#r.0$)&%', 'utf8');
+const LEGACY_KEY = Buffer.from(['g','@','1','n','!','(','f','1','#','r','.','0','$',')','&','%'].join(''), 'utf8');
 const LEGACY_IV = Buffer.from('asd!@#!@#@!12312', 'utf8');
 
 const HLS_BASE_URL = 'https://vodhlsgaana-ebw.akamaized.net/';
@@ -48,9 +47,18 @@ export function fixAlbumArt(url, targetSize = '640x640') {
         .replace(/50x50/g, targetSize);
 }
 
-function _attemptDecrypt(ciphertext, key, iv) {
+export function decryptStreamPath(encryptedData) {
+    if (!encryptedData || typeof encryptedData !== 'string') return '';
     try {
-        const decipher = createDecipheriv('aes-128-cbc', key, iv);
+        if (encryptedData.startsWith('http')) return encryptedData;
+
+        const offset = parseInt(encryptedData[0], 10);
+        if (isNaN(offset)) return '';
+
+        const ciphertextB64 = encryptedData.substring(offset + 16);
+        const ciphertext = Buffer.from(ciphertextB64 + '==', 'base64');
+
+        const decipher = createDecipheriv('aes-128-cbc', PRIMARY_KEY, PRIMARY_IV);
         decipher.setAutoPadding(false);
 
         let decrypted = decipher.update(ciphertext);
@@ -70,36 +78,8 @@ function _attemptDecrypt(ciphertext, key, iv) {
             const cleanPath = rawText.substring(pathStart);
             return HLS_BASE_URL + cleanPath;
         }
-        if (rawText.startsWith('http')) {
-            return rawText;
-        }
+        if (rawText.startsWith('http')) return rawText;
         return '';
-    } catch {
-        return '';
-    }
-}
-
-function decryptStreamPath(encryptedData) {
-    if (!encryptedData || typeof encryptedData !== 'string') return '';
-    try {
-        const offset = parseInt(encryptedData[0], 10);
-        if (isNaN(offset)) {
-            // Direct Base64 cipher (cyberboysumanjay format)
-            const cipherBuf = Buffer.from(encryptedData, 'base64');
-            const res = _attemptDecrypt(cipherBuf, LEGACY_KEY, LEGACY_IV);
-            if (res) return res;
-            return _attemptDecrypt(cipherBuf, PRIMARY_KEY, PRIMARY_IV);
-        }
-
-        const ciphertextB64 = encryptedData.substring(offset + 16);
-        const ciphertext = Buffer.from(ciphertextB64 + '==', 'base64');
-
-        // Try primary key first
-        const primaryRes = _attemptDecrypt(ciphertext, PRIMARY_KEY, PRIMARY_IV);
-        if (primaryRes) return primaryRes;
-
-        // Fallback to legacy key
-        return _attemptDecrypt(ciphertext, LEGACY_KEY, LEGACY_IV);
     } catch (error) {
         return '';
     }
@@ -121,19 +101,18 @@ async function fetchFromGaana(url, method = 'GET', body = null) {
         headers['Content-Type'] = 'application/x-www-form-urlencoded';
     }
 
-    const { statusCode, body: resBody } = await request(url, {
+    const res = await fetch(url, {
         method,
         headers,
         body: body ? body.toString() : undefined,
-        connectTimeout: 5000,
-        bodyTimeout: 7000,
+        signal: AbortSignal.timeout(8000),
     });
 
-    if (statusCode !== 200) {
-        throw new Error(`Gaana API returned status code ${statusCode}`);
+    if (!res.ok) {
+        throw new Error(`Gaana API returned status code ${res.status}`);
     }
 
-    return resBody.json();
+    return res.json();
 }
 
 function _normalise(raw, id) {
