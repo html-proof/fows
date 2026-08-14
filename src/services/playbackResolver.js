@@ -199,25 +199,22 @@ async function _resolveDirectById(songId) {
 async function _resolveBySearch(title, artist = '', album = '') {
     const cleanTitle = title.replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '').replace(/[,\-_]/g, ' ').trim();
     const primaryArtist = artist.split(',')[0].split('&')[0].replace(/[,\-_]/g, ' ').trim();
-    const cleanAlbum = album.replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '').replace(/[,\-_]/g, ' ').trim();
 
     const queries = [
         [cleanTitle, primaryArtist].filter(Boolean).join(' '),
         cleanTitle,
-        [cleanTitle, cleanAlbum].filter(Boolean).join(' '),
-        [title, artist].filter(Boolean).join(' '),
     ].filter(q => q && q.trim().length > 1);
 
     for (const query of queries) {
         try {
             const [jioRes, gaanaRes] = await Promise.allSettled([
-                searchSongsDirect(query, 6).catch(() => [])
+                searchSongsDirect(query, 3).catch(() => [])
                     .then(async res => {
                         if (Array.isArray(res) && res.length > 0) return res;
                         const fallback = await searchSongsOnly(query, 1).catch(() => null);
                         return fallback?.data?.results || [];
                     }),
-                searchGaanaSongsOnly(query, 6).catch(() => []),
+                searchGaanaSongsOnly(query, 3).catch(() => []),
             ]);
 
             const jioCandidates = (jioRes.status === 'fulfilled' && Array.isArray(jioRes.value)) ? jioRes.value : [];
