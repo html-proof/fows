@@ -129,38 +129,30 @@ async function _resolveDirectById(songId) {
                 || await getSongById(songId).then(r => r?.data?.[0] || r?.data).catch(() => null);
             const extracted = _extractDownloadUrl(song);
             if (!extracted) return null;
-
-            const probe = await probeStreamUrl(extracted.url);
-            if (probe.isValid) {
-                return {
-                    streamUrl: extracted.url,
-                    quality: extracted.quality,
-                    contentType: probe.contentType,
-                    isHls: probe.isHls,
-                    provider: 'jiosaavn',
-                    song,
-                };
-            }
-            return null;
+            // Trust JioSaavn's own CDN URL directly — no probe needed here.
+            // The /api/v1/playback proxy handles 403/expired URLs with re-resolve.
+            return {
+                streamUrl: extracted.url,
+                quality: extracted.quality,
+                contentType: extracted.url.includes('.mp4') ? 'audio/mp4' : 'audio/mpeg',
+                isHls: extracted.url.includes('.m3u8'),
+                provider: 'jiosaavn',
+                song,
+            };
         })(),
         (async () => {
             const detail = await getGaanaSongById(songId).catch(() => null);
             const song = detail?.data?.[0] || detail?.data;
             const extracted = _extractDownloadUrl(song);
             if (!extracted) return null;
-
-            const probe = await probeStreamUrl(extracted.url);
-            if (probe.isValid) {
-                return {
-                    streamUrl: extracted.url,
-                    quality: extracted.quality,
-                    contentType: probe.contentType,
-                    isHls: probe.isHls,
-                    provider: 'gaana',
-                    song,
-                };
-            }
-            return null;
+            return {
+                streamUrl: extracted.url,
+                quality: extracted.quality,
+                contentType: extracted.url.includes('.mp4') ? 'audio/mp4' : 'audio/mpeg',
+                isHls: extracted.url.includes('.m3u8'),
+                provider: 'gaana',
+                song,
+            };
         })(),
     ]);
 
@@ -206,7 +198,9 @@ async function _resolveBySearch(title, artist = '', album = '') {
             }
 
             scoredCandidates.sort((a, b) => b.score - a.score);
-            const topCandidates = scoredCandidates.slice(0, 4);
+            // Limit to top 2 candidates — probing more adds latency without
+            // meaningful quality improvement. The proxy handles bad URLs.
+            const topCandidates = scoredCandidates.slice(0, 2);
 
             if (topCandidates.length === 0) continue;
 
@@ -214,7 +208,8 @@ async function _resolveBySearch(title, artist = '', album = '') {
             const probePromises = topCandidates.map(async ({ cand, provider }) => {
                 const extracted = _extractDownloadUrl(cand);
                 if (!extracted) return null;
-                const probe = await probeStreamUrl(extracted.url);
+                // Use a short 1.5s probe timeout to fail fast
+                const probe = await probeStreamUrl(extracted.url, { timeoutMs: 1500 });
                 if (probe.isValid) {
                     return {
                         streamUrl: extracted.url,
@@ -296,6 +291,14 @@ export async function resolvePlayableStream(params = {}) {
     const resolvePromise = (async () => {
         console.log(`[StreamResolver] Resolving stream for "${songTitle}" (${songArtist}) ID: ${songId}`);
 
+        // Overall 12s timeout — fail fast rather than cascade for 90s
+        const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new PlaybackResolveError(
+                `Resolution timed out for "${songTitle || songId}"`, 'TIMEOUT'
+            )), 12000)
+        );
+
+        return Promise.race([timeoutPromise, (async () => {
         // Step A: Direct lookup by ID if available
         let winner = await _resolveDirectById(songId);
 
@@ -351,6 +354,7 @@ export async function resolvePlayableStream(params = {}) {
 
         console.log(`[StreamResolver] Resolved "${songTitle || songId}" via ${winner.provider} (${winner.quality}) in ${Date.now() - startTime}ms`);
         return resolvedData;
+        })()]); // end Promise.race
     })().finally(() => {
         inFlightResolves.delete(trackKey);
     });
