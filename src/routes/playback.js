@@ -201,6 +201,86 @@ async function handlePlayback(req, res) {
     }
 }
 
+import { getSongDirect } from '../services/jiosaavnDirect.js';
+import { searchSongsOnly as searchGaanaSongsOnly } from '../services/gaanaApi.js';
+import { probeStreamUrl } from '../services/streamValidator.js';
+
+// ─── GET /api/v1/playback/diagnostics/:songId ──────────────────────────────────
+router.get('/diagnostics/:songId', async (req, res) => {
+    setCorsHeaders(res);
+    const songId = req.params.songId;
+    const songTitle = req.query.title || req.query.q || '';
+    const songArtist = req.query.artist || '';
+    const songAlbum = req.query.album || '';
+    const language = req.query.language || '';
+
+    const diag = {
+        params: { songId, songTitle, songArtist, songAlbum, language },
+        timestamp: new Date().toISOString(),
+        steps: {},
+    };
+
+    // 1. Direct ID lookups
+    try {
+        const jioDirect = await getSongDirect(songId).catch(e => ({ error: e.message }));
+        diag.steps.jioDirect = {
+            found: !!jioDirect?.name,
+            name: jioDirect?.name,
+            downloadUrlCount: jioDirect?.downloadUrl?.length || 0,
+        };
+        if (jioDirect?.downloadUrl?.[0]?.url) {
+            const probe = await probeStreamUrl(jioDirect.downloadUrl[0].url, { timeoutMs: 2500 });
+            diag.steps.jioDirectProbe = probe;
+        }
+    } catch (e) {
+        diag.steps.jioDirect = { error: e.message };
+    }
+
+    // 2. Gaana Search
+    try {
+        const query = [songTitle, songArtist].filter(Boolean).join(' ') || songTitle || songId;
+        const gaanaResults = await searchGaanaSongsOnly(query, 3).catch(e => ({ error: e.message }));
+        diag.steps.gaanaSearch = {
+            query,
+            count: Array.isArray(gaanaResults) ? gaanaResults.length : 0,
+            results: Array.isArray(gaanaResults) ? gaanaResults.map(g => ({
+                title: g.title || g.name,
+                artist: g.primaryArtists,
+                hasDownloadUrl: !!g.downloadUrl?.[0]?.url,
+                url: g.downloadUrl?.[0]?.url ? g.downloadUrl[0].url.substring(0, 80) + '...' : null,
+            })) : gaanaResults,
+        };
+        if (Array.isArray(gaanaResults) && gaanaResults[0]?.downloadUrl?.[0]?.url) {
+            const probe = await probeStreamUrl(gaanaResults[0].downloadUrl[0].url, { timeoutMs: 2500 });
+            diag.steps.gaanaProbe = probe;
+        }
+    } catch (e) {
+        diag.steps.gaanaSearch = { error: e.message };
+    }
+
+    // 3. Full Resolver Call
+    try {
+        const start = Date.now();
+        const resolved = await resolvePlayableStream({
+            id: songId,
+            title: songTitle,
+            artist: songArtist,
+            album: songAlbum,
+            language,
+        });
+        diag.steps.fullResolver = {
+            timeMs: Date.now() - start,
+            provider: resolved.provider,
+            bitrate: resolved.bitrate,
+            streamUrl: resolved.streamUrl ? resolved.streamUrl.substring(0, 100) + '...' : null,
+        };
+    } catch (e) {
+        diag.steps.fullResolver = { error: e.message, code: e.code };
+    }
+
+    return res.json(diag);
+});
+
 router.get('/:songId', handlePlayback);
 router.head('/:songId', handlePlayback);
 
