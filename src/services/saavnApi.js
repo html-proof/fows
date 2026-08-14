@@ -11,6 +11,7 @@ import {
     getArtistAlbumsDirect,
 } from './jiosaavnDirect.js';
 import { getSongById as getGaanaSongById, searchSongsOnly as searchGaanaSongsOnly } from './gaanaApi.js';
+import { getProviderAlbumId } from './identityResolver.js';
 
 function describeProviderError(error) {
     const message = String(error?.message ?? '').trim();
@@ -467,10 +468,18 @@ export async function getSongById(id) {
  * @returns {Promise<object>} Album details
  */
 export async function getAlbumById(id, url) {
-    // Primary: direct JioSaavn API by album ID
-    if (id) {
+    let resolvedId = id;
+    if (id && String(id).startsWith('alb_')) {
         try {
-            const res = await getAlbumByIdDirect(id);
+            const mapped = getProviderAlbumId(String(id), 'jiosaavn');
+            if (mapped) resolvedId = mapped;
+        } catch (_) {}
+    }
+
+    // Primary: direct JioSaavn API by album ID
+    if (resolvedId) {
+        try {
+            const res = await getAlbumByIdDirect(resolvedId);
             if (_albumHasSongs(res)) return res;
         } catch (_) {}
     }

@@ -117,6 +117,7 @@ const stmts = {
     getTrack:         db.prepare('SELECT * FROM tracks WHERE id = ?'),
     getMappings:      db.prepare('SELECT * FROM provider_maps WHERE track_id = ?'),
     getProviderTrackId: db.prepare('SELECT provider_track_id FROM provider_maps WHERE track_id = ? AND provider = ?'),
+    getProviderAlbumId: db.prepare('SELECT provider_album_id FROM provider_maps WHERE provider_album_id IS NOT NULL AND track_id IN (SELECT id FROM tracks WHERE album_id = ?) AND provider = ? LIMIT 1'),
     getStreamCache:   db.prepare('SELECT url, quality, expires_at FROM stream_cache WHERE track_id = ? AND provider = ?'),
     upsertStreamCache:db.prepare('INSERT OR REPLACE INTO stream_cache (track_id, provider, url, quality, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)'),
     delStreamCache:   db.prepare('DELETE FROM stream_cache WHERE track_id = ? AND provider = ?'),
@@ -250,6 +251,10 @@ export function getProviderMappings(canonicalId) {
 
 export function getProviderTrackId(canonicalId, provider) {
     return stmts.getProviderTrackId.get(canonicalId, provider)?.provider_track_id ?? null;
+}
+
+export function getProviderAlbumId(canonicalAlbumId, provider = 'jiosaavn') {
+    return stmts.getProviderAlbumId.get(canonicalAlbumId, provider)?.provider_album_id ?? null;
 }
 
 // ─── Stream cache ─────────────────────────────────────────────────────────────
