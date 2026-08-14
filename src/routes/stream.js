@@ -178,7 +178,10 @@ async function handleChunkProxy(req, res) {
 
         const contentType = String(upstreamRes.headers.get ? upstreamRes.headers.get('content-type') : (upstreamRes.headers['content-type'] || '')).toLowerCase();
         if (contentType.includes('mpegurl') || chunkUrl.includes('.m3u8')) {
-            const hostUrl = `${req.protocol}://${req.get('host')}`;
+            const forwardedHost = req.headers['x-forwarded-host'];
+            const hostUrl = forwardedHost
+                ? `https://${forwardedHost}`
+                : `${req.protocol}://${req.get('host')}`;
             const rewritten = await fetchAndFlattenM3u8(chunkUrl, hostUrl);
             if (rewritten) {
                 setStreamCorsHeaders(res);
@@ -316,7 +319,10 @@ async function handleStreamProxy(req, res) {
 
     // ── HLS playlist rewriting (flattens master to segment-level playlist) ──
     if (isHls || contentType.includes('mpegurl') || realAudioUrl.includes('.m3u8')) {
-        const hostUrl = `${req.protocol}://${req.get('host')}`;
+        const forwardedHost = req.headers['x-forwarded-host'];
+        const hostUrl = forwardedHost
+            ? `https://${forwardedHost}`
+            : `${req.protocol}://${req.get('host')}`;
         const rewritten = await fetchAndFlattenM3u8(realAudioUrl, hostUrl);
         if (rewritten) {
             setStreamCorsHeaders(res);

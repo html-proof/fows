@@ -106,7 +106,14 @@ async function handlePlayback(req, res) {
 
     // ── HLS playlist direct delivery (flatten master playlist to segment-level) ──
     if (isHls) {
-        const hostUrl = `${req.protocol}://${req.get('host')}`;
+        // Use X-Forwarded-Host so chunk URLs point through the Cloudflare Worker
+        // (music-hub.imeseban.workers.dev), not directly to the Render backend.
+        // Chunks going directly to fows.onrender.com bypass CDN caching, hit
+        // the free-tier container on every segment, and cause slow HLS playback.
+        const forwardedHost = req.headers['x-forwarded-host'];
+        const hostUrl = forwardedHost
+            ? `https://${forwardedHost}`
+            : `${req.protocol}://${req.get('host')}`;
         const rewritten = await fetchAndFlattenM3u8(streamData.streamUrl, hostUrl);
         if (rewritten) {
             setCorsHeaders(res);
