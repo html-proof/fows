@@ -8,15 +8,14 @@
  *   4. On upstream 401/403/410 (CDN token expired): re-resolves & retries once.
  *   5. Sets Accept-Encoding: identity so CDN never gzip-encodes audio bytes.
  *
+ * Uses Node 18+ built-in fetch() for CDN requests — handles redirects
+ * automatically (redirect: 'follow') with no undici maxRedirections API issues.
+ *
  * Flutter never sees raw CDN URLs — CDN token expiry is handled transparently.
  */
 
 import express from 'express';
-import { request, Agent, interceptors } from 'undici';
-
-// Redirect-following agent (undici v6+ requires interceptor instead of maxRedirections option)
-const redirectAgent = new Agent().compose(interceptors.redirect({ maxRedirections: 5 }));
-
+import { Readable } from 'node:stream';
 import {
     resolvePlayableStream,
     getCachedStream,
@@ -50,19 +49,12 @@ function buildOutboundHeaders(streamUrl, req) {
     return headers;
 }
 
-function forwardResponseHeaders(upstream, res) {
+function forwardResponseHeaders(upstreamHeaders, res) {
     const passThrough = ['content-type', 'content-length', 'content-range', 'last-modified', 'etag'];
     for (const h of passThrough) {
-        if (upstream[h]) res.setHeader(h, upstream[h]);
+        const val = upstreamHeaders.get ? upstreamHeaders.get(h) : upstreamHeaders[h];
+        if (val) res.setHeader(h, val);
     }
-}
-
-async function pipeBody(body, req, res) {
-    req.on('close', () => { try { body.destroy(); } catch (_) {} });
-    for await (const chunk of body) {
-        if (!res.write(chunk)) await new Promise(r => res.once('drain', r));
-    }
-    res.end();
 }
 
 // ─── Preflight ────────────────────────────────────────────────────────────────
@@ -109,14 +101,15 @@ async function handlePlayback(req, res) {
 
     const isHls = streamData.isHls || (streamData.streamUrl || '').includes('.m3u8');
 
-    // For HLS, redirect Flutter to the existing /api/stream/:songId proxy which
-    // handles .m3u8 playlist rewriting and chunk proxying correctly.
+    // For HLS redirect to the existing /api/stream/:songId which handles .m3u8 rewriting
     if (isHls) {
         const hlsProxyUrl = `/api/stream/${encodeURIComponent(songId)}?title=${encodeURIComponent(songTitle)}&artist=${encodeURIComponent(songArtist)}&album=${encodeURIComponent(songAlbum)}`;
         return res.redirect(307, hlsProxyUrl);
     }
 
-    // ── 2. Fetch from CDN with retry on expired token ─────────────────────────
+    // ── 2. Fetch from CDN using Node built-in fetch() ─────────────────────────
+    // fetch() automatically follows redirects (redirect: 'follow') — no undici
+    // maxRedirections API issues, works on all Node 18+ environments.
     let upstreamRes;
     let realAudioUrl = streamData.streamUrl;
     let attempt = 0;
@@ -124,22 +117,20 @@ async function handlePlayback(req, res) {
     while (attempt < 2) {
         attempt++;
         try {
-            upstreamRes = await request(realAudioUrl, {
+            upstreamRes = await fetch(realAudioUrl, {
                 method: req.method === 'HEAD' ? 'HEAD' : 'GET',
                 headers: buildOutboundHeaders(realAudioUrl, req),
-                headersTimeout: 8000,
-                // 120s: gives Render time to stream large progressive files without
-                // Cloudflare's 90s Worker timeout becoming the bottleneck.
-                bodyTimeout: 120000,
-                dispatcher: redirectAgent,
+                redirect: 'follow',
+                // AbortSignal.timeout is Node 18+ — 120s body timeout so
+                // Cloudflare's 90s worker timeout isn't the bottleneck.
+                signal: AbortSignal.timeout(120000),
             });
 
-            const { statusCode } = upstreamRes;
+            const { status } = upstreamRes;
 
             // CDN token expired / revoked — re-resolve once, then retry
-            if ((statusCode === 401 || statusCode === 403 || statusCode === 410) && attempt === 1) {
-                console.warn(`[playback] CDN returned ${statusCode} for ${songId} — re-resolving URL`);
-                await upstreamRes.body.dump();  // drain to free connection
+            if ((status === 401 || status === 403 || status === 410) && attempt === 1) {
+                console.warn(`[playback] CDN returned ${status} for ${songId} — re-resolving URL`);
                 invalidateStreamCache(trackKey);
                 invalidateStreamCache(songId);
                 try {
@@ -158,9 +149,9 @@ async function handlePlayback(req, res) {
                 continue;  // retry with fresh URL
             }
 
-            break;  // good status or non-retryable — exit loop
+            break;  // good status — exit loop
         } catch (fetchErr) {
-            if (attempt >= 2 || !res.headersSent === false) {
+            if (attempt >= 2) {
                 console.error(`[playback] Upstream fetch failed for ${songId}:`, fetchErr.message);
                 return res.status(502).json({
                     success: false,
@@ -176,7 +167,6 @@ async function handlePlayback(req, res) {
                 streamData = await resolvePlayableStream({ id: songId, title: songTitle, artist: songArtist, album: songAlbum, language });
                 realAudioUrl = streamData.streamUrl;
             } catch (_) {
-                console.error(`[playback] Re-resolve after network error failed for ${songId}`);
                 return res.status(502).json({ success: false, error: 'Upstream network error', code: 'UPSTREAM_ERROR' });
             }
         }
@@ -184,21 +174,25 @@ async function handlePlayback(req, res) {
 
     // ── 3. Stream response back to Flutter ────────────────────────────────────
     setCorsHeaders(res);
-    // No client caching for audio proxied responses — only the backend caches CDN URLs.
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('X-Stream-Provider', streamData.provider || 'unknown');
     forwardResponseHeaders(upstreamRes.headers, res);
-    res.status(upstreamRes.statusCode);
+    res.status(upstreamRes.status);
 
-    if (req.method === 'HEAD') {
-        await upstreamRes.body.dump();
+    if (req.method === 'HEAD' || !upstreamRes.body) {
         return res.end();
     }
 
+    // Convert Web API ReadableStream → Node.js Readable → pipe to Express response
     try {
-        await pipeBody(upstreamRes.body, req, res);
+        const nodeStream = Readable.fromWeb(upstreamRes.body);
+        req.on('close', () => { try { nodeStream.destroy(); } catch (_) {} });
+        nodeStream.pipe(res);
+        nodeStream.on('error', (err) => {
+            if (!res.headersSent) res.status(500).end();
+            else res.end();
+        });
     } catch (pipeErr) {
-        // Client disconnected mid-stream — normal on track skip/pause
         if (!res.headersSent) {
             res.status(500).json({ success: false, error: 'Stream pipe error', detail: pipeErr.message });
         } else {

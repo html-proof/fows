@@ -1,8 +1,5 @@
 import express from 'express';
-import { request, Agent, interceptors } from 'undici';
-
-// Redirect-following agent (undici v6+ requires interceptor instead of maxRedirections option)
-const redirectAgent = new Agent().compose(interceptors.redirect({ maxRedirections: 5 }));
+import { Readable } from 'node:stream';
 import {
     resolvePlayableStream,
     getCachedStream,
@@ -27,8 +24,6 @@ function setStreamCorsHeaders(res) {
 function buildAudioOutboundHeaders(streamUrl, req) {
     const headers = {
         ...getHeadersForStreamUrl(streamUrl),
-        // Tell CDN never to compress — gzip breaks Content-Length / Content-Range
-        // calculations that ExoPlayer/AVPlayer require for byte-accurate seeking.
         'Accept-Encoding': 'identity',
     };
     const rangeHeader = req.headers['range'];
@@ -49,21 +44,25 @@ function forwardUpstreamHeaders(upstreamHeaders, res) {
         'expires',
     ];
     for (const name of forwardList) {
-        if (upstreamHeaders[name]) res.setHeader(name, upstreamHeaders[name]);
+        // Support both fetch Headers object and plain undici headers object
+        const val = upstreamHeaders.get ? upstreamHeaders.get(name) : upstreamHeaders[name];
+        if (val) res.setHeader(name, val);
     }
 }
 
-// ─── Pipe upstream body to client, honouring backpressure ─────────────────────
+// ─── Pipe upstream body to client ─────────────────────────────────────────────
 async function pipeBody(upstreamBody, req, res) {
-    req.on('close', () => {
-        try { upstreamBody.destroy(); } catch (_) {}
+    // upstreamBody may be a Web API ReadableStream (from fetch()) — convert first
+    const nodeStream = upstreamBody?.getReader
+        ? Readable.fromWeb(upstreamBody)
+        : Readable.from(upstreamBody);
+    req.on('close', () => { try { nodeStream.destroy(); } catch (_) {} });
+    nodeStream.pipe(res);
+    await new Promise((resolve, reject) => {
+        nodeStream.on('end', resolve);
+        nodeStream.on('error', reject);
+        res.on('close', resolve);
     });
-    for await (const chunk of upstreamBody) {
-        if (!res.write(chunk)) {
-            await new Promise(resolve => res.once('drain', resolve));
-        }
-    }
-    res.end();
 }
 
 // ─── POST & GET /resolve (Stream Resolution Endpoint) ────────────────────────
@@ -131,22 +130,20 @@ async function handleChunkProxy(req, res) {
     };
 
     try {
-        const upstreamRes = await request(chunkUrl, {
+        // Use Node built-in fetch() — follows redirects automatically
+        const upstreamRes = await fetch(chunkUrl, {
             method: req.method === 'HEAD' ? 'HEAD' : 'GET',
             headers: outboundHeaders,
-            headersTimeout: 6000,
-            // HLS .ts chunks are small; 30s is enough
-            bodyTimeout: 30000,
-            dispatcher: redirectAgent,
+            redirect: 'follow',
+            signal: AbortSignal.timeout(30000),
         });
 
         setStreamCorsHeaders(res);
         res.setHeader('Cache-Control', 'public, max-age=3600');
         forwardUpstreamHeaders(upstreamRes.headers, res);
-        res.status(upstreamRes.statusCode);
+        res.status(upstreamRes.status);
 
-        if (req.method === 'HEAD') {
-            await upstreamRes.body.dump();
+        if (req.method === 'HEAD' || !upstreamRes.body) {
             return res.end();
         }
 
@@ -205,24 +202,25 @@ async function handleStreamProxy(req, res) {
     let attempt = 0;
     while (attempt < 2) {
         attempt++;
-        const outboundHeaders = buildAudioOutboundHeaders(realAudioUrl, req);
         try {
-            upstreamRes = await request(realAudioUrl, {
+            // Use Node built-in fetch() — follows redirects automatically, no undici
+            // maxRedirections API issues on any Node 18+ environment.
+            upstreamRes = await fetch(realAudioUrl, {
                 method: req.method === 'HEAD' ? 'HEAD' : 'GET',
-                headers: outboundHeaders,
-                headersTimeout: 8000,
+                headers: buildAudioOutboundHeaders(realAudioUrl, req),
+                redirect: 'follow',
                 // 120s: gives Render time to stream large progressive files without
                 // Cloudflare's 90s Worker timeout becoming the bottleneck.
-                bodyTimeout: 120000,
-                dispatcher: redirectAgent,
+                signal: AbortSignal.timeout(120000),
             });
 
-            const statusCode = upstreamRes.statusCode;
+            const statusCode = upstreamRes.status;
 
             // 401 / 403 / 410 = expired or revoked CDN token — re-resolve once
             if ((statusCode === 401 || statusCode === 403 || statusCode === 410) && attempt === 1) {
                 console.warn(`[stream] Upstream ${statusCode} for ${songId} (attempt ${attempt}) — invalidating cache and re-resolving CDN URL`);
-                await upstreamRes.body.dump();  // drain body to avoid connection leak
+                // Drain body
+                await upstreamRes.arrayBuffer();
                 invalidateStreamCache(trackKey);
                 invalidateStreamCache(songId);
                 try {
@@ -294,10 +292,9 @@ async function handleStreamProxy(req, res) {
     res.setHeader('Cache-Control', 'public, max-age=1800');
     res.setHeader('X-Stream-Provider', streamData.provider || 'unknown');
     forwardUpstreamHeaders(headers, res);
-    res.status(statusCode);
+    res.status(upstreamRes.status);
 
-    if (req.method === 'HEAD') {
-        await upstreamRes.body.dump();
+    if (req.method === 'HEAD' || !upstreamRes.body) {
         return res.end();
     }
 
