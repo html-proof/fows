@@ -11,6 +11,26 @@ import { getHeadersForStreamUrl } from '../services/streamValidator.js';
 
 const router = express.Router();
 
+// ─── SSRF guard for chunk proxy ───────────────────────────────────────────────
+function isPrivateHost(hostname) {
+    if (hostname === 'localhost' || hostname === '0.0.0.0') return true;
+    if (/^127\./.test(hostname)) return true;
+    if (/^10\./.test(hostname)) return true;
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(hostname)) return true;
+    if (/^192\.168\./.test(hostname)) return true;
+    if (/^169\.254\./.test(hostname)) return true;
+    if (hostname === '::1' || /^fe80:/i.test(hostname) || /^::ffff:/i.test(hostname)) return true;
+    if (hostname === '100.100.100.200') return true; // Alibaba Cloud metadata
+    return false;
+}
+
+function assertSafeChunkUrl(url) {
+    let parsed;
+    try { parsed = new URL(url); } catch { throw new Error('Invalid URL'); }
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') throw new Error('Invalid protocol');
+    if (isPrivateHost(parsed.hostname)) throw new Error('Host not allowed');
+}
+
 // ─── CORS headers applied to every streaming response ─────────────────────────
 function setStreamCorsHeaders(res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -68,6 +88,11 @@ async function pipeBody(upstreamBody, req, res) {
 // ─── Recursive HLS Playlist Flattener ─────────────────────────────────────────
 export async function fetchAndFlattenM3u8(playlistUrl, hostUrl, depth = 0) {
     if (depth > 3) return null;
+    try {
+        assertSafeChunkUrl(playlistUrl);
+    } catch {
+        return null;
+    }
     try {
         const headers = getHeadersForStreamUrl(playlistUrl);
         const res = await fetch(playlistUrl, {
@@ -158,6 +183,12 @@ async function handleChunkProxy(req, res) {
     const chunkUrl = req.query.url;
     if (!chunkUrl || typeof chunkUrl !== 'string' || !chunkUrl.startsWith('http')) {
         return res.status(400).json({ error: 'Valid chunk URL is required' });
+    }
+
+    try {
+        assertSafeChunkUrl(chunkUrl);
+    } catch {
+        return res.status(403).json({ error: 'URL not allowed' });
     }
 
     const outboundHeaders = {
