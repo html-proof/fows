@@ -5,7 +5,13 @@ require('dotenv').config();
 function resolveCredential() {
     const jsonEnv = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
     if (jsonEnv) {
-        return admin.credential.cert(JSON.parse(jsonEnv));
+        let parsed;
+        try {
+            parsed = JSON.parse(jsonEnv);
+        } catch (e) {
+            throw new Error(`FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON: ${e.message}`);
+        }
+        return admin.credential.cert(parsed);
     }
 
     const keyPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH

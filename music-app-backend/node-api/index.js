@@ -4,9 +4,11 @@ require('dotenv').config();
 const searchRoutes = require('./routes/search');
 const recommendRoutes = require('./routes/recommend');
 const activityRoutes = require('./routes/activity');
+const { generalLimiter } = require('./middleware/rateLimit');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
+app.use(generalLimiter);
 
 app.get('/health', (_req, res) => {
     res.json({

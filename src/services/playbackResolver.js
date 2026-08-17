@@ -146,21 +146,9 @@ async function _resolveDirectById(songId) {
                 || await getSongById(jioId).then(r => r?.data?.[0] || r?.data).catch(() => null);
             const extracted = _extractDownloadUrl(song);
             if (!extracted) return null;
-
-            // Fast probe check — only accept if status is 200 or 206 (not 404/deleted/timeout)
-            try {
-                const probeRes = await fetch(extracted.url, {
-                    method: 'HEAD',
-                    headers: getHeadersForStreamUrl(extracted.url),
-                    signal: AbortSignal.timeout(1500),
-                });
-                if (probeRes.status !== 200 && probeRes.status !== 206) {
-                    return null;
-                }
-            } catch (_) {
-                return null;
-            }
-
+            // Skip CDN probe here — the /api/v1/playback proxy handles 401/403/410
+            // by re-resolving automatically. Probing adds 1.5s to every cold-start
+            // and is redundant since the proxy retries on bad tokens.
             return {
                 streamUrl: extracted.url,
                 quality: extracted.quality,
@@ -237,12 +225,12 @@ async function _resolveBySearch(title, artist = '', album = '') {
 
             if (topCandidates.length === 0) continue;
 
-            // Probe top candidates in parallel
+            // Race probes in parallel — return the first valid result (non-HLS preferred).
+            // Using a race instead of Promise.all cuts latency from max(all probes) to min(first valid probe).
             const probePromises = topCandidates.map(async ({ cand, provider }) => {
                 const extracted = _extractDownloadUrl(cand);
                 if (!extracted) return null;
-                // 3.5s probe timeout to accommodate cloud container network latencies
-                const probe = await probeStreamUrl(extracted.url, { timeoutMs: 3500 });
+                const probe = await probeStreamUrl(extracted.url, { timeoutMs: 1500 });
                 if (probe.isValid) {
                     return {
                         streamUrl: extracted.url,
@@ -256,15 +244,16 @@ async function _resolveBySearch(title, artist = '', album = '') {
                 return null;
             });
 
-            const probeResults = await Promise.all(probePromises);
-            const validResults = probeResults.filter(r => r !== null);
-            validResults.sort((a, b) => {
-                // Prefer non-HLS (direct progressive MP4/AAC) over HLS .m3u8 for instant mobile playback
-                if (!a.isHls && b.isHls) return -1;
-                if (a.isHls && !b.isHls) return 1;
-                return 0;
-            });
-            if (validResults.length > 0) return validResults[0];
+            // Race probes — resolve as soon as the first valid result arrives.
+            // Prefer non-HLS (progressive MP4/AAC); fall back to HLS if that's all that's available.
+            // This is a true race: we don't wait for slow/failing probes.
+            const winner = await Promise.any(
+                probePromises.map(p => p.then(r => { if (!r || r.isHls) throw new Error('skip'); return r; }))
+            ).catch(() =>
+                Promise.any(probePromises.map(p => p.then(r => { if (!r) throw new Error('skip'); return r; })))
+                    .catch(() => null)
+            );
+            if (winner) return winner;
         } catch (_) {}
     }
 

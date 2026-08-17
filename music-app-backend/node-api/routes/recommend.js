@@ -15,9 +15,10 @@ router.get('/:userId', authenticateUser, async (req, res) => {
             return res.status(403).json({ error: 'Forbidden' });
         }
 
+        const CATALOG_LIMIT = 200;
         const [userSnap, songsSnap] = await Promise.all([
             db.ref(`users/${userId}`).once('value'),
-            db.ref('songs').once('value'),
+            db.ref('songs').limitToFirst(CATALOG_LIMIT).once('value'),
         ]);
 
         const userData = userSnap.val() || {};

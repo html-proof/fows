@@ -253,7 +253,7 @@ router.get('/search', async (req, res) => {
                 try {
                     const albumDetail = await Promise.race([
                         getAlbumById(matchedAlbum.id, matchedAlbum.url),
-                        new Promise((_, reject) => setTimeout(() => reject(new Error('album timeout')), 5000)),
+                        new Promise((_, reject) => setTimeout(() => reject(new Error('album timeout')), 2000)),
                     ]);
                     const albumSongs = albumDetail?.data?.songs ?? albumDetail?.data?.list ?? [];
                     if (albumSongs.length > 0) {
@@ -1179,8 +1179,7 @@ router.get('/songs/:id/stream', async (req, res) => {
             }
             if (!chosenUrl) { chosenUrl = urls[0].url; chosenQuality = urls[0].quality; }
 
-            const isValid = await validatePlayableStream(chosenUrl);
-            if (isValid) {
+            if (chosenUrl) {
                 return res.json({
                     success: true,
                     data: {

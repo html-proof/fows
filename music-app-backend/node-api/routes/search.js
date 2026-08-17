@@ -21,7 +21,7 @@ router.post('/', authenticateUser, async (req, res) => {
             return res.status(400).json({ error: 'query is required' });
         }
 
-        const snapshot = await db.ref('songs').once('value');
+        const snapshot = await db.ref('songs').limitToFirst(500).once('value');
         const songsById = snapshot.val() || {};
         const candidates = Object.entries(songsById)
             .map(([id, value]) => ({ id, ...(value || {}) }))

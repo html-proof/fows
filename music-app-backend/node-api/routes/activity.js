@@ -28,19 +28,16 @@ router.post('/', authenticateUser, async (req, res) => {
         }
 
         const ref = db.ref(`user_activity/${effectiveUserId}/${songId}`);
-        const snapshot = await ref.once('value');
-        const current = snapshot.val() || {
-            play_count: 0,
-            skip_count: 0,
-            like_count: 0,
-        };
-
-        if (normalizedAction === 'play') current.play_count += 1;
-        if (normalizedAction === 'skip') current.skip_count += 1;
-        if (normalizedAction === 'like') current.like_count += 1;
-        current.last_played = Date.now();
-
-        await ref.set(current);
+        let current;
+        await ref.transaction((existing) => {
+            const data = existing || { play_count: 0, skip_count: 0, like_count: 0 };
+            if (normalizedAction === 'play') data.play_count = (data.play_count || 0) + 1;
+            if (normalizedAction === 'skip') data.skip_count = (data.skip_count || 0) + 1;
+            if (normalizedAction === 'like') data.like_count = (data.like_count || 0) + 1;
+            data.last_played = Date.now();
+            current = data;
+            return data;
+        });
         return res.json({
             success: true,
             userId: effectiveUserId,
