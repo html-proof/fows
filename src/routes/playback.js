@@ -154,7 +154,7 @@ async function handlePlayback(req, res) {
                 invalidateStreamCache(songId);
                 try {
                     streamData = await resolvePlayableStream({
-                        id: '', title: songTitle, artist: songArtist, album: songAlbum, language,
+                        id: songId, title: songTitle, artist: songArtist, album: songAlbum, language,
                     });
                     realAudioUrl = streamData.streamUrl;
                 } catch (resolveErr) {

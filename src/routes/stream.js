@@ -328,7 +328,12 @@ async function handleStreamProxy(req, res) {
 
             break;  // success or non-retryable status — exit the retry loop
         } catch (fetchErr) {
-            if (attempt >= 2) throw fetchErr;
+            if (attempt >= 2) {
+                if (!res.headersSent) {
+                    return res.status(502).json({ error: 'Failed to fetch audio from upstream', code: 'UPSTREAM_ERROR' });
+                }
+                return res.end();
+            }
             console.warn(`[stream] Fetch error attempt ${attempt} for ${songId}:`, fetchErr.message);
             // On a network error on attempt 1, try re-resolving and retrying
             invalidateStreamCache(trackKey);
@@ -339,7 +344,10 @@ async function handleStreamProxy(req, res) {
                 });
                 realAudioUrl = streamData.streamUrl;
             } catch (_) {
-                throw fetchErr;  // re-throw original error
+                if (!res.headersSent) {
+                    return res.status(502).json({ error: 'Failed to fetch audio from upstream', code: 'UPSTREAM_ERROR' });
+                }
+                return res.end();
             }
         }
     }

@@ -42,6 +42,7 @@ import {
     PlaybackResolveError,
 } from '../services/playbackResolver.js';
 import { getUserPreferences, getGlobalTrending, getRecentActivity } from '../services/database.js';
+import { generateRecommendations } from '../services/recommendation.js';
 import { rerankSongsForUser } from '../services/personalizationModel.js';
 import { normalizeSongMetadata, normalizeSongList } from '../services/metadataService.js';
 

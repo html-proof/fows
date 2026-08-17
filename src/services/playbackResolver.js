@@ -329,7 +329,8 @@ export async function resolvePlayableStream(params = {}) {
             let searchAlbum = songAlbum;
 
             if (!searchTitle && songId) {
-                const dbTrack = await getTrack(songId).catch(() => null);
+                let dbTrack = null;
+                try { dbTrack = getTrack(songId); } catch (_) {}
                 if (dbTrack) {
                     searchTitle = dbTrack.title || dbTrack.name || '';
                     searchArtist = dbTrack.artist || '';
