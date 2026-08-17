@@ -370,7 +370,7 @@ router.get('/home', async (req, res) => {
             sections.push({ type: 'trending', title: 'Trending Now', items: trend.slice(0, 20) });
         }
 
-        return res.json({ sections, uid });
+        return res.json({ sections });
     } catch (err) {
         console.error('[home]', err);
         return res.status(500).json({ error: 'Home feed failed' });

@@ -19,6 +19,9 @@ router.post('/', authenticateUser, async (req, res) => {
                 error: 'songId and action are required',
             });
         }
+        if (/[\/\.#$\[\]]/.test(String(songId))) {
+            return res.status(400).json({ error: 'Invalid songId' });
+        }
 
         const normalizedAction = String(action).trim().toLowerCase();
         if (!['play', 'skip', 'like'].includes(normalizedAction)) {

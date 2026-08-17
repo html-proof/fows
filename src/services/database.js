@@ -323,7 +323,7 @@ async function upsertSearchHistory(uid, query, timestamp) {
 
 async function updateSongInteractionAggregate(uid, type, payload, timestamp) {
     const songId = String(payload.songId || '').trim();
-    if (!songId) return;
+    if (!songId || /[\/\.#$\[\]]/.test(songId)) return;
 
     const songRef = db.ref(`user_activity/${uid}/${songId}`);
     await songRef.transaction((current) => {
@@ -354,7 +354,7 @@ async function updateSongInteractionAggregate(uid, type, payload, timestamp) {
 
 async function updateListeningHistory(uid, type, payload, timestamp) {
     const songId = String(payload.songId || '').trim();
-    if (!songId) return;
+    if (!songId || /[\/\.#$\[\]]/.test(songId)) return;
 
     const historyRef = db.ref(`users/${uid}/listening_history/${songId}`);
     await historyRef.transaction((current) => {

@@ -21,7 +21,7 @@ const router = Router();
  */
 router.get('/', authenticateUser, async (req, res) => {
     try {
-        const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
+        const limit = Math.min(Math.max(1, parseInt(req.query.limit, 10) || 50), 100);
 
         // Get user preferences
         const prefs = await getUserPreferences(req.user.uid);
@@ -66,7 +66,7 @@ router.get('/', authenticateUser, async (req, res) => {
  */
 router.post('/next', authenticateUser, async (req, res) => {
     try {
-        const limit = Math.min(parseInt(req.body?.limit, 10) || 10, 20);
+        const limit = Math.min(Math.max(1, parseInt(req.body?.limit, 10) || 10), 20);
         const currentSong = req.body?.currentSong;
         if (!currentSong || typeof currentSong !== 'object') {
             return res.status(400).json({
@@ -115,7 +115,7 @@ router.get('/mood/:mood', authenticateUser, async (req, res) => {
         const mood = String(req.params.mood || '').toLowerCase().trim();
         const prefs = await getUserPreferences(req.user.uid).catch(() => null);
         const languages = prefs?.languages ?? [];
-        const limit = Math.min(parseInt(req.query.limit, 10) || 20, 30);
+        const limit = Math.min(Math.max(1, parseInt(req.query.limit, 10) || 20), 30);
 
         const songs = await generateMoodSongs({ mood, languages, limit });
         res.json({ success: true, mood, count: songs.length, data: songs });
@@ -138,7 +138,7 @@ router.post('/radio', authenticateUser, async (req, res) => {
 
         const prefs = await getUserPreferences(req.user.uid).catch(() => null);
         const languages = prefs?.languages ?? [];
-        const limit = Math.min(parseInt(req.body?.limit, 10) || 20, 30);
+        const limit = Math.min(Math.max(1, parseInt(req.body?.limit, 10) || 20), 30);
 
         const songs = await generateRadioQueue({
             seedType,

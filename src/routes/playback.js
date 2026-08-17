@@ -27,6 +27,7 @@ import { getHeadersForStreamUrl, probeStreamUrl } from '../services/streamValida
 import { getSongDirect } from '../services/jiosaavnDirect.js';
 import { searchSongsOnly as searchGaanaSongsOnly } from '../services/gaanaApi.js';
 import { fetchAndFlattenM3u8 } from './stream.js';
+import { authenticateUser } from '../middleware/auth.js';
 
 const router = express.Router();
 
@@ -220,7 +221,7 @@ async function handlePlayback(req, res) {
 }
 
 // ─── GET /api/v1/playback/diagnostics/:songId ──────────────────────────────────
-router.get('/diagnostics/:songId', async (req, res) => {
+router.get('/diagnostics/:songId', authenticateUser, async (req, res) => {
     setCorsHeaders(res);
     const songId = req.params.songId;
     const songTitle = req.query.title || req.query.q || '';

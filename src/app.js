@@ -124,7 +124,7 @@ app.use('/v1/catalog/resolve', cachePublic(600, 1800));      // stream URLs: 10 
 app.use('/v1/catalog/tracks', cachePublic(3600, 86400));     // track meta: 1 h / 24 h
 app.use('/v1', cachePublic(300, 600), catalogRoutes);
 app.use('/v1', playerRoutes);
-app.use('/api/playback', cachePublic(600, 1800), catalogRoutes);
+app.use('/api/playback', cachePrivate, catalogRoutes);
 app.use('/api/gaana', cachePublic(600, 1800), catalogRoutes);
 app.use('/api/trending', cachePublic(300, 600));             // 5 min / 10 min
 app.use('/api/songs', cachePublic(3600, 86400));             // 1 h / 24 h

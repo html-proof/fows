@@ -386,7 +386,12 @@ export async function resolvePlayableStream(params = {}) {
  * Backward compatibility wrapper for canonical catalog routes (`/v1/catalog/resolve/:id`)
  */
 export async function resolveStream(canonicalId, opts = {}) {
-    const track = opts.overrideTrack || getTrack(canonicalId);
+    let track;
+    try {
+        track = opts.overrideTrack || getTrack(canonicalId);
+    } catch (_) {
+        track = null;
+    }
     const resolved = await resolvePlayableStream({
         id: canonicalId,
         title: track?.title ?? opts.overrideTrack?.title ?? '',

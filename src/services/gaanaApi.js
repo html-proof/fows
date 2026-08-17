@@ -271,7 +271,7 @@ export async function searchSongsOnly(query, limit = 20) {
         // Fetch song details in parallel
         const songPromises = trackSeokeys.map(async (seokey) => {
             try {
-                const songDetailUrl = `https://gaana.com/apiv2?type=songDetail&seokey=${seokey}`;
+                const songDetailUrl = `https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seokey)}`;
                 const detailResult = await fetchFromGaana(songDetailUrl, 'POST');
                 if (detailResult.tracks && detailResult.tracks.length > 0) {
                     const normalized = _normalise(detailResult.tracks[0], seokey);

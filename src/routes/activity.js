@@ -9,6 +9,13 @@ const MAX_FIELD_LEN = 100;
 const MAX_HISTORY_LIMIT = 300;
 const ALLOWED_ACTIVITY_TYPES = new Set(['search', 'play', 'skip', 'search_click']);
 
+// Firebase RTDB key characters that create path traversal or key errors
+const FIREBASE_UNSAFE_RE = /[\/\.#$\[\]]/;
+
+function isValidSongId(id) {
+    return typeof id === 'string' && id.length > 0 && id.length <= MAX_FIELD_LEN && !FIREBASE_UNSAFE_RE.test(id);
+}
+
 function truncate(value, maxLen) {
     if (typeof value !== 'string') return value;
     return value.slice(0, maxLen);
@@ -42,8 +49,8 @@ router.post('/search', authenticateUser, async (req, res) => {
 router.post('/play', authenticateUser, async (req, res) => {
     try {
         const { songId, songName, artist, language, genre, duration, totalDuration } = req.body;
-        if (!songId || typeof songId !== 'string') {
-            return res.status(400).json({ error: '"songId" is required' });
+        if (!isValidSongId(songId)) {
+            return res.status(400).json({ error: '"songId" is required and must not contain path characters' });
         }
 
         const payload = { songId: truncate(songId, MAX_FIELD_LEN) };
@@ -71,8 +78,8 @@ router.post('/play', authenticateUser, async (req, res) => {
 router.post('/skip', authenticateUser, async (req, res) => {
     try {
         const { songId, songName, artist, language, genre, skipTime, totalDuration } = req.body;
-        if (!songId || typeof songId !== 'string') {
-            return res.status(400).json({ error: '"songId" is required' });
+        if (!isValidSongId(songId)) {
+            return res.status(400).json({ error: '"songId" is required and must not contain path characters' });
         }
 
         const payload = { songId: truncate(songId, MAX_FIELD_LEN) };
@@ -100,8 +107,8 @@ router.post('/skip', authenticateUser, async (req, res) => {
 router.post('/search-click', authenticateUser, async (req, res) => {
     try {
         const { songId, songName, artist, language, genre, query, position } = req.body;
-        if (!songId || typeof songId !== 'string') {
-            return res.status(400).json({ error: '"songId" is required' });
+        if (!isValidSongId(songId)) {
+            return res.status(400).json({ error: '"songId" is required and must not contain path characters' });
         }
 
         const payload = { songId: truncate(songId, MAX_FIELD_LEN) };
@@ -110,7 +117,8 @@ router.post('/search-click', authenticateUser, async (req, res) => {
         if (language) payload.language = truncate(String(language), MAX_FIELD_LEN);
         if (genre) payload.genre = truncate(String(genre), MAX_FIELD_LEN);
         if (query) payload.query = truncate(String(query), MAX_QUERY_LEN);
-        if (position != null) payload.position = Number(position);
+        const parsedPosition = Number(position);
+        if (position != null && Number.isFinite(parsedPosition)) payload.position = parsedPosition;
 
         const result = await logActivity(req.user.uid, 'search_click', payload);
         res.json({ success: true, data: result });
