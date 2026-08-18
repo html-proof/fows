@@ -48,7 +48,7 @@ router.post('/search', authenticateUser, async (req, res) => {
  */
 router.post('/play', authenticateUser, async (req, res) => {
     try {
-        const { songId, songName, artist, language, genre, duration, totalDuration } = req.body;
+        const { songId, songName, artist, language, genre, duration, totalDuration, imageUrl, canonicalId } = req.body;
         if (!isValidSongId(songId)) {
             return res.status(400).json({ error: '"songId" is required and must not contain path characters' });
         }
@@ -58,6 +58,8 @@ router.post('/play', authenticateUser, async (req, res) => {
         if (artist) payload.artist = truncate(String(artist), MAX_FIELD_LEN);
         if (language) payload.language = truncate(String(language), MAX_FIELD_LEN);
         if (genre) payload.genre = truncate(String(genre), MAX_FIELD_LEN);
+        if (imageUrl) payload.imageUrl = truncate(String(imageUrl), MAX_FIELD_LEN);
+        if (canonicalId) payload.canonicalId = truncate(String(canonicalId), MAX_FIELD_LEN);
         const parsedDuration = Number(duration);
         if (duration != null && Number.isFinite(parsedDuration)) payload.duration = parsedDuration;
         const parsedTotalDuration = Number(totalDuration);

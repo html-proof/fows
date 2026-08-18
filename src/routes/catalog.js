@@ -405,15 +405,20 @@ async function _fetchRecentlyPlayed(uid) {
         if (!seen.has(e.songId)) { seen.add(e.songId); unique.push(e); }
     }
 
-    return unique.slice(0, 15).map(e => ({
-        type:      'song',
-        id:        e.canonicalId ?? e.songId,
-        providerId: e.songId,
-        title:     e.songName ?? '',
-        artist:    [{ id: null, name: e.artistName ?? '' }],
-        artwork:   e.imageUrl ?? null,
-        durationMs: null,
-    }));
+    return unique.slice(0, 15).map(e => {
+        const img = e.imageUrl ?? e.artwork ?? null;
+        return {
+            type:      'song',
+            id:        e.canonicalId ?? e.songId,
+            providerId: e.songId,
+            title:     e.songName ?? '',
+            artist:    [{ id: null, name: e.artist ?? e.artistName ?? '' }],
+            imageUrl:  img,
+            image:     img ? [{ quality: '500x500', url: img }] : [],
+            artwork:   img,
+            durationMs: null,
+        };
+    });
 }
 
 async function _fetchRecommended(uid, languages) {
