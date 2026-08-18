@@ -74,22 +74,63 @@ export function generateTrackKey(id, title = '', artist = '', album = '') {
     return `trk_${Math.abs(hash).toString(36)}`;
 }
 
-function _extractDownloadUrl(song) {
-    if (!song) return null;
+/**
+ * Return every playable download URL for a song, ordered best-quality first.
+ *
+ * JioSaavn download URLs are fabricated by string-swapping the bitrate token
+ * (see jiosaavnDirect._buildDownloadUrls), so a `_320`/`_160` URL is NOT
+ * guaranteed to exist on the CDN — some tracks only encode lower bitrates.
+ * Returning the full ordered list lets the caller probe down the ladder and
+ * pick the first bitrate the CDN actually serves, instead of blindly handing
+ * the player a 320kbps URL that 404s.
+ */
+function _extractDownloadCandidates(song) {
+    if (!song) return [];
     const urls = Array.isArray(song.downloadUrl) ? song.downloadUrl : [];
-    const directUrl =
-        urls.find(u => u.quality === '320kbps')?.url
-        || urls.find(u => u.quality === '160kbps')?.url
-        || urls[urls.length - 1]?.url
-        || song.streamUrl
-        || song.stream_url
-        || (typeof song.downloadUrl === 'string' ? song.downloadUrl : null);
+    const ordered = [];
+    const seen = new Set();
+    const push = (url, quality) => {
+        if (typeof url !== 'string') return;
+        const u = url.trim();
+        if (!u.startsWith('http') || seen.has(u)) return;
+        seen.add(u);
+        ordered.push({ url: u, quality: quality || (u.includes('320') ? '320kbps' : u.includes('160') ? '160kbps' : '320kbps') });
+    };
+    for (const q of ['320kbps', '160kbps', '96kbps', '48kbps', '12kbps']) {
+        push(urls.find(u => u.quality === q)?.url, q);
+    }
+    // Any remaining array entries not covered by the standard quality labels.
+    for (const u of urls) push(u?.url, u?.quality);
+    // Legacy single-string shapes.
+    push(song.streamUrl);
+    push(song.stream_url);
+    if (typeof song.downloadUrl === 'string') push(song.downloadUrl);
+    return ordered;
+}
 
-    if (typeof directUrl === 'string' && directUrl.trim().startsWith('http')) {
-        const quality =
-            urls.find(u => u.url === directUrl)?.quality
-            || (directUrl.includes('320') ? '320kbps' : directUrl.includes('160') ? '160kbps' : '320kbps');
-        return { url: directUrl.trim(), quality };
+/**
+ * Walk a song's download candidates best-quality first and return the first
+ * one the CDN actually serves (probe-verified 200/206). Restores the module's
+ * "verified playable URLs only" guarantee for the direct-by-ID lane, so the
+ * 302 fast-path never redirects the player to a dead/404 CDN URL.
+ *
+ * Bounded to the top few bitrates so cold-start latency stays low: a valid
+ * 320kbps hit returns after a single probe RTT.
+ */
+async function _firstPlayableCandidate(song, provider, { maxCandidates = 3, timeoutMs = 1800 } = {}) {
+    const candidates = _extractDownloadCandidates(song).slice(0, maxCandidates);
+    for (const c of candidates) {
+        const probe = await probeStreamUrl(c.url, { timeoutMs });
+        if (probe.isValid) {
+            return {
+                streamUrl: c.url,
+                quality: c.quality,
+                contentType: probe.contentType || (c.url.includes('.mp4') ? 'audio/mp4' : 'audio/mpeg'),
+                isHls: probe.isHls || c.url.includes('.m3u8'),
+                provider,
+                song,
+            };
+        }
     }
     return null;
 }
@@ -148,18 +189,10 @@ async function _resolveDirectById(songId) {
         }
     }
 
-    const makeResult = (song, provider) => {
-        const extracted = _extractDownloadUrl(song);
-        if (!extracted) return null;
-        return {
-            streamUrl: extracted.url,
-            quality: extracted.quality,
-            contentType: extracted.url.includes('.mp4') ? 'audio/mp4' : 'audio/mpeg',
-            isHls: extracted.url.includes('.m3u8'),
-            provider,
-            song,
-        };
-    };
+    // Probe-verify the chosen CDN URL (walking bitrates best→worst) before a
+    // lane is allowed to win. Without this, an unverified 320kbps URL that the
+    // CDN never encoded 404s straight through the 302 fast-path to the player.
+    const makeResult = (song, provider) => _firstPlayableCandidate(song, provider);
 
     const lanes = [
         // Lane A: JioSaavn direct API (fastest when running from Indian region)
@@ -276,22 +309,9 @@ async function _resolveBySearch(title, artist = '', album = '') {
 
             // Race probes in parallel — return the first valid result (non-HLS preferred).
             // 2000ms timeout: CDN URLs need slightly more time than local probes.
-            const probePromises = topCandidates.map(async ({ cand, provider }) => {
-                const extracted = _extractDownloadUrl(cand);
-                if (!extracted) return null;
-                const probe = await probeStreamUrl(extracted.url, { timeoutMs: 2000 });
-                if (probe.isValid) {
-                    return {
-                        streamUrl: extracted.url,
-                        quality: extracted.quality,
-                        contentType: probe.contentType,
-                        isHls: probe.isHls,
-                        provider,
-                        song: cand,
-                    };
-                }
-                return null;
-            });
+            const probePromises = topCandidates.map(({ cand, provider }) =>
+                _firstPlayableCandidate(cand, provider, { maxCandidates: 2, timeoutMs: 2000 })
+            );
 
             // Race probes — resolve as soon as the first valid result arrives.
             // Prefer non-HLS (progressive MP4/AAC); fall back to HLS if that's all that's available.
