@@ -2,8 +2,11 @@ name = "music-hub"
 main = "cloudflare-worker.js"
 compatibility_date = "2024-01-01"
 
+# Render free tier spins the container down after ~15 min idle. A 10-min ping
+# left too thin a margin against Cloudflare cron jitter, so cold starts leaked
+# through (20-40 s first-request stalls). Ping every 5 min for a ~3x safety margin.
 [triggers]
-crons = ["*/10 * * * *"]
+crons = ["*/5 * * * *"]
 
 [observability]
 enabled = false

@@ -1,6 +1,8 @@
 /**
  * Cloudflare Worker — Edge proxy for fows.onrender.com
  *
+ * Deploy pipeline test: 2026-08-18
+ *
  * What this does:
  *  - Routes all requests through Cloudflare's 300+ global edge nodes
  *  - Passes through Range headers & 206 Partial Content for streaming audio byte probes & seeking
