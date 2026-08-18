@@ -68,6 +68,34 @@ router.options('/:songId', (_req, res) => {
     res.status(204).end();
 });
 
+// ─── GET /api/v1/playback/prefetch/:songId ────────────────────────────────────
+// Returns 202 immediately and resolves the stream in the background.
+// Flutter calls this for the next-in-queue song so the CDN URL is cached
+// before the user taps play — eliminating the cold-cache resolution delay.
+router.get('/prefetch/:songId', (req, res) => {
+    setCorsHeaders(res);
+    const songId     = req.params.songId;
+    const songTitle  = req.query.title  || req.query.q || '';
+    const songArtist = req.query.artist || '';
+    const songAlbum  = req.query.album  || '';
+    const language   = req.query.language || '';
+
+    if (!songId) {
+        return res.status(400).json({ success: false, error: 'songId is required' });
+    }
+
+    // Check if already cached — if so, nothing to do.
+    const trackKey = generateTrackKey(songId, songTitle, songArtist, songAlbum);
+    const alreadyCached = getCachedStream(trackKey) || getCachedStream(songId);
+    res.status(alreadyCached ? 200 : 202).json({ success: true, cached: !!alreadyCached });
+
+    if (!alreadyCached) {
+        // Fire-and-forget background resolution — client has already received 202.
+        resolvePlayableStream({ id: songId, title: songTitle, artist: songArtist, album: songAlbum, language })
+            .catch(() => {});
+    }
+});
+
 // ─── GET / HEAD /api/v1/playback/:songId ──────────────────────────────────────
 
 async function handlePlayback(req, res) {

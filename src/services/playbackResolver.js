@@ -346,11 +346,11 @@ export async function resolvePlayableStream(params = {}) {
 
     const resolvePromise = (async () => {
 
-        // Overall 12s timeout — fail fast rather than cascade for 90s
+        // Overall 7s timeout — parallel lanes resolve in 2–5s; 7s catches stragglers
         const timeoutPromise = new Promise((_, reject) =>
             setTimeout(() => reject(new PlaybackResolveError(
                 `Resolution timed out for "${songTitle || songId}"`, 'TIMEOUT'
-            )), 12000)
+            )), 7000)
         );
 
         return Promise.race([timeoutPromise, (async () => {
