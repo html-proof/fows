@@ -60,6 +60,7 @@ admin.initializeApp({
 const db = admin.database();
 const firestore = admin.firestore();
 const auth = admin.auth();
+const messaging = admin.messaging();
 
 admin.app().options.credential.getAccessToken()
     .then(() => console.log('✅ Firebase Admin credential verified (OAuth2 token obtained).'))
@@ -74,5 +75,5 @@ admin.app().options.credential.getAccessToken()
         );
     });
 
-export { admin, db, firestore, auth };
+export { admin, db, firestore, auth, messaging };
 export default admin;

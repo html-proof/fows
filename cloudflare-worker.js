@@ -25,6 +25,7 @@ const PRIVATE_PREFIXES = [
     '/api/user',
     '/api/activity',
     '/api/recommendations',
+    '/api/notifications',
     '/api/playlist',
     '/api/player/resolve',
     '/api/stream',

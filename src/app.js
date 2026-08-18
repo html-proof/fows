@@ -18,6 +18,7 @@ import catalogRoutes from './routes/catalog.js';
 import playerRoutes from './routes/player.js';
 import streamRoutes from './routes/stream.js';
 import playbackRoutes from './routes/playback.js';
+import notificationRoutes from './routes/notifications.js';
 import { isShuttingDown } from './runtimeState.js';
 
 const app = express();
@@ -117,6 +118,7 @@ const cachePrivate = (_req, res, next) => {
 app.use('/api/user', cachePrivate, userRoutes);
 app.use('/api/activity', cachePrivate, activityRoutes);
 app.use('/api/recommendations', cachePrivate, recommendationRoutes);
+app.use('/api/notifications', strictLimiter, cachePrivate, notificationRoutes);
 app.use('/api/playlist', strictLimiter, cachePrivate, playlistImportRoutes);
 // Playback gateway — never cache, never compress (registered before catalogRoutes)
 app.use('/api/v1/playback', cachePrivate, playbackRoutes);

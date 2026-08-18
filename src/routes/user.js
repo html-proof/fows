@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { authenticateUser } from '../middleware/auth.js';
 import { saveUserPreferences, getUserPreferences } from '../services/database.js';
+import { syncArtistFollowerIndex } from '../services/notificationService.js';
 
 const router = Router();
 
@@ -63,6 +64,18 @@ router.post('/preferences', authenticateUser, async (req, res) => {
             displayName: req.user.name,
             email: req.user.email,
         });
+
+        // Keep the reverse artist→followers index in sync so new-song pushes can
+        // find this user. Only touch it when favouriteArtists was actually part
+        // of this update (a languages-only update must not wipe the index).
+        if (sanitizedArtists !== undefined) {
+            try {
+                await syncArtistFollowerIndex(req.user.uid, sanitizedArtists);
+            } catch (indexError) {
+                console.error('Follower index sync failed:', indexError.message);
+                // Non-fatal — preferences are already saved.
+            }
+        }
 
         res.json({
             success: true,
