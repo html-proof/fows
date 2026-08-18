@@ -210,10 +210,16 @@ async function forwardToBackend(request, url) {
         headers.set('Accept-Encoding', 'gzip, br');
     }
 
+    // The playback gateway may answer with a 302 to a public CDN (saavncdn).
+    // Pass that redirect straight through to the player (ExoPlayer/AVPlayer
+    // follow redirects natively) so audio bytes go player→CDN directly and
+    // never relay through the Worker. Every other route follows redirects here.
+    const isPlaybackRoute = url.pathname.startsWith('/api/v1/playback');
+
     const init = {
         method: request.method,
         headers,
-        redirect: 'follow',
+        redirect: isPlaybackRoute ? 'manual' : 'follow',
     };
 
     // Buffer body for POST/PUT/PATCH to prevent Cloudflare Worker streaming deadlock
