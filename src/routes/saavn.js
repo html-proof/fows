@@ -1284,7 +1284,7 @@ router.get('/songs/:id/recommendations', async (req, res) => {
             }
         }
 
-        res.json({ success: true, data: attachCanonicalIds(recommendations.slice(0, limit)) });
+        res.json({ success: true, data: normalizeSongList(attachCanonicalIds(recommendations.slice(0, limit))) });
     } catch (error) {
         console.error('Recommendations error:', error.message);
         res.status(500).json({ error: 'Internal server error' });
@@ -1311,8 +1311,11 @@ router.get('/trending', async (req, res) => {
 
     try {
         // getTrendingDirect uses undici (not Node fetch) — works from any region.
-        const data = await getTrendingDirect(type, language, limit);
-        if (data.length > 0) {
+        const rawData = await getTrendingDirect(type, language, limit);
+        if (rawData.length > 0) {
+            // Normalize so every item carries imageUrl/artwork like all other
+            // endpoints; getTrendingDirect only emits a raw `image` field.
+            const data = type === 'album' ? normalizeAlbumList(rawData) : normalizeSongList(rawData);
             _trendingCache.set(cacheKey, { data, expiresAt: now + _TRENDING_TTL_MS });
             return res.json({ success: true, data });
         }
@@ -1325,7 +1328,7 @@ router.get('/trending', async (req, res) => {
     try {
         const query = type === 'album' ? `top ${language} albums` : `top ${language} songs`;
         const results = await searchSongsOnly(query, 20);
-        const fallback = (results?.data?.results ?? []).slice(0, limit);
+        const fallback = normalizeSongList((results?.data?.results ?? []).slice(0, limit));
         if (fallback.length > 0) {
             _trendingCache.set(cacheKey, { data: fallback, expiresAt: now + 2 * 60 * 1000 });
             return res.json({ success: true, data: fallback });
