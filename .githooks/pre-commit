@@ -1,0 +1,47 @@
+#!/bin/sh
+# Pre-commit hook for music-hub-backend.
+# 1. Blocks accidental commits of secrets.
+# 2. Runs `node --check` on staged .js/.mjs files (syntax validation).
+#
+# Enable with: git config core.hooksPath .githooks
+
+set -e
+
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$staged" ] && exit 0
+
+# --- 1. Secret guard -----------------------------------------------------
+secret_hit=0
+for f in $staged; do
+  case "$f" in
+    .env|*/.env|*firebase-adminsdk-*.json|serviceAccountKey.json)
+      echo "✖ Refusing to commit secret file: $f"
+      secret_hit=1
+      ;;
+  esac
+done
+if [ "$secret_hit" -ne 0 ]; then
+  echo "  (these are gitignored; use 'git rm --cached <file>' if already tracked)"
+  exit 1
+fi
+
+# --- 2. JS syntax check --------------------------------------------------
+syntax_fail=0
+for f in $staged; do
+  case "$f" in
+    *.js|*.mjs)
+      if [ -f "$f" ]; then
+        if ! node --check "$f"; then
+          echo "✖ Syntax error in: $f"
+          syntax_fail=1
+        fi
+      fi
+      ;;
+  esac
+done
+if [ "$syntax_fail" -ne 0 ]; then
+  echo "Commit aborted: fix the syntax errors above."
+  exit 1
+fi
+
+exit 0
