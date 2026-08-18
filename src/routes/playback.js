@@ -133,6 +133,24 @@ async function handlePlayback(req, res) {
 
     const isHls = streamData.isHls || (streamData.streamUrl || '').includes('.m3u8');
 
+    // ── Fast path: 302-redirect to public JioSaavn CDN (no byte-proxy) ─────────
+    // saavncdn.com progressive MP4/AAC/MP3 files are public — they require no
+    // Referer/Origin and no token. Proxying every byte through the free-tier
+    // container just adds TTFB + throttles bandwidth. A redirect lets ExoPlayer/
+    // AVPlayer stream and seek straight from the CDN edge = near-instant start.
+    // Gaana/Akamai (need Referer) and HLS still use the transparent proxy below.
+    if (!isHls && req.method === 'GET') {
+        const u = (streamData.streamUrl || '').toLowerCase();
+        const isPublicSaavnCdn = u.includes('saavncdn.com')
+            && (u.includes('.mp4') || u.includes('.m4a') || u.includes('.aac') || u.includes('.mp3'));
+        if (isPublicSaavnCdn) {
+            setCorsHeaders(res);
+            res.setHeader('Cache-Control', 'no-store');
+            res.setHeader('X-Stream-Provider', streamData.provider || 'jiosaavn');
+            return res.redirect(302, streamData.streamUrl);
+        }
+    }
+
     // ── HLS playlist direct delivery (flatten master playlist to segment-level) ──
     if (isHls) {
         // Use X-Forwarded-Host so chunk URLs point through the Cloudflare Worker

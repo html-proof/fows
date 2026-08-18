@@ -161,7 +161,7 @@ async function _resolveDirectById(songId) {
         };
     };
 
-    const [jioDirectResult, proxyResult, gaanaResult] = await Promise.allSettled([
+    const lanes = [
         // Lane A: JioSaavn direct API (fastest when running from Indian region)
         (async () => {
             if (!jioId || jioId.startsWith('trk_')) return null;
@@ -194,15 +194,29 @@ async function _resolveDirectById(songId) {
             const song = detail?.data?.[0] || detail?.data;
             return makeResult(song, 'gaana');
         })(),
-    ]);
+    ];
 
-    const jioVal   = jioDirectResult.status === 'fulfilled' ? jioDirectResult.value : null;
-    const proxyVal = proxyResult.status === 'fulfilled'     ? proxyResult.value     : null;
-    const gaanaVal = gaanaResult.status === 'fulfilled'     ? gaanaResult.value     : null;
-
-    // Prefer non-HLS (progressive MP4/AAC) sources; fall back to HLS or whatever is available.
-    const candidates = [jioVal, proxyVal, gaanaVal].filter(Boolean);
-    return candidates.find(c => !c.isHls) ?? candidates[0] ?? null;
+    // TRUE RACE: return the first lane that yields a usable progressive (non-HLS)
+    // stream the instant it arrives — do NOT wait for the slowest lane's 5s timeout.
+    // If no lane produces a non-HLS source, fall back to the first HLS/any result
+    // once every lane has settled. This is the single biggest cold-start win:
+    // a fast JioSaavn-direct hit (~300ms) is no longer blocked behind the proxy.
+    return new Promise((resolve) => {
+        let remaining = lanes.length;
+        let fallback = null;
+        for (const lane of lanes) {
+            lane.then((r) => {
+                if (r && !r.isHls) {
+                    resolve(r);              // best case — return immediately
+                } else if (r && !fallback) {
+                    fallback = r;            // keep first HLS/any as a fallback
+                }
+            }).catch(() => {}).finally(() => {
+                remaining -= 1;
+                if (remaining === 0) resolve(fallback);
+            });
+        }
+    });
 }
 
 /**
