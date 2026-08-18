@@ -110,6 +110,10 @@ const DERIVATIVE_KEYWORDS = [
     'edit version',
 ];
 
+export async function requestJsonWithTimeoutExported(url, { timeoutMs, label }) {
+    return requestJsonWithTimeout(url, { timeoutMs, label });
+}
+
 async function requestJsonWithTimeout(url, { timeoutMs, label }) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -187,7 +191,7 @@ async function searchSongsOnlyPrimary(query, page = 1) {
     return requestJsonWithTimeout(
         `${BASE_URL}/api/search/songs?query=${encodeURIComponent(query)}&page=${page}`,
         {
-            timeoutMs: 1500,
+            timeoutMs: 5000,
             label: 'Saavn song search',
         }
     );
@@ -434,32 +438,41 @@ async function computeSmartSearchResults({
  * @returns {Promise<object>} Song details
  */
 export async function getSongById(id) {
-    // Primary: direct JioSaavn API — most reliable, no proxy dependency
-    try {
-        const directSong = await getSongDirect(id);
-        if (directSong) {
-            return { success: true, data: [directSong] };
-        }
-    } catch (_) {}
+    // Run direct JioSaavn API and the saavn.sumit.co proxy simultaneously.
+    // The proxy returns pre-decrypted CDN URLs and is geo-transparent, making
+    // it reliable from non-Indian servers where the direct API may omit stream URLs.
+    const [directResult, proxyResult] = await Promise.allSettled([
+        getSongDirect(id).then(song => song ? { success: true, data: [song] } : null).catch(() => null),
+        requestJsonWithTimeout(
+            `${BASE_URL}/api/songs/${encodeURIComponent(id)}`,
+            { timeoutMs: 5000, label: 'Saavn song proxy fetch' },
+        ).then(res => {
+            const song = Array.isArray(res?.data) ? res.data[0] : res?.data;
+            return song ? { success: true, data: [song] } : null;
+        }).catch(() => null),
+    ]);
 
-    // Secondary: Gaana API
+    const directVal = directResult.status === 'fulfilled' ? directResult.value : null;
+    const proxyVal  = proxyResult.status  === 'fulfilled' ? proxyResult.value  : null;
+
+    // Prefer direct result if it has a stream URL; otherwise fall back to proxy
+    if (directVal?.data?.[0] && _hasDownloadUrl(directVal.data[0])) return directVal;
+    if (proxyVal?.data?.[0])  return proxyVal;
+    if (directVal?.data?.[0]) return directVal;  // metadata-only fallback
+
+    // Last resort: Gaana API
     try {
         const gaanaRes = await getGaanaSongById(id);
-        if (gaanaRes && gaanaRes.success && gaanaRes.data?.length > 0) {
-            return gaanaRes;
-        }
-    } catch (_) {}
-
-    // Tertiary: proxy fallback with tight timeout
-    try {
-        const res = await requestJsonWithTimeout(
-            `${BASE_URL}/api/songs/${encodeURIComponent(id)}`,
-            { timeoutMs: 1500, label: 'Saavn song fetch' }
-        );
-        if (res?.data) return res;
+        if (gaanaRes?.success && gaanaRes.data?.length > 0) return gaanaRes;
     } catch (_) {}
 
     return { success: false, error: 'Service temporarily unavailable', data: [] };
+}
+
+function _hasDownloadUrl(song) {
+    if (!song) return false;
+    const urls = Array.isArray(song.downloadUrl) ? song.downloadUrl : [];
+    return urls.some(u => u?.url?.startsWith('http'));
 }
 
 /**

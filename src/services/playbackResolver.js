@@ -11,11 +11,13 @@ import {
     getTrack,
     getProviderTrackId,
 } from './identityResolver.js';
-import { getSongById, searchSongsOnly } from './saavnApi.js';
+import { getSongById, searchSongsOnly, requestJsonWithTimeoutExported } from './saavnApi.js';
 import { searchSongsDirect, getSongDirect } from './jiosaavnDirect.js';
 import { getSongById as getGaanaSongById, searchSongsOnly as searchGaanaSongsOnly } from './gaanaApi.js';
 import { bigramSimilarity, normText } from './searchEngine.js';
 import { probeStreamUrl, getHeadersForStreamUrl, validatePlayableStream } from './streamValidator.js';
+
+const SAAVN_PROXY_BASE = 'https://saavn.sumit.co';
 
 export class PlaybackResolveError extends Error {
     constructor(message, code = 'UNRESOLVABLE') {
@@ -118,7 +120,14 @@ function _scoreCandidate(targetTitle, targetArtist, candidate) {
 }
 
 /**
- * Direct parallel lookup for a song on JioSaavn and Gaana by ID.
+ * Direct parallel lookup for a song on JioSaavn (direct + proxy) and Gaana by ID.
+ *
+ * Runs three lanes in parallel:
+ *   Lane A: JioSaavn direct API (fast when server is in India; may lack encrypted_media_url otherwise)
+ *   Lane B: saavn.sumit.co proxy (geo-transparent; returns pre-decrypted CDN URLs)
+ *   Lane C: Gaana direct API
+ *
+ * First lane to return a usable stream wins.
  */
 async function _resolveDirectById(songId) {
     if (!songId) return null;
@@ -139,46 +148,61 @@ async function _resolveDirectById(songId) {
         }
     }
 
-    const [jioResult, gaanaResult] = await Promise.allSettled([
+    const makeResult = (song, provider) => {
+        const extracted = _extractDownloadUrl(song);
+        if (!extracted) return null;
+        return {
+            streamUrl: extracted.url,
+            quality: extracted.quality,
+            contentType: extracted.url.includes('.mp4') ? 'audio/mp4' : 'audio/mpeg',
+            isHls: extracted.url.includes('.m3u8'),
+            provider,
+            song,
+        };
+    };
+
+    const [jioDirectResult, proxyResult, gaanaResult] = await Promise.allSettled([
+        // Lane A: JioSaavn direct API (fastest when running from Indian region)
         (async () => {
             if (!jioId || jioId.startsWith('trk_')) return null;
-            const song = await getSongDirect(jioId).catch(() => null)
-                || await getSongById(jioId).then(r => r?.data?.[0] || r?.data).catch(() => null);
-            const extracted = _extractDownloadUrl(song);
-            if (!extracted) return null;
-            // Skip CDN probe here — the /api/v1/playback proxy handles 401/403/410
-            // by re-resolving automatically. Probing adds 1.5s to every cold-start
-            // and is redundant since the proxy retries on bad tokens.
-            return {
-                streamUrl: extracted.url,
-                quality: extracted.quality,
-                contentType: extracted.url.includes('.mp4') ? 'audio/mp4' : 'audio/mpeg',
-                isHls: extracted.url.includes('.m3u8'),
-                provider: 'jiosaavn',
-                song,
-            };
+            const song = await getSongDirect(jioId).catch(() => null);
+            return makeResult(song, 'jiosaavn');
         })(),
+
+        // Lane B: saavn.sumit.co proxy — geo-transparent third-party wrapper.
+        // Returns pre-decrypted CDN URLs so no DES/encryption step needed here.
+        // 5 s timeout: proxy may be cold but is the most reliable non-Indian path.
+        (async () => {
+            if (!jioId || jioId.startsWith('trk_')) return null;
+            try {
+                const res = await requestJsonWithTimeoutExported(
+                    `${SAAVN_PROXY_BASE}/api/songs/${encodeURIComponent(jioId)}`,
+                    { timeoutMs: 5000, label: 'saavn-proxy song' },
+                );
+                // Proxy may return { data: song } or { data: [song] }
+                const song = Array.isArray(res?.data) ? res.data[0] : res?.data;
+                return makeResult(song, 'jiosaavn');
+            } catch (_) {
+                return null;
+            }
+        })(),
+
+        // Lane C: Gaana direct API
         (async () => {
             if (!gaanaId || gaanaId.startsWith('trk_')) return null;
             const detail = await getGaanaSongById(gaanaId).catch(() => null);
             const song = detail?.data?.[0] || detail?.data;
-            const extracted = _extractDownloadUrl(song);
-            if (!extracted) return null;
-            return {
-                streamUrl: extracted.url,
-                quality: extracted.quality,
-                contentType: extracted.url.includes('.mp4') ? 'audio/mp4' : 'audio/mpeg',
-                isHls: extracted.url.includes('.m3u8'),
-                provider: 'gaana',
-                song,
-            };
+            return makeResult(song, 'gaana');
         })(),
     ]);
 
-    const jioVal = jioResult.status === 'fulfilled' ? jioResult.value : null;
-    const gaanaVal = gaanaResult.status === 'fulfilled' ? gaanaResult.value : null;
+    const jioVal   = jioDirectResult.status === 'fulfilled' ? jioDirectResult.value : null;
+    const proxyVal = proxyResult.status === 'fulfilled'     ? proxyResult.value     : null;
+    const gaanaVal = gaanaResult.status === 'fulfilled'     ? gaanaResult.value     : null;
 
-    return jioVal || gaanaVal || null;
+    // Prefer non-HLS (progressive MP4/AAC) sources; fall back to HLS or whatever is available.
+    const candidates = [jioVal, proxyVal, gaanaVal].filter(Boolean);
+    return candidates.find(c => !c.isHls) ?? candidates[0] ?? null;
 }
 
 /**
@@ -195,7 +219,7 @@ async function _resolveBySearch(title, artist = '', album = '') {
 
     for (const query of queries) {
         try {
-            const [jioRes, gaanaRes] = await Promise.allSettled([
+            const [jioRes, gaanaRes, proxyRes] = await Promise.allSettled([
                 searchSongsDirect(query, 3).catch(() => [])
                     .then(async res => {
                         if (Array.isArray(res) && res.length > 0) return res;
@@ -203,10 +227,16 @@ async function _resolveBySearch(title, artist = '', album = '') {
                         return fallback?.data?.results || [];
                     }),
                 searchGaanaSongsOnly(query, 3).catch(() => []),
+                // saavn.sumit.co proxy search — geo-transparent; returns pre-decrypted URLs
+                requestJsonWithTimeoutExported(
+                    `${SAAVN_PROXY_BASE}/api/search/songs?query=${encodeURIComponent(query)}&limit=3`,
+                    { timeoutMs: 5000, label: 'saavn-proxy search' },
+                ).then(r => r?.data?.results || []).catch(() => []),
             ]);
 
-            const jioCandidates = (jioRes.status === 'fulfilled' && Array.isArray(jioRes.value)) ? jioRes.value : [];
+            const jioCandidates  = (jioRes.status   === 'fulfilled' && Array.isArray(jioRes.value))   ? jioRes.value   : [];
             const gaanaCandidates = (gaanaRes.status === 'fulfilled' && Array.isArray(gaanaRes.value)) ? gaanaRes.value : [];
+            const proxyCandidates = (proxyRes.status === 'fulfilled' && Array.isArray(proxyRes.value)) ? proxyRes.value : [];
 
             const scoredCandidates = [];
             for (const cand of jioCandidates) {
@@ -217,20 +247,25 @@ async function _resolveBySearch(title, artist = '', album = '') {
                 const score = _scoreCandidate(title, artist, cand);
                 if (score >= 0.45) scoredCandidates.push({ cand, score, provider: 'gaana' });
             }
+            // Proxy results already have pre-decrypted URLs — give them a small boost
+            for (const cand of proxyCandidates) {
+                const score = _scoreCandidate(title, artist, cand);
+                if (score >= 0.45) scoredCandidates.push({ cand, score: score + 0.05, provider: 'jiosaavn' });
+            }
 
-            // Collect top candidates from each distinct provider so a dead provider (e.g. JioSaavn 404) doesn't crowd out valid ones
-            const topJio = scoredCandidates.filter(c => c.provider === 'jiosaavn').slice(0, 2);
+            // Collect top candidates from each distinct provider so a dead provider doesn't crowd out valid ones
+            const topJio   = scoredCandidates.filter(c => c.provider === 'jiosaavn').slice(0, 2);
             const topGaana = scoredCandidates.filter(c => c.provider === 'gaana').slice(0, 2);
             const topCandidates = [...topJio, ...topGaana];
 
             if (topCandidates.length === 0) continue;
 
             // Race probes in parallel — return the first valid result (non-HLS preferred).
-            // Using a race instead of Promise.all cuts latency from max(all probes) to min(first valid probe).
+            // 2000ms timeout: CDN URLs need slightly more time than local probes.
             const probePromises = topCandidates.map(async ({ cand, provider }) => {
                 const extracted = _extractDownloadUrl(cand);
                 if (!extracted) return null;
-                const probe = await probeStreamUrl(extracted.url, { timeoutMs: 1500 });
+                const probe = await probeStreamUrl(extracted.url, { timeoutMs: 2000 });
                 if (probe.isValid) {
                     return {
                         streamUrl: extracted.url,
