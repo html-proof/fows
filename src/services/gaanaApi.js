@@ -102,9 +102,13 @@ export function decryptStreamPath(encryptedData) {
 // Search fan-out means many concurrent Gaana calls; a stalled one must not
 // hold a user request open for the full 8s default.
 const SEARCH_REQUEST_TIMEOUT_MS = 2500;
-// An album lookup is a single request that the user is watching a spinner for,
-// so it can afford a slightly longer budget than one lane of a search fan-out.
-const ALBUM_REQUEST_TIMEOUT_MS = 4000;
+// An album lookup is a single request, and for a Gaana-only album it is the
+// ONLY lane -- there is no second provider to fall through to, so cutting it
+// short just yields an empty screen rather than a faster one. Gaana's album
+// endpoint is markedly slower than its search (observed between 0.4s and 7s for
+// the same album), so this gets the client's full default budget. Only the
+// first opener pays it; the album cache absorbs everyone after that.
+const ALBUM_REQUEST_TIMEOUT_MS = 8000;
 // Detail hydration is the expensive part of a Gaana search: one songDetail
 // request per hit, plus one stream-url request on top. Fan those out without a
 // cap and a single search turns into ~80 HTTP calls, which is what made search
