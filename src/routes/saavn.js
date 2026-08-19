@@ -30,7 +30,7 @@ import {
 import { getUserPreferences } from '../services/database.js';
 import { rerankSongsForUser } from '../services/personalizationModel.js';
 import { attachCanonicalIds } from '../services/identityResolver.js';
-import { resolveStream, setCachedStream, generateTrackKey } from '../services/playbackResolver.js';
+import { resolveStream, setCachedStream, generateTrackKey, normalizeQuality, bitrateLabelForStreamUrl } from '../services/playbackResolver.js';
 import { validatePlayableStream } from '../services/streamValidator.js';
 import {
     normalizeSongMetadata,
@@ -1046,24 +1046,37 @@ router.get('/albums', async (req, res) => {
 
         if (data?.data) {
             const normalized = normalizeAlbumMetadata(data.data);
-            // Pre-warm playbackResolver stream cache for every track in this album
+            // Pre-warm playbackResolver stream cache for every track in this album.
+            //
+            // The album payload's streamUrl is the TOP bitrate (320kbps). The
+            // cache is keyed per quality tier, and setCachedStream defaults to
+            // the 'normal' tier — so warming it with this URL used to file a
+            // 320kbps stream under 'normal', which is the tier every request
+            // without an explicit ?quality= resolves to. Opening an album page
+            // therefore pinned each of its tracks to ~8 MB/song for the next 15
+            // minutes, no matter what quality the player asked for.
+            //
+            // Warm the tier the URL actually belongs to instead, so a 'normal'
+            // or 'low' request still resolves its own bitrate.
             if (Array.isArray(normalized?.songs)) {
                 for (const song of normalized.songs) {
                     if (song.streamUrl) {
+                        const bitrate = bitrateLabelForStreamUrl(song.streamUrl);
                         const streamInfo = {
                             streamUrl: song.streamUrl,
-                            bitrate: '320kbps',
+                            bitrate,
                             contentType: song.streamUrl.includes('.mp4') ? 'audio/mp4' : 'audio/mpeg',
                             isHls: song.streamUrl.includes('.m3u8'),
                             provider: 'jiosaavn',
                             title: song.name || song.title,
                             artist: song.artist || song.primaryArtists,
                         };
-                        if (song.id) setCachedStream(song.id, streamInfo);
-                        if (song.canonicalId) setCachedStream(song.canonicalId, streamInfo);
-                        if (song.providerId) setCachedStream(song.providerId, streamInfo);
+                        const tier = normalizeQuality(bitrate);
+                        if (song.id) setCachedStream(song.id, streamInfo, tier);
+                        if (song.canonicalId) setCachedStream(song.canonicalId, streamInfo, tier);
+                        if (song.providerId) setCachedStream(song.providerId, streamInfo, tier);
                         const trackKey = generateTrackKey(song.id, song.name, song.artist, normalized.name);
-                        setCachedStream(trackKey, streamInfo);
+                        setCachedStream(trackKey, streamInfo, tier);
                     }
                 }
             }

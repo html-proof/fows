@@ -88,11 +88,15 @@ export async function probeStreamUrl(rawUrl, options = {}) {
     const timeoutMs = options.timeoutMs || VALIDATION_TIMEOUT_MS;
     const outboundHeaders = options.headers || getHeadersForStreamUrl(rawUrl);
 
-    // Step 1: Fast HEAD probe using fetch()
-    try {
+    // One probe attempt. HEAD is cheapest, but plenty of CDN edges answer it
+    // with 403/405 even when the file is fine, so a Range GET is the reliable
+    // one. They are raced rather than tried in sequence: run back-to-back, a
+    // HEAD that hangs to its own timeout doubles the cost of every probe, and
+    // the resolver probes several candidates before it can answer the player.
+    const attempt = async (method) => {
         const res = await fetch(rawUrl, {
-            method: 'HEAD',
-            headers: outboundHeaders,
+            method,
+            headers: method === 'HEAD' ? outboundHeaders : { ...outboundHeaders, 'Range': 'bytes=0-1023' },
             redirect: 'follow',
             signal: AbortSignal.timeout(timeoutMs),
         });
@@ -104,49 +108,23 @@ export async function probeStreamUrl(rawUrl, options = {}) {
         const isValidStatus = statusCode === 200 || statusCode === 206;
         const isValidType = isValidAudioContentType(contentType, rawUrl);
 
-        if (isValidStatus && isValidType) {
-            return {
-                isValid: true,
-                contentType: res.headers.get('content-type') || 'audio/mp4',
-                contentLength,
-                statusCode,
-                isHls,
-                durationMs: Date.now() - startTime,
-            };
-        }
-    } catch (_) {
-        // Fallback to partial Range GET probe
-    }
+        // Drain the 1 KB body so the socket returns to the pool immediately.
+        if (method === 'GET') { try { await res.arrayBuffer(); } catch (_) {} }
 
-    // Step 2: Partial Range GET probe (bytes=0-1023) using fetch()
+        if (!isValidStatus || !isValidType) throw new Error(`probe ${method}: HTTP ${statusCode} ${contentType}`);
+
+        return {
+            isValid: true,
+            contentType: res.headers.get('content-type') || 'audio/mp4',
+            contentLength,
+            statusCode,
+            isHls,
+            durationMs: Date.now() - startTime,
+        };
+    };
+
     try {
-        const res = await fetch(rawUrl, {
-            method: 'GET',
-            headers: {
-                ...outboundHeaders,
-                'Range': 'bytes=0-1023',
-            },
-            redirect: 'follow',
-            signal: AbortSignal.timeout(timeoutMs),
-        });
-
-        const statusCode = res.status;
-        const contentType = String(res.headers.get('content-type') || '').toLowerCase();
-        const contentLength = res.headers.get('content-length') ? parseInt(res.headers.get('content-length'), 10) : null;
-        const isHls = contentType.includes('mpegurl') || rawUrl.includes('.m3u8') || res.url.includes('.m3u8');
-        const isValidStatus = statusCode === 200 || statusCode === 206;
-        const isValidType = isValidAudioContentType(contentType, rawUrl);
-
-        if (isValidStatus && isValidType) {
-            return {
-                isValid: true,
-                contentType: res.headers.get('content-type') || 'audio/mp4',
-                contentLength,
-                statusCode,
-                isHls,
-                durationMs: Date.now() - startTime,
-            };
-        }
+        return await Promise.any([attempt('HEAD'), attempt('GET')]);
     } catch (_) {}
 
     return {

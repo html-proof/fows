@@ -77,13 +77,19 @@ export function normalizeQuality(input) {
         case 'best':
             return 'max';
     }
-    // Raw bitrate hint, e.g. "96", "160kbps", "320"
+    // Raw bitrate hint, e.g. "96", "160kbps", "320".
+    //
+    // A numeric hint is a CEILING — the client sends the bitrate it has decided
+    // to spend on this connection — so pick the richest tier that stays within
+    // it, never the nearest one. Rounding up defeated the point: a Data Saver
+    // client asking for 64 kbps was handed the 96 kbps tier, spending 50% more
+    // data than it had budgeted.
     const kbps = parseInt(s, 10);
     if (Number.isFinite(kbps)) {
-        if (kbps <= 60) return 'low';
-        if (kbps <= 128) return 'normal';
-        if (kbps <= 224) return 'high';
-        return 'max';
+        if (kbps >= 320) return 'max';
+        if (kbps >= 160) return 'high';
+        if (kbps >= 96) return 'normal';
+        return 'low';
     }
     return DEFAULT_QUALITY;
 }
@@ -109,7 +115,17 @@ const inFlightResolves = new Map();
 // and probing CDNs. Every sequential step below checks the shared deadline and
 // bails, and probe timeouts are clamped to whatever budget is left. Without this
 // an abandoned resolve could keep grinding for a minute or more.
-const RESOLVE_BUDGET_MS = 7000;
+//
+// The budget is a ceiling on failure, not a target: a cold resolve should land
+// in ~1-3s. Every stage below is either raced or hedged so the ceiling is the
+// slowest single upstream call, never the sum of them.
+const RESOLVE_BUDGET_MS = 5000;
+
+// Direct-by-ID is the accurate lane, so it gets a head start — but only a short
+// one. Past this point the search lane is started alongside it and whichever
+// produces a playable URL first wins, so a stalled provider lookup can no
+// longer eat the whole budget before the fallback has even been attempted.
+const SEARCH_HEDGE_AFTER_MS = 1200;
 
 function _msLeft(deadlineAt) {
     if (!deadlineAt) return Infinity;
@@ -136,6 +152,32 @@ function _withDeadline(promise, deadlineAt, onExpiry = null) {
             (v) => { clearTimeout(timer); resolve(v); },
             () => { clearTimeout(timer); resolve(onExpiry); },
         );
+    });
+}
+
+/**
+ * Resolve with the first promise to yield a truthy value; null if the deadline
+ * passes or every promise settles empty. Unlike Promise.any this ignores falsy
+ * fulfilments (a lane that finished but found nothing) instead of accepting
+ * them as the answer.
+ */
+function _firstTruthy(promises, deadlineAt) {
+    return new Promise((resolve) => {
+        let remaining = promises.length;
+        let settled = false;
+        const finish = (v) => { if (!settled) { settled = true; resolve(v); } };
+        if (remaining === 0) return finish(null);
+        const left = _msLeft(deadlineAt);
+        if (Number.isFinite(left)) {
+            const timer = setTimeout(() => finish(null), Math.max(0, left));
+            if (typeof timer.unref === 'function') timer.unref();
+        }
+        for (const p of promises) {
+            Promise.resolve(p)
+                .then((v) => { if (v) finish(v); })
+                .catch(() => {})
+                .finally(() => { remaining -= 1; if (remaining === 0) finish(null); });
+        }
     });
 }
 
@@ -193,13 +235,26 @@ export function generateTrackKey(id, title = '', artist = '', album = '') {
  * pick the first bitrate the CDN actually serves, instead of blindly handing
  * the player a 320kbps URL that 404s.
  */
+/**
+ * Read the bitrate a CDN URL encodes, as a quality label ('96kbps', …).
+ *
+ * Matches the bitrate TOKEN — `_96.mp4`, `_320_v4.mp4` — not any occurrence of
+ * the digits. A bare substring test (the previous behaviour) also matched the
+ * random hash in the filename and the numeric CDN directory, so a URL like
+ * `.../606/8dd6da86c5eab7e6483b3e854cfd61d1_96.mp4` reported "48kbps" purely
+ * because its hash happened to contain "48". Mislabelled candidates then
+ * shuffled the quality ladder and the resolver handed back the wrong bitrate.
+ *
+ * Falls back to the top bitrate when no token is present, so an unlabelled URL
+ * is never mistaken for a cheap one.
+ */
+export function bitrateLabelForStreamUrl(url) {
+    const match = String(url || '').match(/_(12|48|96|160|320)(?:_[^./]*)?\.(?:mp4|m4a|mp3|aac)/i);
+    return match ? `${match[1]}kbps` : '320kbps';
+}
+
 function _labelForUrl(u) {
-    if (u.includes('_320') || u.includes('320')) return '320kbps';
-    if (u.includes('_160') || u.includes('160')) return '160kbps';
-    if (u.includes('_96')  || u.includes('96'))  return '96kbps';
-    if (u.includes('_48')  || u.includes('48'))  return '48kbps';
-    if (u.includes('_12')  || u.includes('12'))  return '12kbps';
-    return '320kbps';
+    return bitrateLabelForStreamUrl(u);
 }
 
 function _extractDownloadCandidates(song, quality = DEFAULT_QUALITY) {
@@ -244,15 +299,36 @@ function _extractDownloadCandidates(song, quality = DEFAULT_QUALITY) {
  * 302 fast-path never redirects the player to a dead/404 CDN URL.
  *
  * Bounded to the top few bitrates so cold-start latency stays low: a valid
- * 320kbps hit returns after a single probe RTT.
+ * top-of-ladder hit returns after a single probe RTT.
+ *
+ * The probes are fired together and then consumed in ladder order. Walking them
+ * one at a time made a cold resolve cost the SUM of up to three probe timeouts
+ * per lane, which on its own could exhaust the whole resolution budget; fired
+ * together the cost is one probe timeout while the preferred bitrate still wins
+ * whenever it is playable.
  */
-async function _firstPlayableCandidate(song, provider, { maxCandidates = 3, timeoutMs = 1800, quality = DEFAULT_QUALITY, deadlineAt = null } = {}) {
-    const candidates = _extractDownloadCandidates(song, quality).slice(0, maxCandidates);
-    for (const c of candidates) {
-        // Never start a probe we have no budget left to finish.
-        const budget = Math.min(timeoutMs, _msLeft(deadlineAt));
-        if (budget <= 0) return null;
-        const probe = await probeStreamUrl(c.url, { timeoutMs: budget });
+async function _firstPlayableCandidate(song, provider, { maxCandidates = 3, timeoutMs = 1800, quality = DEFAULT_QUALITY, deadlineAt = null, excludeUrls = null } = {}) {
+    let candidates = _extractDownloadCandidates(song, quality);
+    // Drop URLs a caller already knows are dead. Without this, re-resolving
+    // after a stream failure just handed back the same URL that had failed
+    // moments earlier — the retry could never reach a different source.
+    if (excludeUrls && excludeUrls.size > 0) {
+        candidates = candidates.filter(c => !excludeUrls.has(c.url));
+    }
+    candidates = candidates.slice(0, maxCandidates);
+    if (candidates.length === 0) return null;
+
+    // Never start probes we have no budget left to finish.
+    const budget = Math.min(timeoutMs, _msLeft(deadlineAt));
+    if (budget <= 0) return null;
+
+    const probes = candidates.map(c =>
+        probeStreamUrl(c.url, { timeoutMs: budget }).catch(() => ({ isValid: false })),
+    );
+
+    for (let i = 0; i < candidates.length; i++) {
+        const c = candidates[i];
+        const probe = await probes[i];
         if (probe.isValid) {
             return {
                 streamUrl: c.url,
@@ -302,7 +378,7 @@ function _scoreCandidate(targetTitle, targetArtist, candidate) {
  *
  * First lane to return a usable stream wins.
  */
-async function _resolveDirectById(songId, quality = DEFAULT_QUALITY, deadlineAt = null) {
+async function _resolveDirectById(songId, quality = DEFAULT_QUALITY, deadlineAt = null, excludeUrls = null) {
     if (!songId) return null;
 
     let jioId = songId;
@@ -324,25 +400,31 @@ async function _resolveDirectById(songId, quality = DEFAULT_QUALITY, deadlineAt 
     // Probe-verify the chosen CDN URL (walking bitrates best→worst) before a
     // lane is allowed to win. Without this, an unverified 320kbps URL that the
     // CDN never encoded 404s straight through the 302 fast-path to the player.
-    const makeResult = (song, provider) => _firstPlayableCandidate(song, provider, { quality, deadlineAt });
+    const makeResult = (song, provider) => _firstPlayableCandidate(song, provider, { quality, deadlineAt, excludeUrls });
+
+    // Detail lookups get roughly half the remaining budget: whatever they
+    // return still has to be probe-verified before the lane can win.
+    const detailTimeoutMs = Math.max(1, Math.min(2500, Math.round(_msLeft(deadlineAt) / 2)));
 
     const lanes = [
         // Lane A: JioSaavn direct API (fastest when running from Indian region)
         (async () => {
             if (!jioId || jioId.startsWith('trk_')) return null;
-            const song = await getSongDirect(jioId).catch(() => null);
+            const song = await getSongDirect(jioId, { timeoutMs: detailTimeoutMs }).catch(() => null);
             return makeResult(song, 'jiosaavn');
         })(),
 
         // Lane B: saavn.sumit.co proxy — geo-transparent third-party wrapper.
         // Returns pre-decrypted CDN URLs so no DES/encryption step needed here.
-        // 5 s timeout: proxy may be cold but is the most reliable non-Indian path.
+        // The proxy may be cold, but it is the most reliable non-Indian path —
+        // it still only gets its share of the budget, since a 5 s wait here used
+        // to outlive the entire resolution it was supposed to serve.
         (async () => {
             if (!jioId || jioId.startsWith('trk_')) return null;
             try {
                 const res = await requestJsonWithTimeoutExported(
                     `${SAAVN_PROXY_BASE}/api/songs/${encodeURIComponent(jioId)}`,
-                    { timeoutMs: 5000, label: 'saavn-proxy song' },
+                    { timeoutMs: detailTimeoutMs, label: 'saavn-proxy song' },
                 );
                 // Proxy may return { data: song } or { data: [song] }
                 const song = Array.isArray(res?.data) ? res.data[0] : res?.data;
@@ -355,7 +437,11 @@ async function _resolveDirectById(songId, quality = DEFAULT_QUALITY, deadlineAt 
         // Lane C: Gaana direct API
         (async () => {
             if (!gaanaId || gaanaId.startsWith('trk_')) return null;
-            const detail = await getGaanaSongById(gaanaId).catch(() => null);
+            const detail = await _withDeadline(
+                getGaanaSongById(gaanaId).catch(() => null),
+                Date.now() + detailTimeoutMs,
+                null,
+            );
             const song = detail?.data?.[0] || detail?.data;
             return makeResult(song, 'gaana');
         })(),
@@ -395,7 +481,7 @@ async function _resolveDirectById(songId, quality = DEFAULT_QUALITY, deadlineAt 
 /**
  * Fallback parallel search across JioSaavn and Gaana for song title + artist.
  */
-async function _resolveBySearch(title, artist = '', album = '', quality = DEFAULT_QUALITY, deadlineAt = null) {
+async function _resolveBySearch(title, artist = '', album = '', quality = DEFAULT_QUALITY, deadlineAt = null, excludeUrls = null) {
     const cleanTitle = title.replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '').replace(/[,\-_]/g, ' ').trim();
     const primaryArtist = artist.split(',')[0].split('&')[0].replace(/[,\-_]/g, ' ').trim();
 
@@ -453,7 +539,7 @@ async function _resolveBySearch(title, artist = '', album = '', quality = DEFAUL
             // Race probes in parallel — return the first valid result (non-HLS preferred).
             // 2000ms timeout: CDN URLs need slightly more time than local probes.
             const probePromises = topCandidates.map(({ cand, provider }) =>
-                _firstPlayableCandidate(cand, provider, { maxCandidates: 2, timeoutMs: 2000, quality, deadlineAt })
+                _firstPlayableCandidate(cand, provider, { maxCandidates: 2, timeoutMs: 2000, quality, deadlineAt, excludeUrls })
             );
 
             // Race probes — resolve as soon as the first valid result arrives.
@@ -489,6 +575,16 @@ export async function resolvePlayableStream(params = {}) {
     const songAlbum = String(params.album || '').trim();
     const quality = normalizeQuality(params.quality);
 
+    // URLs the caller has already seen fail. Everything downstream skips them,
+    // so a re-resolve after a dead stream is guaranteed to try a different
+    // candidate — a different bitrate, or a different provider entirely —
+    // rather than confidently handing back the URL that just 404'd.
+    const excludeUrls = new Set(
+        (Array.isArray(params.excludeUrls) ? params.excludeUrls : [])
+            .map(u => String(u || '').trim())
+            .filter(Boolean),
+    );
+
     if (!songId && !songTitle) {
         throw new PlaybackResolveError('Song ID or title is required for resolution', 'BAD_REQUEST');
     }
@@ -497,8 +593,12 @@ export async function resolvePlayableStream(params = {}) {
     const lockKey = _cacheKey(trackKey, quality);
 
     // 1. Fast Memory Cache Check (Instant 0ms) — per quality tier
+    // Skipped when the cached URL is one of the failed ones: serving it again
+    // would turn the retry into an instant repeat of the same failure.
     const cached = getCachedStream(trackKey, quality);
-    if (cached && cached.streamUrl) {
+    if (cached && cached.streamUrl && excludeUrls.has(cached.streamUrl)) {
+        invalidateStreamCache(trackKey, quality);
+    } else if (cached && cached.streamUrl) {
         return {
             id: trackKey,
             title: songTitle || cached.title,
@@ -519,18 +619,36 @@ export async function resolvePlayableStream(params = {}) {
     }
 
     // 2. Single-flight lock: deduplicate concurrent requests for the same track+tier
-    const activeLock = inFlightResolves.get(lockKey);
-    if (activeLock) {
-        return activeLock;
+    //
+    // A retry carrying exclusions must NOT join an in-flight resolve: that
+    // resolve was started without them and can only return the very URL the
+    // caller is retrying away from. Such requests run on their own so the
+    // failover is real, and they do not publish a lock of their own either —
+    // their answer is deliberately narrower than the general one.
+    if (excludeUrls.size === 0) {
+        const activeLock = inFlightResolves.get(lockKey);
+        if (activeLock) {
+            return activeLock;
+        }
     }
 
     const deadlineAt = startTime + RESOLVE_BUDGET_MS;
 
     const workPromise = (async () => {
-        // Step A: Direct lookup by ID if available
-        let winner = await _resolveDirectById(songId, quality, deadlineAt);
+        // Step A: Direct lookup by ID if available.
+        const directPromise = _resolveDirectById(songId, quality, deadlineAt, excludeUrls).catch(() => null);
 
-        // Step B: Fallback search if direct lookup gave no playable stream
+        // Give the accurate lane a short head start of its own.
+        let winner = await _withDeadline(
+            directPromise,
+            Math.min(startTime + SEARCH_HEDGE_AFTER_MS, deadlineAt),
+            null,
+        );
+
+        // Step B: Hedge with a fallback search. This runs ALONGSIDE the direct
+        // lookup rather than after it — waiting for direct to fully give up
+        // meant a slow provider consumed the entire budget and the search never
+        // ran at all, which is what turned a resolvable track into a timeout.
         if (!winner) {
             let searchTitle = songTitle;
             let searchArtist = songArtist;
@@ -546,9 +664,14 @@ export async function resolvePlayableStream(params = {}) {
                 }
             }
 
+            const racers = [directPromise];
             if (searchTitle.length > 0 || searchArtist.length > 0) {
-                winner = await _resolveBySearch(searchTitle, searchArtist, searchAlbum, quality, deadlineAt);
+                racers.push(
+                    _resolveBySearch(searchTitle, searchArtist, searchAlbum, quality, deadlineAt, excludeUrls)
+                        .catch(() => null),
+                );
             }
+            winner = await _firstTruthy(racers, deadlineAt);
         }
 
         if (!winner || !winner.streamUrl) {
@@ -599,7 +722,10 @@ export async function resolvePlayableStream(params = {}) {
     workPromise.catch(() => {}).finally(() => {
         inFlightResolves.delete(lockKey);
     });
-    inFlightResolves.set(lockKey, workPromise);
+    // Only a general (exclusion-free) resolve may be shared with other callers.
+    if (excludeUrls.size === 0) {
+        inFlightResolves.set(lockKey, workPromise);
+    }
     return workPromise;
 }
 

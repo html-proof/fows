@@ -23,6 +23,9 @@ const MAX_REQUEST_ATTEMPTS = 2;
 // Without this a single stalled socket could hold a request for ~14s (two
 // attempts x 8s body timeout) and blow every caller's deadline.
 const SEARCH_REQUEST_TIMEOUT_MS = 4000;
+// song.getDetails sits directly in front of playback: the resolver still has to
+// probe CDN candidates after it returns, so its slice of the budget is smaller.
+const SONG_REQUEST_TIMEOUT_MS = 2500;
 // The search fan-out asks for the same query string from several lanes at once
 // (route variants overlap with the smart-search layer's own variants). Those
 // duplicates queue up against the same origin and then abort on their own
@@ -347,11 +350,19 @@ async function _searchSongsDirectUncached(query, limit, options) {
 /**
  * Get full song details (including stream URL) for one JioSaavn song ID.
  * Returns a normalised song object or null.
+ *
+ * Carries the same hard wall-clock budget as search: without one, a stalled
+ * upstream socket runs to the generous connect/body timeouts twice over (retry
+ * included) and blows the playback resolver's deadline single-handedly.
  */
-export async function getSongDirect(id) {
+export async function getSongDirect(id, options = {}) {
     const data = await _apiCall({
         '__call': 'song.getDetails',
         'pids':   id,
+    }, {
+        timeoutMs: Number.isFinite(options?.timeoutMs)
+            ? options.timeoutMs
+            : SONG_REQUEST_TIMEOUT_MS,
     });
 
     // The direct API can also return under `songs` key
