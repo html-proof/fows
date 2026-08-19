@@ -77,18 +77,45 @@ function withSearchBudget(promise, ms, fallback) {
         new Promise(resolve => { timer = setTimeout(() => resolve(fallback), ms); }),
     ]);
 }
-/** Drops repeat ids while keeping the first (best-ranked) occurrence. */
-function dedupeById(items) {
+/**
+ * Collapses rows that are the SAME RECORDING to one entry, keeping the
+ * best-ranked occurrence.
+ *
+ * Providers return one track once per release it appears on. A single
+ * JioSaavn search for "arijit singh" comes back with 40 rows that are only 8
+ * distinct songs: "Apna Bana Le" 17 times and "Zaalima" 16, each under a
+ * different album — the single, the film soundtrack, three compilations, a
+ * "best of". Fusion cannot collapse them because its key is title + album, and
+ * the album is exactly what differs.
+ *
+ * The canonical id is the one identity that does see through this: it is
+ * resolved from title, artist and duration, so all 17 rows carry the same
+ * `trk_…`. Keying on it turns a page of 40 near-copies into a page of real
+ * results.
+ */
+function dedupeByIdentity(items) {
     const seen = new Set();
     const out = [];
     for (const item of (Array.isArray(items) ? items : [])) {
-        const id = String(item?.id ?? '').trim();
-        if (id && seen.has(id)) continue;
-        if (id) seen.add(id);
+        const key = String(item?.canonicalId ?? '').trim()
+            || String(item?.id ?? '').trim();
+        if (key && seen.has(key)) continue;
+        if (key) seen.add(key);
         out.push(item);
     }
     return out;
 }
+
+// How deep into the ranked list to resolve canonical ids before cutting the
+// page. Deduplication has to happen BEFORE the slice or the page is cut to
+// `limit` rows and only then collapses to a handful — which is what made a
+// search look empty. Resolving identity costs a SQLite round trip per row, so
+// the depth is bounded rather than unbounded.
+const IDENTITY_RESOLVE_DEPTH = 4;
+
+// Best-effort budget for the artist-catalogue lane. It only ever adds results,
+// so it must never hold a search open.
+const ARTIST_CATALOGUE_BUDGET_MS = 2500;
 
 /**
  * Round-robins a provider-grouped list so a fixed-size slice keeps every
@@ -208,7 +235,13 @@ router.get('/search', async (req, res) => {
             const finalSongs = uid
                 ? await rerankSongsForUser({ uid, songs: orderedSongs, query: rawQuery, preferredLanguages, mode: 'search' })
                 : orderedSongs;
-            const songs = dedupeById(normalizeSongList(finalSongs.slice(0, limit)));
+            const songs = normalizeSongList(
+                dedupeByIdentity(
+                    attachCanonicalIds(
+                        finalSongs.slice(0, limit * IDENTITY_RESOLVE_DEPTH),
+                    ),
+                ).slice(0, limit),
+            );
             return res.json({
                 success: true,
                 data: {
@@ -281,6 +314,36 @@ router.get('/search', async (req, res) => {
             : [];
         if (gaanaList.length > 0) {
             candidateGroups.push({ source: 'gaana', weight: 0.9, songs: gaanaList });
+        }
+
+        // ── Artist queries deserve the artist's catalogue ───────────────────
+        // A search for a performer is answered by the search endpoint with
+        // whatever tracks happen to mention the name, and those collapse hard
+        // once same-recording duplicates are removed: "arijit singh" yields
+        // barely twenty distinct songs out of forty rows. The artist's own
+        // track list is the obvious source for the rest, and it is one request
+        // against an id the artist lane has already resolved.
+        //
+        // Gated on the query actually naming that artist, so a song search that
+        // happens to surface an artist card never gets flooded with their back
+        // catalogue.
+        const topArtist = artistsData.status === 'fulfilled'
+            ? (artistsData.value?.data?.results ?? [])[0]
+            : null;
+        const artistNameMatchesQuery = topArtist
+            && areSearchTermsSimilar(normText(topArtist.name ?? ''), normText(primaryQuery));
+        if (topArtist?.id && artistNameMatchesQuery) {
+            const artistSongs = await withSearchBudget(
+                getArtistSongs(String(topArtist.id)).catch(() => null),
+                ARTIST_CATALOGUE_BUDGET_MS,
+                null,
+            );
+            const list = artistSongs?.data?.songs ?? artistSongs?.data?.results ?? [];
+            if (Array.isArray(list) && list.length > 0) {
+                // Below the search variants: these are relevant by artist, not
+                // by the query text, so they fill the page rather than lead it.
+                candidateGroups.push({ source: 'artist-catalogue', weight: 0.6, songs: list });
+            }
         }
 
         // Fallback: if JioSaavn AND Gaana both yielded nothing, try direct
@@ -405,12 +468,15 @@ router.get('/search', async (req, res) => {
             }
         }
 
-        // Final identity pass. Fusion dedupes on title+artist, which still lets
-        // two rows through when the same track appears under one id with
-        // slightly different credits — the client then renders it twice and the
-        // page is one result shorter than it looks.
-        const songsOut = dedupeById(
-            normalizeSongList(attachCanonicalIds(finalRanked.slice(0, limit)))
+        // Final identity pass, applied to more rows than fit on the page so
+        // that collapsing duplicates pulls the next real songs up into the
+        // freed slots instead of leaving a short page.
+        const songsOut = normalizeSongList(
+            dedupeByIdentity(
+                attachCanonicalIds(
+                    finalRanked.slice(0, limit * IDENTITY_RESOLVE_DEPTH),
+                ),
+            ).slice(0, limit),
         );
 
         // The album lanes are merged provider-by-provider upstream (JioSaavn
