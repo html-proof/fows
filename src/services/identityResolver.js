@@ -115,6 +115,13 @@ const stmts = {
     upgradeArtwork:   db.prepare('UPDATE tracks SET artwork_url = ?, updated_at = ? WHERE id = ? AND artwork_url IS NULL'),
     upgradeGenre:     db.prepare('UPDATE tracks SET genre = ?, updated_at = ? WHERE id = ? AND genre IS NULL'),
     getTrack:         db.prepare('SELECT * FROM tracks WHERE id = ?'),
+    getTrackByProviderTrackId: db.prepare(`
+        SELECT t.* FROM tracks t
+        JOIN provider_maps pm ON pm.track_id = t.id
+        WHERE pm.provider_track_id = ?
+        ORDER BY pm.confidence DESC
+        LIMIT 1
+    `),
     getMappings:      db.prepare('SELECT * FROM provider_maps WHERE track_id = ?'),
     getProviderTrackId: db.prepare('SELECT provider_track_id FROM provider_maps WHERE track_id = ? AND provider = ?'),
     getProviderAlbumId: db.prepare('SELECT provider_album_id FROM provider_maps WHERE provider_album_id IS NOT NULL AND track_id IN (SELECT id FROM tracks WHERE album_id = ?) AND provider = ? LIMIT 1'),
@@ -243,6 +250,20 @@ function _upgradeIfBetter(trackId, meta) {
 
 export function getTrack(canonicalId) {
     return stmts.getTrack.get(canonicalId) ?? null;
+}
+
+/**
+ * Look a track up by either its canonical id (trk_…) or any provider's track
+ * id, so callers holding a raw JioSaavn/Gaana id don't need to know which.
+ *
+ * Used to backfill metadata (notably artwork) onto records that stored only an
+ * id — e.g. play-activity rows written before the client sent an image URL.
+ */
+export function findTrackByAnyId(id) {
+    if (typeof id !== 'string') return null;
+    const key = id.trim();
+    if (!key) return null;
+    return stmts.getTrack.get(key) ?? stmts.getTrackByProviderTrackId.get(key) ?? null;
 }
 
 export function getProviderMappings(canonicalId) {

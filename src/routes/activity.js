@@ -1,11 +1,18 @@
 import { Router } from 'express';
 import { authenticateUser } from '../middleware/auth.js';
 import { logActivity, getRecentActivity } from '../services/database.js';
+import { findTrackByAnyId } from '../services/identityResolver.js';
 
 const router = Router();
 
 const MAX_QUERY_LEN = 200;
 const MAX_FIELD_LEN = 100;
+// URLs get their own budget. Artwork URLs carry a slugged title/album plus a
+// timestamp and a size suffix, so real ones routinely run past 100 characters
+// (12% of the catalog does, up to ~135). Truncating them to MAX_FIELD_LEN
+// stored a silently broken link, which is why Recently Played rendered
+// placeholders even for rows that did carry an image.
+const MAX_URL_LEN = 600;
 const MAX_HISTORY_LIMIT = 300;
 const ALLOWED_ACTIVITY_TYPES = new Set(['search', 'play', 'skip', 'search_click']);
 
@@ -19,6 +26,25 @@ function isValidSongId(id) {
 function truncate(value, maxLen) {
     if (typeof value !== 'string') return value;
     return value.slice(0, maxLen);
+}
+
+/**
+ * Returns a safe absolute http(s) URL, or null.
+ *
+ * Rejects rather than truncates: a clipped URL is not a smaller image, it is a
+ * dead link that we would then serve back to every client forever.
+ */
+function sanitizeUrl(value) {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.length > MAX_URL_LEN) return null;
+    try {
+        const parsed = new URL(trimmed);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+        return trimmed;
+    } catch {
+        return null;
+    }
 }
 
 /**
@@ -48,7 +74,7 @@ router.post('/search', authenticateUser, async (req, res) => {
  */
 router.post('/play', authenticateUser, async (req, res) => {
     try {
-        const { songId, songName, artist, language, genre, duration, totalDuration, imageUrl, canonicalId } = req.body;
+        const { songId, songName, artist, album, language, genre, duration, totalDuration, imageUrl, canonicalId } = req.body;
         if (!isValidSongId(songId)) {
             return res.status(400).json({ error: '"songId" is required and must not contain path characters' });
         }
@@ -56,9 +82,11 @@ router.post('/play', authenticateUser, async (req, res) => {
         const payload = { songId: truncate(songId, MAX_FIELD_LEN) };
         if (songName) payload.songName = truncate(String(songName), MAX_FIELD_LEN);
         if (artist) payload.artist = truncate(String(artist), MAX_FIELD_LEN);
+        if (album) payload.album = truncate(String(album), MAX_FIELD_LEN);
         if (language) payload.language = truncate(String(language), MAX_FIELD_LEN);
         if (genre) payload.genre = truncate(String(genre), MAX_FIELD_LEN);
-        if (imageUrl) payload.imageUrl = truncate(String(imageUrl), MAX_FIELD_LEN);
+        const safeImageUrl = sanitizeUrl(imageUrl);
+        if (safeImageUrl) payload.imageUrl = safeImageUrl;
         if (canonicalId) payload.canonicalId = truncate(String(canonicalId), MAX_FIELD_LEN);
         const parsedDuration = Number(duration);
         if (duration != null && Number.isFinite(parsedDuration)) payload.duration = parsedDuration;
@@ -131,6 +159,29 @@ router.post('/search-click', authenticateUser, async (req, res) => {
 });
 
 /**
+ * Fill in a missing `imageUrl` from the local catalog.
+ *
+ * Play events written before the client started sending artwork have only an
+ * id, so Recently Played had nothing to render. The canonical catalog already
+ * knows the artwork for these tracks, and the lookup is a local SQLite read on
+ * an indexed column — no network call, no added latency worth measuring.
+ *
+ * Only ever *adds* a field: a row that already carries an image keeps it.
+ */
+function enrichArtwork(activity) {
+    if (!activity || activity.imageUrl) return activity;
+    try {
+        const track = findTrackByAnyId(activity.canonicalId) ?? findTrackByAnyId(activity.songId);
+        const artwork = sanitizeUrl(track?.artwork_url);
+        if (!artwork) return activity;
+        return { ...activity, imageUrl: artwork };
+    } catch {
+        // Catalog lookup is best-effort — never fail a history request over it.
+        return activity;
+    }
+}
+
+/**
  * GET /api/activity/history
  */
 router.get('/history', authenticateUser, async (req, res) => {
@@ -152,7 +203,7 @@ router.get('/history', authenticateUser, async (req, res) => {
             type || null,
             Math.min(parsedLimit, MAX_HISTORY_LIMIT)
         );
-        res.json({ success: true, data: activities });
+        res.json({ success: true, data: activities.map(enrichArtwork) });
     } catch (error) {
         console.error('Get activity history error:', error.message);
         res.status(500).json({ error: 'Failed to retrieve activity history' });
