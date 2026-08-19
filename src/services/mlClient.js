@@ -26,7 +26,7 @@ const SCORE_CACHE_TTL_MS = 60_000;
 const SCORE_CACHE_MAX_ENTRIES = 200;
 const MAX_SONGS_PER_REQUEST = 200;
 
-const baseUrl = (process.env.ML_SERVICE_URL || '').trim().replace(/\/+$/, '');
+const baseUrl = normalizeBaseUrl(process.env.ML_SERVICE_URL);
 const apiKey = (process.env.ML_SERVICE_API_KEY || '').trim();
 const timeoutMs = Number(process.env.ML_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
 const recommendationTimeoutMs = Number(
@@ -52,6 +52,31 @@ const stats = {
 };
 
 const scoreCache = new Map();
+
+/**
+ * Accept a bare `host:port` as well as a full URL.
+ *
+ * Render's blueprint `fromService` properties only ever yield `host`, `port` or
+ * `hostport` -- never a scheme -- so wiring the two services together in
+ * render.yaml hands us something like `music-ml-service:10000`, which undici
+ * cannot dispatch.
+ *
+ * Only a public DNS name gets TLS. A bare service name (Render's private
+ * network), localhost, and raw IPs all speak plain HTTP -- assuming https for
+ * those would fail the handshake rather than fall back.
+ */
+function normalizeBaseUrl(raw) {
+    const trimmed = String(raw || '').trim().replace(/\/+$/, '');
+    if (!trimmed) return '';
+    if (/^https?:\/\//i.test(trimmed)) return trimmed;
+
+    const host = trimmed.split('/')[0].split(':')[0].toLowerCase();
+    const isIpAddress = /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+    const isPublicName = host.includes('.') && !isIpAddress;
+    const scheme = isPublicName && host !== 'localhost' ? 'https' : 'http';
+
+    return `${scheme}://${trimmed}`;
+}
 
 export function isMlEnabled() {
     return enabled;

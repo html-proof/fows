@@ -16,8 +16,14 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-      # Wire the gateway to the ML service below. Render substitutes the
-      # deployed host, so this survives service recreation.
+      # Wire the gateway to the ML service below, over Render's private
+      # network: lower latency than the public URL, and the ML service is
+      # never reached from the internet.
+      #
+      # `hostport` yields a bare "music-ml-service:10000" -- blueprint
+      # fromService properties are only ever host/port/hostport, never a full
+      # URL -- so the gateway prepends the scheme itself (see
+      # normalizeBaseUrl in src/services/mlClient.js).
       - key: ML_SERVICE_URL
         fromService:
           type: web

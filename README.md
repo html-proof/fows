@@ -63,7 +63,7 @@ The trained ranking model runs in a **separate Python service**
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `ML_SERVICE_URL` | *(empty)* | Base URL of the ML service. **Empty disables the integration** — the gateway then ranks with local heuristics only. |
+| `ML_SERVICE_URL` | *(empty)* | Base URL of the ML service. **Empty disables the integration** — the gateway then ranks with local heuristics only. A bare `host:port` is accepted: `render.yaml` wires the two services over Render's private network, and blueprint `fromService` properties never include a scheme. Public DNS names get `https://`, private names and IPs get `http://`. |
 | `ML_SERVICE_API_KEY` | *(empty)* | Shared secret, sent as `X-API-Key`. Must match the ML service. |
 | `ML_ENABLED` | `true` | Kill switch. Set `false` to bypass the ML service without clearing the URL. |
 | `ML_TIMEOUT_MS` | `800` | Per-request budget for search reranking. |
