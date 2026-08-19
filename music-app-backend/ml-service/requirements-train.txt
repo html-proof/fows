@@ -1,0 +1,3 @@
+# Training-only dependencies. Never installed on the serving instance.
+# Install with: pip install -r requirements.txt -r requirements-train.txt
+pandas==2.2.3

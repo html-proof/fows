@@ -52,3 +52,46 @@ Recommended on Render:
 4. Set env `KEEPALIVE_URL=https://your-service-name.onrender.com`
 
 This keeps the web service warm more reliably than in-process timers.
+## ML personalization
+
+The trained ranking model runs in a **separate Python service**
+(`music-app-backend/ml-service`), deployed as its own Render web service. See
+`render.yaml` for the blueprint that wires the two together, and
+`music-app-backend/README.md` for training and endpoint details.
+
+### Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ML_SERVICE_URL` | *(empty)* | Base URL of the ML service. **Empty disables the integration** — the gateway then ranks with local heuristics only. |
+| `ML_SERVICE_API_KEY` | *(empty)* | Shared secret, sent as `X-API-Key`. Must match the ML service. |
+| `ML_ENABLED` | `true` | Kill switch. Set `false` to bypass the ML service without clearing the URL. |
+| `ML_TIMEOUT_MS` | `800` | Per-request budget for search reranking. |
+| `ML_RECOMMENDATION_TIMEOUT_MS` | `2000` | Per-request budget for recommendations, radio and next-song. |
+
+### Failure behaviour
+
+The ML service is treated as strictly optional. If it is disabled, asleep,
+unreachable, or slower than its budget, the request is **not** retried and the
+user is **not** made to wait — the gateway ranks with its own heuristics, which
+is exactly what it did before the integration existed.
+
+A circuit breaker opens after 3 consecutive failures and stays open for 30s, so
+a spun-down ML instance costs one timeout rather than one per request. Scores
+are cached for 60s per user/result-set.
+
+Because Render free instances spin down, expect the first request after an idle
+period to fall back while the ML service wakes. Keep it warm the same way the
+gateway is kept warm (see the keepalive section above), pointed at the ML
+service's `/health`.
+
+### Checking it
+
+```bash
+curl https://your-service.onrender.com/healthz/ml
+```
+
+Reports whether the integration is enabled, whether the service is reachable,
+circuit state, call/hit/failure counters, and the loaded model's training
+metrics. It is deliberately **not** part of `/healthz`, which must stay a local
+zero-IO check for keepalive probes.

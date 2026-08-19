@@ -20,6 +20,7 @@ import streamRoutes from './routes/stream.js';
 import playbackRoutes from './routes/playback.js';
 import notificationRoutes from './routes/notifications.js';
 import { isShuttingDown } from './runtimeState.js';
+import { getMlStatus } from './services/mlClient.js';
 
 const app = express();
 
@@ -152,6 +153,13 @@ app.get('/healthz', (_req, res) => {
 app.head('/healthz', (_req, res) => {
     const shuttingDown = isShuttingDown();
     res.sendStatus(shuttingDown ? 503 : 200);
+});
+
+// ML service status. Kept off /healthz on purpose: that endpoint is hit by
+// keepalive probes every few minutes and must stay a local, zero-IO check.
+app.get('/healthz/ml', async (_req, res) => {
+    const status = await getMlStatus();
+    res.status(status.enabled && status.reachable === false ? 503 : 200).json(status);
 });
 
 app.get('/health', (_req, res) => {
