@@ -144,7 +144,7 @@ function _recordingFingerprint(song) {
     // listed under a film: 'Gehra Hua (From "Dhurandhar")' and 'Gehra Hua' are
     // one recording.
     const title = normText(song.name ?? song.title ?? '')
-        .replace(/s*froms+.*$/i, '')
+        .replace(/\s*\bfrom\b\s+.*$/i, '')
         .trim();
     if (!title) return null;
 
@@ -158,7 +158,7 @@ function _recordingFingerprint(song) {
     // test that has to hold is overlap, not equality.
     const artists = new Set(
         String(rawArtist ?? '')
-            .split(/[,&]|feat.?|ft.?/i)
+            .split(/[,&]|\bfeat\.?\b|\bft\.?\b/i)
             .map(a => normText(a))
             .filter(Boolean),
     );
