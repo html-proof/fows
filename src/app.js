@@ -172,7 +172,7 @@ app.head('/health', (_req, res) => {
 app.get('/', (_req, res) => {
     res.json({
         message: 'Music Hub API — JioSaavn-powered backend',
-        version: '2.1.0',
+        version: '2.1.1',
         endpoints: {
             search: [
                 'GET  /api/search?query=&limit=&page=       — songs + albums + artists + top result',

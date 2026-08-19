@@ -88,22 +88,42 @@ function withSearchBudget(promise, ms, fallback) {
  * "best of". Fusion cannot collapse them because its key is title + album, and
  * the album is exactly what differs.
  *
- * The canonical id is the one identity that does see through this: it is
- * resolved from title, artist and duration, so all 17 rows carry the same
- * `trk_…`. Keying on it turns a page of 40 near-copies into a page of real
- * results.
+ * Title, credits and runtime see through it: all 17 rows carry the same three,
+ * and comparing them turns a page of 40 near-copies into a page of real
+ * results. Credits are compared for overlap and never dropped, because titles
+ * repeat across films and two same-titled songs by unrelated artists must both
+ * survive -- see _isSameRecording.
  */
 function dedupeByIdentity(items) {
-    const seen = new Set();
+    // Grouped by title rather than hashed on one key: deciding whether two rows
+    // are the same recording needs a comparison (do the credits overlap? are the
+    // runtimes within a few seconds?), and a comparison cannot be expressed as
+    // an equality key without losing one side of it.
+    const byTitle = new Map();
     const out = [];
     for (const item of (Array.isArray(items) ? items : [])) {
-        const key = _recordingKey(item);
-        if (key && seen.has(key)) continue;
-        if (key) seen.add(key);
+        const fingerprint = _recordingFingerprint(item);
+        if (!fingerprint) {
+            out.push(item);
+            continue;
+        }
+        const sameTitle = byTitle.get(fingerprint.title);
+        if (sameTitle) {
+            if (sameTitle.some(prev => _isSameRecording(prev, fingerprint))) continue;
+            sameTitle.push(fingerprint);
+        } else {
+            byTitle.set(fingerprint.title, [fingerprint]);
+        }
         out.push(item);
     }
     return out;
 }
+
+// Providers round runtimes differently, so equal-length recordings arrive a
+// second or two apart. Compared as a tolerance rather than bucketed: fixed
+// buckets split a 242 s row from a 243 s one whenever a boundary happened to
+// fall between them, which let the duplicate through.
+const _DURATION_TOLERANCE_SECONDS = 3;
 
 /**
  * The identity of a RECORDING, computed from metadata alone.
@@ -118,38 +138,67 @@ function dedupeByIdentity(items) {
  * seventeen copies of one song a provider returns, one per release it appears
  * on.
  */
-function _recordingKey(song) {
-    if (!song) return '';
+function _recordingFingerprint(song) {
+    if (!song) return null;
     // Strip the release marker providers append when the same recording is
     // listed under a film: 'Gehra Hua (From "Dhurandhar")' and 'Gehra Hua' are
     // one recording.
     const title = normText(song.name ?? song.title ?? '')
-        .replace(/\s*\bfrom\b\s+.*$/i, '')
+        .replace(/s*froms+.*$/i, '')
         .trim();
-    if (!title) return String(song.canonicalId ?? song.id ?? '').trim();
+    if (!title) return null;
 
-    // Duration is the discriminator, NOT the artist credit. Providers list the
-    // same recording with the credits in different orders and sometimes drop
-    // one entirely ("Amitabh Bhattacharya, Sachin-Jigar, Arijit Singh" vs
-    // "Sachin-Jigar, Arijit Singh"), so any artist-derived key leaves the
-    // copies looking distinct. Length does not drift between re-releases, and
-    // it still separates a cover or a live take from the studio recording.
-    // Bucketed to five seconds because providers round differently.
-    const seconds = parseInt(song.duration ?? 0, 10) || 0;
-    if (seconds > 0) return `${title}::${Math.round(seconds / 5)}`;
-
-    // No duration to key on — fall back to the credits, unordered.
     const rawArtist = song.primaryArtists
         ?? (Array.isArray(song.artists?.primary)
             ? song.artists.primary.map(a => a?.name ?? '').join(', ')
             : (song.artist ?? ''));
-    const artists = String(rawArtist ?? '')
-        .split(/[,&]|\bfeat\.?\b|\bft\.?\b/i)
-        .map(a => normText(a))
-        .filter(Boolean)
-        .sort()
-        .join('|');
-    return `${title}::${artists}`;
+    // A set, not a joined string: providers list the same recording with the
+    // credits reordered and sometimes drop one entirely ("Amitabh Bhattacharya,
+    // Sachin-Jigar, Arijit Singh" against "Sachin-Jigar, Arijit Singh"), so the
+    // test that has to hold is overlap, not equality.
+    const artists = new Set(
+        String(rawArtist ?? '')
+            .split(/[,&]|feat.?|ft.?/i)
+            .map(a => normText(a))
+            .filter(Boolean),
+    );
+
+    return { title, seconds: parseInt(song.duration ?? 0, 10) || 0, artists };
+}
+
+/**
+ * Whether two rows that already share a title are the same recording.
+ *
+ * Credits come first and can veto on their own. Keying on title and runtime
+ * alone -- which is what this replaced -- silently deleted real songs: Indian
+ * film music reuses titles constantly, so "Malare" by Vijay Yesudas (245 s) and
+ * "Malare" by Haricharan (243 s) landed in one bucket and the page lost a track
+ * the user had asked for. Two same-titled songs by unrelated artists are
+ * different songs however close their runtimes.
+ */
+function _isSameRecording(a, b) {
+    const bothCredited = a.artists.size > 0 && b.artists.size > 0;
+    if (bothCredited) {
+        let sharesArtist = false;
+        for (const name of a.artists) {
+            if (b.artists.has(name)) {
+                sharesArtist = true;
+                break;
+            }
+        }
+        if (!sharesArtist) return false;
+    }
+
+    // Runtime still separates a cover, a remix or a live take from the studio
+    // cut by the same performer.
+    if (a.seconds > 0 && b.seconds > 0) {
+        return Math.abs(a.seconds - b.seconds) <= _DURATION_TOLERANCE_SECONDS;
+    }
+
+    // One side carries no runtime. Shared credits are then the only evidence
+    // there is; with neither credits nor runtime, a repeated bare title is a
+    // duplicate row rather than a coincidence.
+    return bothCredited || (a.artists.size === 0 && b.artists.size === 0);
 }
 
 // How deep into the ranked list to resolve canonical ids before cutting the
@@ -162,6 +211,16 @@ const IDENTITY_RESOLVE_DEPTH = 4;
 // Best-effort budget for the artist-catalogue lane. It only ever adds results,
 // so it must never hold a search open.
 const ARTIST_CATALOGUE_BUDGET_MS = 2500;
+
+// The artist-catalogue lane is an ENHANCEMENT, and it is off unless switched
+// on. Artist queries were the only ones that stopped answering after it
+// shipped -- they are the only queries it runs for -- and while its own budget
+// is bounded, everything it adds to the candidate list is then paid for
+// downstream. An enhancement is not worth an outage, so it stays dark until it
+// can be re-enabled deliberately, with the search path measured under it.
+const ARTIST_CATALOGUE_ENABLED = String(process.env.SEARCH_ARTIST_CATALOGUE ?? '')
+    .trim()
+    .toLowerCase() === 'true';
 
 /**
  * Round-robins a provider-grouped list so a fixed-size slice keeps every
@@ -373,7 +432,7 @@ router.get('/search', async (req, res) => {
         // Gated on the query actually naming that artist, so a song search that
         // happens to surface an artist card never gets flooded with their back
         // catalogue.
-        const topArtist = artistsData.status === 'fulfilled'
+        const topArtist = ARTIST_CATALOGUE_ENABLED && artistsData.status === 'fulfilled'
             ? (artistsData.value?.data?.results ?? [])[0]
             : null;
         const artistNameMatchesQuery = topArtist
