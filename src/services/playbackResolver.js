@@ -106,6 +106,59 @@ function _cacheKey(trackKey, quality) {
     return `${trackKey}::${normalizeQuality(quality)}`;
 }
 
+// ─── URL outcome memory ────────────────────────────────────────────────────────
+// Remembers which concrete CDN URLs actually played and which ones failed, so
+// the resolver stops re-learning the same lesson on every request.
+//
+// Two costs this removes from the tap-to-audio path:
+//   * A URL known to be dead is dropped before any probe is fired. Previously a
+//     404'd URL sat at the top of the bitrate ladder and every later play of
+//     that track paid its probe timeout again before moving on.
+//   * A URL known to be good is returned WITHOUT probing at all, which is a
+//     whole network round-trip saved on the common repeat-play path.
+//
+// Kept deliberately short-lived: CDN tokens expire, so "good" is only trusted
+// briefly, while "dead" is remembered longer because a 404 rarely heals.
+const URL_OK_TTL_MS   = 5 * 60 * 1000;
+const URL_DEAD_TTL_MS = 30 * 60 * 1000;
+const URL_OUTCOME_MAX = 5000;
+const urlOutcomes = new Map(); // url -> { ok: boolean, at: number }
+
+function _pruneUrlOutcomes() {
+    if (urlOutcomes.size <= URL_OUTCOME_MAX) return;
+    // Map preserves insertion order — drop the oldest quarter in one pass.
+    const drop = Math.ceil(URL_OUTCOME_MAX / 4);
+    let i = 0;
+    for (const key of urlOutcomes.keys()) {
+        urlOutcomes.delete(key);
+        if (++i >= drop) break;
+    }
+}
+
+/**
+ * Records how a URL actually behaved. Callers that stream bytes (the playback
+ * gateway) should report here: a real 200/206 or a real 404 is far stronger
+ * evidence than a HEAD probe.
+ */
+export function markStreamUrlOutcome(url, ok) {
+    const u = String(url || '').trim();
+    if (!u.startsWith('http')) return;
+    urlOutcomes.set(u, { ok: !!ok, at: Date.now() });
+    _pruneUrlOutcomes();
+}
+
+/** 'ok' | 'dead' | null (unknown / expired). */
+function _urlOutcome(url) {
+    const entry = urlOutcomes.get(url);
+    if (!entry) return null;
+    const ttl = entry.ok ? URL_OK_TTL_MS : URL_DEAD_TTL_MS;
+    if (Date.now() - entry.at > ttl) {
+        urlOutcomes.delete(url);
+        return null;
+    }
+    return entry.ok ? 'ok' : 'dead';
+}
+
 // In-flight resolution deduplication locks (keyed by track key)
 const inFlightResolves = new Map();
 
@@ -126,6 +179,19 @@ const RESOLVE_BUDGET_MS = 5000;
 // produces a playable URL first wins, so a stalled provider lookup can no
 // longer eat the whole budget before the fallback has even been attempted.
 const SEARCH_HEDGE_AFTER_MS = 1200;
+
+// Budget for a resolve that is recovering from a URL the client already saw
+// fail. It is wider than the normal one because the cheap answers have been
+// ruled out by definition: what is left is a cross-provider search, and cutting
+// it off at the ordinary budget is what left the player with nothing to fail
+// over to.
+const RECOVERY_BUDGET_MS = 8000;
+
+// How many wide-net query variants may run concurrently on the recovery path.
+// Each variant fans out to three provider searches, so this is the knob that
+// keeps a failing track from turning into a request storm. Four is enough to
+// cover title+album, title+artist+album, artist+album and title+language.
+const WIDE_SEARCH_MAX_VARIANTS = 4;
 
 function _msLeft(deadlineAt) {
     if (!deadlineAt) return Infinity;
@@ -186,6 +252,13 @@ export function getCachedStream(trackKey, quality = DEFAULT_QUALITY) {
     const entry = memoryStreamCache.get(_cacheKey(trackKey, quality));
     if (!entry) return null;
     if (Date.now() > entry.expiresAt) {
+        memoryStreamCache.delete(_cacheKey(trackKey, quality));
+        return null;
+    }
+    // A cached URL that has since been observed dead is worse than no cache at
+    // all: the gateway would hand it straight back — or 302 the player at it —
+    // and the track would fail again for everyone until the TTL ran out.
+    if (entry.streamUrl && _urlOutcome(entry.streamUrl) === 'dead') {
         memoryStreamCache.delete(_cacheKey(trackKey, quality));
         return null;
     }
@@ -320,8 +393,26 @@ async function _firstPlayableCandidate(song, provider, { maxCandidates = 3, time
     if (excludeUrls && excludeUrls.size > 0) {
         candidates = candidates.filter(c => !excludeUrls.has(c.url));
     }
+    // Drop URLs remembered as dead from an earlier attempt, so their probe
+    // timeout is never paid twice.
+    candidates = candidates.filter(c => _urlOutcome(c.url) !== 'dead');
     candidates = candidates.slice(0, maxCandidates);
     if (candidates.length === 0) return null;
+
+    // Fast path: a URL that recently played needs no probe at all. This is the
+    // repeat-play case, and skipping the probe removes a full round-trip from
+    // the time between the tap and the first audio byte.
+    const known = candidates.find(c => _urlOutcome(c.url) === 'ok');
+    if (known) {
+        return {
+            streamUrl: known.url,
+            quality: known.quality,
+            contentType: known.url.includes('.mp4') ? 'audio/mp4' : 'audio/mpeg',
+            isHls: known.url.includes('.m3u8'),
+            provider,
+            song,
+        };
+    }
 
     // Never start probes we have no budget left to finish.
     const budget = Math.min(timeoutMs, _msLeft(deadlineAt));
@@ -334,6 +425,9 @@ async function _firstPlayableCandidate(song, provider, { maxCandidates = 3, time
     for (let i = 0; i < candidates.length; i++) {
         const c = candidates[i];
         const probe = await probes[i];
+        // Remember the verdict either way so the next play of this track can
+        // skip the probe (valid) or skip the URL entirely (invalid).
+        markStreamUrlOutcome(c.url, probe.isValid);
         if (probe.isValid) {
             return {
                 streamUrl: c.url,
@@ -486,19 +580,20 @@ async function _resolveDirectById(songId, quality = DEFAULT_QUALITY, deadlineAt 
 /**
  * Fallback parallel search across JioSaavn and Gaana for song title + artist.
  */
-async function _resolveBySearch(title, artist = '', album = '', quality = DEFAULT_QUALITY, deadlineAt = null, excludeUrls = null) {
-    const cleanTitle = title.replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '').replace(/[,\-_]/g, ' ').trim();
-    const primaryArtist = artist.split(',')[0].split('&')[0].replace(/[,\-_]/g, ' ').trim();
-
-    const queries = [
-        [cleanTitle, primaryArtist].filter(Boolean).join(' '),
-        cleanTitle,
-    ].filter(q => q && q.trim().length > 1);
-
-    for (const query of queries) {
-        // Queries run sequentially — don't start another round we can't finish.
-        if (_expired(deadlineAt)) return null;
-        try {
+/**
+ * One search round: query every provider in parallel for a single query
+ * string, score the candidates against the requested track, and probe the
+ * best few. Returns a playable source, or null.
+ *
+ * Scoring is always done against the ORIGINAL title and artist, never against
+ * the query variant that found the candidate, so a track discovered via
+ * "artist + movie" still has to look like the song the user actually asked
+ * for. Only the stream URL is ever taken from the result; the caller keeps
+ * its own metadata untouched.
+ */
+async function _runSearchRound(query, title, artist, quality, deadlineAt, excludeUrls) {
+    if (_expired(deadlineAt)) return null;
+    try {
             const [jioRes, gaanaRes, proxyRes] = await Promise.allSettled([
                 _withDeadline(searchSongsDirect(query, 3).catch(() => [])
                     .then(async res => {
@@ -539,7 +634,7 @@ async function _resolveBySearch(title, artist = '', album = '', quality = DEFAUL
             const topGaana = scoredCandidates.filter(c => c.provider === 'gaana').slice(0, 2);
             const topCandidates = [...topJio, ...topGaana];
 
-            if (topCandidates.length === 0) continue;
+            if (topCandidates.length === 0) return null;
 
             // Race probes in parallel — return the first valid result (non-HLS preferred).
             // 2000ms timeout: CDN URLs need slightly more time than local probes.
@@ -556,11 +651,60 @@ async function _resolveBySearch(title, artist = '', album = '', quality = DEFAUL
                 Promise.any(probePromises.map(p => p.then(r => { if (!r) throw new Error('skip'); return r; })))
                     .catch(() => null)
             );
-            if (winner) return winner;
-        } catch (_) {}
+            return winner || null;
+    } catch (_) {}
+    return null;
+}
+
+async function _resolveBySearch(title, artist = '', album = '', quality = DEFAULT_QUALITY, deadlineAt = null, excludeUrls = null, language = '') {
+    const clean = v => String(v || '').replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '').replace(/[,\-_]/g, ' ').replace(/\s+/g, ' ').trim();
+    const cleanTitle = clean(title);
+    const primaryArtist = clean(String(artist || '').split(',')[0].split('&')[0]);
+    // Album doubles as the film name for soundtrack releases, which is how most
+    // regional cinema tracks are actually indexed.
+    const cleanAlbum = clean(String(album || '').replace(/original motion picture soundtrack/ig, ''));
+    const cleanLanguage = clean(language);
+
+    const dedupe = list => [...new Set(list.filter(q => q && q.trim().length > 1))];
+
+    // Round 1 — the cheap, high-precision queries. Unchanged in cost and order,
+    // so the common path pays exactly what it paid before.
+    const primaryQueries = dedupe([
+        [cleanTitle, primaryArtist].filter(Boolean).join(' '),
+        cleanTitle,
+    ]);
+
+    for (const query of primaryQueries) {
+        if (_expired(deadlineAt)) return null;
+        const winner = await _runSearchRound(query, title, artist, quality, deadlineAt, excludeUrls);
+        if (winner) return winner;
     }
 
-    return null;
+    // Round 2 — the wide net, and only reached when round 1 found nothing.
+    //
+    // A track missing under "title artist" is usually not missing from the
+    // catalogues at all: it is filed under a compilation, a soundtrack release,
+    // or a differently-transliterated artist credit. These variants approach it
+    // from the other directions the providers actually index -- the film name,
+    // the album, the language -- and they run CONCURRENTLY rather than one
+    // after another, because at this point the resolution budget is nearly
+    // spent and sequential rounds would simply run out of time.
+    //
+    // Deliberately gated behind round 1 so the extra fan-out is paid only by
+    // requests that genuinely need it, never by an ordinary play.
+    const wideQueries = dedupe([
+        [cleanTitle, cleanAlbum].filter(Boolean).join(' '),
+        [cleanTitle, primaryArtist, cleanAlbum].filter(Boolean).join(' '),
+        [primaryArtist, cleanAlbum].filter(Boolean).join(' '),
+        [cleanTitle, cleanLanguage].filter(Boolean).join(' '),
+    ]).filter(q => !primaryQueries.includes(q)).slice(0, WIDE_SEARCH_MAX_VARIANTS);
+
+    if (wideQueries.length === 0 || _expired(deadlineAt)) return null;
+
+    const rounds = wideQueries.map(q =>
+        _runSearchRound(q, title, artist, quality, deadlineAt, excludeUrls),
+    );
+    return _firstTruthy(rounds, deadlineAt);
 }
 
 /**
@@ -578,6 +722,9 @@ export async function resolvePlayableStream(params = {}) {
     const songTitle = String(params.title || '').trim();
     const songArtist = String(params.artist || '').trim();
     const songAlbum = String(params.album || '').trim();
+    // Language is a retrieval hint for the wide-net recovery search only; it
+    // never affects the metadata returned to the caller.
+    const songLanguage = String(params.language || '').trim();
     const quality = normalizeQuality(params.quality);
 
     // URLs the caller has already seen fail. Everything downstream skips them,
@@ -637,18 +784,28 @@ export async function resolvePlayableStream(params = {}) {
         }
     }
 
-    const deadlineAt = startTime + RESOLVE_BUDGET_MS;
+    // A recovery resolve — one carrying URLs the client has already watched
+    // fail — is both more urgent and less likely to be answered by the direct
+    // lane, so it gets the wider budget and skips the head start below.
+    const isRecovery = excludeUrls.size > 0;
+    const deadlineAt = startTime + (isRecovery ? RECOVERY_BUDGET_MS : RESOLVE_BUDGET_MS);
 
     const workPromise = (async () => {
         // Step A: Direct lookup by ID if available.
         const directPromise = _resolveDirectById(songId, quality, deadlineAt, excludeUrls).catch(() => null);
 
-        // Give the accurate lane a short head start of its own.
-        let winner = await _withDeadline(
-            directPromise,
-            Math.min(startTime + SEARCH_HEDGE_AFTER_MS, deadlineAt),
-            null,
-        );
+        // Give the accurate lane a short head start of its own — but not on a
+        // recovery resolve. There, the direct lane has already produced a URL
+        // that did not play; spending the head start waiting for it to offer
+        // another one is exactly the delay the client is trying to escape, so
+        // the cross-provider search starts in the same tick.
+        let winner = isRecovery
+            ? null
+            : await _withDeadline(
+                directPromise,
+                Math.min(startTime + SEARCH_HEDGE_AFTER_MS, deadlineAt),
+                null,
+            );
 
         // Step B: Hedge with a fallback search. This runs ALONGSIDE the direct
         // lookup rather than after it — waiting for direct to fully give up
@@ -672,7 +829,7 @@ export async function resolvePlayableStream(params = {}) {
             const racers = [directPromise];
             if (searchTitle.length > 0 || searchArtist.length > 0) {
                 racers.push(
-                    _resolveBySearch(searchTitle, searchArtist, searchAlbum, quality, deadlineAt, excludeUrls)
+                    _resolveBySearch(searchTitle, searchArtist, searchAlbum, quality, deadlineAt, excludeUrls, songLanguage)
                         .catch(() => null),
                 );
             }

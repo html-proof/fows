@@ -85,8 +85,72 @@ async function pipeBody(upstreamBody, req, res) {
     });
 }
 
+// ─── HLS variant selection ────────────────────────────────────────────────────
+// A master playlist lists several renditions. The flattener used to take the
+// first one it saw, which on Gaana is the richest — so every phone, on every
+// connection, was handed the heaviest rendition and then spent the first
+// several seconds buffering it through the proxy.
+//
+// Picking the best rendition that still fits the tier the client asked for is
+// the biggest start-up win available on the HLS path, and it costs nothing but
+// smaller segments.
+const HLS_TIER_CEILING_KBPS = {
+    low: 64,
+    normal: 128,
+    high: 192,
+    max: Infinity,
+};
+
+function _hlsCeilingKbps(quality) {
+    const tier = String(quality || '').toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(HLS_TIER_CEILING_KBPS, tier)) {
+        return HLS_TIER_CEILING_KBPS[tier];
+    }
+    const kbps = parseInt(tier, 10);
+    return Number.isFinite(kbps) && kbps > 0 ? kbps : HLS_TIER_CEILING_KBPS.normal;
+}
+
+/**
+ * Choose a rendition URI out of a master playlist body.
+ *
+ * Returns the highest-bandwidth variant at or below `ceilingKbps`; when every
+ * variant sits above it, the cheapest one wins — a rendition too heavy for the
+ * connection stalls, and a stall is worse than a slightly thinner stream.
+ */
+function _pickVariant(text, ceilingKbps) {
+    const lines = text.split('\n').map(l => l.trim());
+    const variants = [];
+    for (let i = 0; i < lines.length; i++) {
+        if (!lines[i].startsWith('#EXT-X-STREAM-INF')) continue;
+        const uri = lines.slice(i + 1).find(l => l && !l.startsWith('#'));
+        if (!uri) continue;
+        const bw = lines[i].match(/BANDWIDTH=(\d+)/i);
+        variants.push({ uri, kbps: bw ? Math.round(parseInt(bw[1], 10) / 1000) : null });
+    }
+    if (variants.length === 0) return null;
+
+    const known = variants.filter(v => Number.isFinite(v.kbps));
+    if (known.length === 0) return variants[0].uri;
+
+    const withinBudget = known.filter(v => v.kbps <= ceilingKbps);
+    return withinBudget.length > 0
+        ? withinBudget.reduce((best, v) => (v.kbps > best.kbps ? v : best)).uri
+        : known.reduce((best, v) => (v.kbps < best.kbps ? v : best)).uri;
+}
+
 // ─── Recursive HLS Playlist Flattener ─────────────────────────────────────────
-export async function fetchAndFlattenM3u8(playlistUrl, hostUrl, depth = 0) {
+/**
+ * @param {string} playlistUrl
+ * @param {string} hostUrl        public origin the segment URLs should point at
+ * @param {object} [options]
+ * @param {string} [options.quality] quality tier (or kbps hint) used to pick a
+ *   rendition out of a master playlist
+ * @param {number} [options.depth]   recursion guard
+ */
+export async function fetchAndFlattenM3u8(playlistUrl, hostUrl, options = {}) {
+    const depth = Number.isFinite(options?.depth) ? options.depth : 0;
+    const quality = options?.quality ?? '';
+    const ceilingKbps = _hlsCeilingKbps(quality);
     if (depth > 3) return null;
     try {
         assertSafeChunkUrl(playlistUrl);
@@ -106,12 +170,11 @@ export async function fetchAndFlattenM3u8(playlistUrl, hostUrl, depth = 0) {
 
         // If master playlist with sub-playlists (#EXT-X-STREAM-INF), recursively resolve child playlist
         if (text.includes('#EXT-X-STREAM-INF')) {
-            const lines = text.split('\n').map(l => l.trim());
-            const subPath = lines.find(l => l && !l.startsWith('#'));
+            const subPath = _pickVariant(text, ceilingKbps);
             if (subPath) {
                 const baseUrl = playlistUrl.substring(0, playlistUrl.lastIndexOf('/') + 1);
                 const childUrl = subPath.startsWith('http') ? subPath : new URL(subPath, baseUrl).toString();
-                return fetchAndFlattenM3u8(childUrl, hostUrl, depth + 1);
+                return fetchAndFlattenM3u8(childUrl, hostUrl, { quality, depth: depth + 1 });
             }
         }
 
@@ -121,7 +184,11 @@ export async function fetchAndFlattenM3u8(playlistUrl, hostUrl, depth = 0) {
             const trimmed = line.trim();
             if (!trimmed || trimmed.startsWith('#')) return line;
             const absUrl = trimmed.startsWith('http') ? trimmed : new URL(trimmed, baseUrl).toString();
-            return `${hostUrl}/api/stream/chunk?url=${encodeURIComponent(absUrl)}`;
+            // Carry the tier along: a segment line can itself turn out to be a
+            // nested playlist, and the chunk proxy has to pick the same
+            // rendition this playlist was built for.
+            const tier = quality ? `&quality=${encodeURIComponent(quality)}` : '';
+            return `${hostUrl}/api/stream/chunk?url=${encodeURIComponent(absUrl)}${tier}`;
         }).join('\n');
     } catch (_) {
         return null;
@@ -214,7 +281,9 @@ async function handleChunkProxy(req, res) {
             const hostUrl = forwardedHost
                 ? `https://${forwardedHost}`
                 : `${req.protocol}://${req.get('host')}`;
-            const rewritten = await fetchAndFlattenM3u8(chunkUrl, hostUrl);
+            const rewritten = await fetchAndFlattenM3u8(chunkUrl, hostUrl, {
+                quality: String(req.query.quality || ''),
+            });
             if (rewritten) {
                 setStreamCorsHeaders(res);
                 res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
@@ -366,7 +435,7 @@ async function handleStreamProxy(req, res) {
         const hostUrl = forwardedHost
             ? `https://${forwardedHost}`
             : `${req.protocol}://${req.get('host')}`;
-        const rewritten = await fetchAndFlattenM3u8(realAudioUrl, hostUrl);
+        const rewritten = await fetchAndFlattenM3u8(realAudioUrl, hostUrl, { quality });
         if (rewritten) {
             setStreamCorsHeaders(res);
             res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');

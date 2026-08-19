@@ -312,16 +312,23 @@ export async function searchSongsOnly(query, limit = 20, options = {}) {
     const inFlight = searchInFlight.get(cacheKey);
     if (inFlight) return inFlight;
 
-    const promise = _searchSongsOnlyUncached(query, limit, options)
+    // Hydration that outruns the caller's budget still finishes in the
+    // background, and its complete result replaces the partial one in the
+    // cache — so the hit that was too slow for this search is ready for the
+    // next one instead of being thrown away.
+    const remember = (songs) => {
+        if (!Array.isArray(songs) || songs.length === 0) return;
+        searchMicroCache.set(cacheKey, { storedAt: Date.now(), songs });
+        while (searchMicroCache.size > 200) {
+            const oldest = searchMicroCache.keys().next().value;
+            if (oldest === undefined) break;
+            searchMicroCache.delete(oldest);
+        }
+    };
+
+    const promise = _searchSongsOnlyUncached(query, limit, { ...options, onComplete: remember })
         .then((songs) => {
-            if (Array.isArray(songs) && songs.length > 0) {
-                searchMicroCache.set(cacheKey, { storedAt: Date.now(), songs });
-                while (searchMicroCache.size > 200) {
-                    const oldest = searchMicroCache.keys().next().value;
-                    if (oldest === undefined) break;
-                    searchMicroCache.delete(oldest);
-                }
-            }
+            remember(songs);
             return songs;
         });
 
@@ -332,6 +339,7 @@ export async function searchSongsOnly(query, limit = 20, options = {}) {
 }
 
 async function _searchSongsOnlyUncached(query, limit, options) {
+    const startedAt = Date.now();
     const withStreams = options?.withStreams !== false;
     const detailTimeoutMs = Number.isFinite(options?.timeoutMs)
         ? options.timeoutMs
@@ -367,7 +375,9 @@ async function _searchSongsOnlyUncached(query, limit, options) {
         // metadata (search/browse) skip the per-track stream lookup entirely —
         // playback resolves Gaana streams by track id later, so fetching them
         // here doubled the request count for URLs nobody read.
-        const songs = await _mapWithConcurrency(trackSeokeys, SEARCH_DETAIL_CONCURRENCY, async (seokey) => {
+        const hydrated = [];
+        const collect = (song) => { if (song) hydrated.push(song); return song; };
+        const hydrateAll = _mapWithConcurrency(trackSeokeys, SEARCH_DETAIL_CONCURRENCY, async (seokey) => {
             const songDetailUrl = `https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seokey)}`;
             const detailResult = await fetchFromGaana(songDetailUrl, 'POST', null, { timeoutMs: detailTimeoutMs });
             if (!detailResult.tracks?.length) return null;
@@ -385,10 +395,42 @@ async function _searchSongsOnlyUncached(query, limit, options) {
                     ];
                 }
             }
-            return normalized;
+            return collect(normalized);
         });
 
-        return songs.filter(Boolean);
+        // Hydration is the slow half of a Gaana search: one songDetail request
+        // per hit, in waves of SEARCH_DETAIL_CONCURRENCY. Waiting for the last
+        // wave used to be all-or-nothing — a caller with a 3.5s budget got
+        // NOTHING from Gaana whenever the tail was slow, which is exactly how a
+        // catalogue that has the song ends up invisible in the results.
+        //
+        // With a budget, the tracks that did hydrate are returned on time and
+        // the rest keep going in the background to warm the cache.
+        // The budget covers the whole call, so the keyword search that already
+        // ran comes out of it.
+        const budgetMs = Number.isFinite(options?.budgetMs)
+            ? options.budgetMs - (Date.now() - startedAt)
+            : null;
+        if (budgetMs === null) {
+            return (await hydrateAll).filter(Boolean);
+        }
+
+        const onComplete = typeof options?.onComplete === 'function' ? options.onComplete : null;
+        hydrateAll.then((all) => {
+            const full = all.filter(Boolean);
+            if (onComplete && full.length > hydrated.length) onComplete(full);
+        }).catch(() => {});
+
+        const timedOut = Symbol('timeout');
+        const raced = await Promise.race([
+            hydrateAll,
+            new Promise((resolve) => {
+                const t = setTimeout(() => resolve(timedOut), Math.max(1, budgetMs));
+                if (typeof t.unref === 'function') t.unref();
+            }),
+        ]);
+        if (raced !== timedOut) return raced.filter(Boolean);
+        return hydrated.slice();
     } catch (_) {
         return [];
     }
