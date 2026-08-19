@@ -77,6 +77,19 @@ function withSearchBudget(promise, ms, fallback) {
         new Promise(resolve => { timer = setTimeout(() => resolve(fallback), ms); }),
     ]);
 }
+/** Drops repeat ids while keeping the first (best-ranked) occurrence. */
+function dedupeById(items) {
+    const seen = new Set();
+    const out = [];
+    for (const item of (Array.isArray(items) ? items : [])) {
+        const id = String(item?.id ?? '').trim();
+        if (id && seen.has(id)) continue;
+        if (id) seen.add(id);
+        out.push(item);
+    }
+    return out;
+}
+
 /**
  * Round-robins a provider-grouped list so a fixed-size slice keeps every
  * provider represented. Order within a provider is preserved, and rows without
@@ -195,7 +208,7 @@ router.get('/search', async (req, res) => {
             const finalSongs = uid
                 ? await rerankSongsForUser({ uid, songs: orderedSongs, query: rawQuery, preferredLanguages, mode: 'search' })
                 : orderedSongs;
-            const songs = normalizeSongList(finalSongs.slice(0, limit));
+            const songs = dedupeById(normalizeSongList(finalSongs.slice(0, limit)));
             return res.json({
                 success: true,
                 data: {
@@ -392,7 +405,13 @@ router.get('/search', async (req, res) => {
             }
         }
 
-        const songsOut = normalizeSongList(attachCanonicalIds(finalRanked.slice(0, limit)));
+        // Final identity pass. Fusion dedupes on title+artist, which still lets
+        // two rows through when the same track appears under one id with
+        // slightly different credits — the client then renders it twice and the
+        // page is one result shorter than it looks.
+        const songsOut = dedupeById(
+            normalizeSongList(attachCanonicalIds(finalRanked.slice(0, limit)))
+        );
 
         // The album lanes are merged provider-by-provider upstream (JioSaavn
         // first, then Gaana), so a flat `.slice(0, ALBUM_LIMIT)` cut Gaana off

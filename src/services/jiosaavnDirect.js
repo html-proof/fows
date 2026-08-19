@@ -309,7 +309,8 @@ export async function getTrendingDirect(type = 'song', language = 'hindi', limit
  * Returns normalised song objects matching the saavn.sumit.co proxy format.
  */
 export async function searchSongsDirect(query, limit = 20, options = {}) {
-    const cacheKey = `${String(query ?? '').toLowerCase()}|${limit}`;
+    const page = Math.max(1, Number.parseInt(options?.page, 10) || 1);
+    const cacheKey = `${String(query ?? '').toLowerCase()}|${limit}|p${page}`;
 
     const cached = _readSearchMicroCache(cacheKey);
     if (cached) return cached;
@@ -317,7 +318,7 @@ export async function searchSongsDirect(query, limit = 20, options = {}) {
     const inFlight = searchInFlight.get(cacheKey);
     if (inFlight) return inFlight;
 
-    const promise = _searchSongsDirectUncached(query, limit, options)
+    const promise = _searchSongsDirectUncached(query, limit, { ...options, page })
         .then((songs) => {
             _writeSearchMicroCache(cacheKey, songs);
             return songs;
@@ -330,13 +331,17 @@ export async function searchSongsDirect(query, limit = 20, options = {}) {
 }
 
 async function _searchSongsDirectUncached(query, limit, options) {
+    // `p` was pinned to 1, so every "load more" page re-fetched the SAME first
+    // page: page 2 and page 3 of a search came back byte-identical and
+    // scrolling could never reach anything new. It is the caller's page now.
+    const page = Math.max(1, Number.parseInt(options?.page, 10) || 1);
     const data = await _apiCall({
         '__call': 'search.getResults',
         'q':      query,
         // JioSaavn accepts lowercase `n`. Uppercase `N` is ignored and the
         // provider silently falls back to ten results.
         'n':      String(Math.min(limit, 40)),
-        'p':      '1',
+        'p':      String(page),
     }, {
         timeoutMs: Number.isFinite(options?.timeoutMs)
             ? options.timeoutMs
@@ -380,11 +385,12 @@ export async function getSongDirect(id, options = {}) {
  * callers expect: { data: { results, start, total } }
  */
 export async function searchSongsOnlyDirect(query, limit = 20, options = {}) {
-    const songs = await searchSongsDirect(query, limit, options);
+    const page = Math.max(1, Number.parseInt(options?.page, 10) || 1);
+    const songs = await searchSongsDirect(query, limit, { ...options, page });
     return {
         data: {
             results: songs,
-            start:   1,
+            start:   (page - 1) * limit + 1,
             total:   songs.length,
         },
     };
