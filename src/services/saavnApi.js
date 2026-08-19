@@ -175,18 +175,27 @@ export async function searchSongsOnly(query, page = 1) {
     const pageNumber = Number.parseInt(page, 10) || 1;
 
     // 1. Direct JioSaavn API is primary (fastest, direct DES decryption, no proxy downtime)
+    //
+    // The page HAS to be forwarded here. This lane answers essentially every
+    // search, and it used to drop the argument on the floor -- so "load more"
+    // asked for page 2, got page 1 back, and every further scroll returned the
+    // same songs again.
     try {
-        const directPayload = await searchSongsOnlyDirect(query, 40);
+        const directPayload = await searchSongsOnlyDirect(query, 40, { page: pageNumber });
         if (directPayload?.data?.results?.length > 0) {
             return directPayload;
         }
     } catch (_) {}
 
-    // 2. Gaana fallback
+    // 2. Gaana fallback. Gaana's search has no page cursor, so ask for enough
+    //    hits to cover every page up to this one and return the slice that
+    //    belongs to this page.
     try {
-        const gaanaSongs = await searchGaanaSongsOnly(query, 30);
+        const gaanaWanted = 30 * pageNumber;
+        const gaanaSongs = await searchGaanaSongsOnly(query, Math.min(gaanaWanted, 90));
         if (Array.isArray(gaanaSongs) && gaanaSongs.length > 0) {
-            return wrapSongsOnlyResponse(gaanaSongs);
+            const slice = pageNumber > 1 ? gaanaSongs.slice(30 * (pageNumber - 1)) : gaanaSongs;
+            if (slice.length > 0) return wrapSongsOnlyResponse(slice);
         }
     } catch (_) {}
 
