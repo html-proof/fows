@@ -45,6 +45,26 @@ const router = Router();
 const DEFAULT_LIMIT = 40;
 const MIN_LIMIT = 20;
 const MAX_LIMIT = 60;
+
+// How long a search will wait for the secondary provider before answering
+// without it. Cross-provider coverage is valuable but never worth making every
+// search feel slow, so Gaana is best-effort: merged when it is quick enough,
+// silently dropped when it is not.
+const GAANA_SEARCH_BUDGET_MS = 3500;
+
+/**
+ * Resolves to [promise]'s value, or to [fallback] if it has not settled within
+ * [ms]. The underlying work is left running (its result is simply ignored) —
+ * cancelling it would waste an upstream response that the provider cache can
+ * still use for the next search.
+ */
+function withSearchBudget(promise, ms, fallback) {
+    let timer;
+    return Promise.race([
+        promise.finally(() => clearTimeout(timer)),
+        new Promise(resolve => { timer = setTimeout(() => resolve(fallback), ms); }),
+    ]);
+}
 const ALBUM_LIMIT = 20;
 const MAX_RELATED_LANGUAGES = 5;
 const MAX_ALBUM_LANGUAGE_BUCKETS = 4;
@@ -134,10 +154,30 @@ router.get('/search', async (req, res) => {
                 .catch(() => [])
         );
 
-        const [songResults, albumsData, artistsData] = await Promise.allSettled([
+        // Gaana runs on EVERY page-1 search, in parallel with the JioSaavn
+        // variants — not only when JioSaavn comes back empty.
+        //
+        // The two catalogues genuinely differ, especially for regional cinema:
+        // searching "Pattalam" returned plenty of Tamil tracks from JioSaavn,
+        // so the zero-results fallback below never fired, and the Malayalam
+        // film's entire soundtrack — which exists only on Gaana — was invisible
+        // no matter how the user phrased the query. A provider that is only
+        // consulted when the other one fails can never fill that kind of gap.
+        //
+        // Bounded so it can never slow a search down: results are merged if
+        // they arrive within GAANA_SEARCH_BUDGET_MS and dropped otherwise. The
+        // JioSaavn variants are unaffected either way.
+        const gaanaFetch = withSearchBudget(
+            searchGaanaSongsOnly(primaryQuery, 20).catch(() => []),
+            GAANA_SEARCH_BUDGET_MS,
+            [],
+        );
+
+        const [songResults, albumsData, artistsData, gaanaSongs] = await Promise.allSettled([
             Promise.all(songFetches),
             searchAlbums(albumSearchQuery),
             searchArtists(primaryQuery),
+            gaanaFetch,
         ]);
 
         // ── Step 4: Merge + deduplicate + rank songs ─────────────────────────
@@ -149,20 +189,28 @@ router.get('/search', async (req, res) => {
             }))
             : [];
 
-        // Fallback: If all primary search variants failed or yielded 0 songs,
-        // query direct JioSaavn and Gaana in parallel before giving up!
+        // Merge the Gaana lane as its own retrieval group. Weight sits just
+        // below the exact JioSaavn variant (1.0) so cross-provider coverage is
+        // additive: a Gaana-only soundtrack ranks high enough to be found,
+        // without displacing an exact match from the primary catalogue.
+        // Cross-provider duplicates collapse in fuseSongCandidates — Gaana rows
+        // carry no songId/canonicalId, so getSongIdentityKey falls through to
+        // the normalized title::artist key that both providers share.
+        const gaanaList = gaanaSongs.status === 'fulfilled' && Array.isArray(gaanaSongs.value)
+            ? gaanaSongs.value
+            : [];
+        if (gaanaList.length > 0) {
+            candidateGroups.push({ source: 'gaana', weight: 0.9, songs: gaanaList });
+        }
+
+        // Fallback: if JioSaavn AND Gaana both yielded nothing, try direct
+        // JioSaavn (a different endpoint from the variant search) before
+        // giving up.
         const totalVariantSongs = candidateGroups.reduce((acc, g) => acc + (Array.isArray(g.songs) ? g.songs.length : 0), 0);
         if (totalVariantSongs === 0) {
-            const [directSaavn, gaanaResults] = await Promise.allSettled([
-                searchSongsDirect(rawQuery, 20),
-                searchGaanaSongsOnly(rawQuery, 20),
-            ]);
-            const fallbackList = [
-                ...(directSaavn.status === 'fulfilled' && Array.isArray(directSaavn.value) ? directSaavn.value : []),
-                ...(gaanaResults.status === 'fulfilled' && Array.isArray(gaanaResults.value) ? gaanaResults.value : []),
-            ];
-            if (fallbackList.length > 0) {
-                candidateGroups.push({ source: 'direct-fallback', weight: 1.0, songs: fallbackList });
+            const directSaavn = await searchSongsDirect(rawQuery, 20).catch(() => []);
+            if (Array.isArray(directSaavn) && directSaavn.length > 0) {
+                candidateGroups.push({ source: 'direct-fallback', weight: 1.0, songs: directSaavn });
             }
         }
 

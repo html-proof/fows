@@ -260,13 +260,57 @@ export function buildSearchVariants(analysis) {
  * Two results with the same key are considered the same song.
  */
 export function getSongIdentityKey(song) {
+    const title = normText(song?.name ?? song?.title ?? '');
     const canonicalId = String(song?.canonicalId ?? song?.canonicalSongId ?? '').trim();
+
+    // Identity is content-first, ids second.
+    //
+    // canonicalId was checked first, which defeated the whole point once two
+    // catalogues feed one result set: JioSaavn rows carry a canonical id and
+    // key as `canonical:trk_…`, Gaana rows carry none and key on content, so
+    // the same track could never match itself across providers. Content
+    // (title + album + language) is the only identity both sides state, so it
+    // now wins whenever it is available; ids remain the fallback for rows too
+    // sparse to identify by content.
+    //
+    // They used to be preferred over title+artist, which silently broke
+    // deduplication across providers: a JioSaavn row carries songId and keys as
+    // `song:<id>`, while the same track from Gaana carries no id at all and
+    // keys as `title::artist`. Different keys, so the same song appeared twice
+    // in one result list once both catalogues were searched together. Falling
+    // back to the id only when there is no title keeps rows without metadata
+    // addressable while letting real tracks match on what both providers
+    // actually agree on.
+    if (!title) {
+        if (canonicalId) return `canonical:${canonicalId}`;
+        const songId = String(song?.songId ?? '').trim();
+        if (songId) return `song:${songId}`;
+    }
+
+    // Prefer title + album + language over title + artist for cross-provider
+    // identity. The providers do not agree on what "primary artist" means —
+    // Gaana returns the composer where JioSaavn returns the singers — so an
+    // artist-based key leaves the same track double-listed once both
+    // catalogues feed one result set. Album and language are stated
+    // consistently, and a title is unique within an album, which makes this
+    // both stricter and more portable. Language is part of the key so two
+    // same-named regional soundtracks (a Tamil and a Malayalam "Pattalam")
+    // never collapse into each other.
+    const albumName = typeof song?.album === 'string'
+        ? song.album
+        : String(song?.album?.name ?? '');
+    const normalizedAlbum = stripAlbumEditionSuffix(normText(albumName));
+    if (normalizedAlbum) {
+        // Language is deliberately NOT part of the key. Providers disagree on
+        // it constantly — the same "Tum Hi Ho" from Aashiqui 2 comes back
+        // tagged hindi, malayalam and punjabi — so including it split one track
+        // into three. Title plus album is already a precise identity: a title
+        // is unique within a release.
+        return `${stripVersionSuffix(title)}@@${normalizedAlbum}`;
+    }
+
     if (canonicalId) return `canonical:${canonicalId}`;
 
-    const songId = String(song?.songId ?? '').trim();
-    if (songId) return `song:${songId}`;
-
-    const title = normText(song?.name ?? song?.title ?? '');
     const rawArtist = song?.primaryArtists
         ?? (Array.isArray(song?.artists?.primary)
             ? song.artists.primary.map(a => a?.name ?? '').join(', ')
@@ -275,6 +319,24 @@ export function getSongIdentityKey(song) {
     // Only use first artist for dedup key — handles "Artist A, Artist B" vs "Artist A feat Artist B"
     const artist = normText(rawArtist.split(/[,&]/)[0]);
     return `${stripVersionSuffix(title)}::${artist}`;
+}
+
+/**
+ * Drops edition/packaging wording that one provider appends to an album title
+ * and the other does not, e.g. JioSaavn's "Pattalam" vs Gaana's
+ * "Pattalam (Original Motion Picture Soundtrack)".
+ *
+ * Operates on normText output, which has already flattened punctuation to
+ * spaces — so these patterns must match bare words, not bracketed groups.
+ */
+function stripAlbumEditionSuffix(album) {
+    return String(album ?? '')
+        .replace(/\b(original\s+)?(motion\s+picture\s+)?sound\s*track\b/gi, ' ')
+        .replace(/\boriginal\s+motion\s+picture\b/gi, ' ')
+        .replace(/\bfrom\s+the\s+(motion\s+picture|film|movie)\b/gi, ' ')
+        .replace(/\b(deluxe|remastered|special|extended)\s+(edition|version)\b/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
 }
 
 function stripVersionSuffix(title) {
