@@ -179,12 +179,25 @@ export default {
         return response;
     },
 
-    // ── Cron: keep Render warm every 10 minutes ──────────────────────────────
+    // ── Cron: keep Render warm (schedule lives in wrangler.toml: */5) ────────
+    //
+    // This is the ONLY reliable keep-alive. The GitHub Actions schedule that
+    // also pings /healthz is throttled heavily in practice — measured gaps of
+    // 20-106 minutes against its 5-minute cron — so on its own it leaves the
+    // free-tier container asleep most of the time, and the cold start (20-40 s)
+    // lands on whichever song the user taps next.
+    //
+    // NOTE: this handler only runs if the Worker was deployed with the
+    // wrangler.toml triggers (`wrangler deploy`). A Worker pasted into the
+    // dashboard has no cron attached and this never fires.
     async scheduled(_event, _env, _ctx) {
         try {
+            // 30s, not 10s: a cold container needs 20-40s to answer. The old
+            // timeout aborted mid-boot, so the ping reported failure on exactly
+            // the runs that mattered most.
             await fetch(`${BACKEND_URL}/healthz`, {
                 method: 'HEAD',
-                signal: AbortSignal.timeout(10000),
+                signal: AbortSignal.timeout(30000),
             });
         } catch (_) {
             // Ping is best-effort
