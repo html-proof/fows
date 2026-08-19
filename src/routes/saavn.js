@@ -14,7 +14,12 @@ import {
     getLyricsBySongId,
 } from '../services/saavnApi.js';
 import { searchSongsDirect, searchAlbumsDirect, autocompleteAlbumSearch, getTrendingDirect } from '../services/jiosaavnDirect.js';
-import { searchSongsOnly as searchGaanaSongsOnly, looksLikeGaanaSeokey } from '../services/gaanaApi.js';
+import {
+    searchSongsOnly as searchGaanaSongsOnly,
+    searchAlbums as searchGaanaAlbums,
+    extractSeokeyFromUrl,
+    looksLikeGaanaSeokey,
+} from '../services/gaanaApi.js';
 import { auth } from '../config/firebase.js';
 import { getGlobalTrending } from '../services/database.js';
 import {
@@ -404,6 +409,8 @@ router.get('/search', async (req, res) => {
                 ? (artistsData.value?.data?.results ?? []).slice(0, ALBUM_LIMIT)
                 : []
         );
+
+        _rememberAlbumNames(albumsOut);
 
         // ── Step 5: Resolve top result using engine scoring ──────────────────
         const topResult = engineResolveTopResult({
@@ -1139,7 +1146,11 @@ function _warmAlbumStreams(album) {
             bitrate,
             contentType: song.streamUrl.includes('.mp4') ? 'audio/mp4' : 'audio/mpeg',
             isHls: song.streamUrl.includes('.m3u8'),
-            provider: 'jiosaavn',
+            // An album can arrive from either catalogue -- including via the
+            // cross-provider recovery below -- and the provider decides which
+            // Referer/Origin the stream is fetched with, so read it off the URL
+            // rather than assuming.
+            provider: /gaana|akamaized\.net/i.test(song.streamUrl) ? 'gaana' : 'jiosaavn',
             title: song.name || song.title,
             artist: song.artist || song.primaryArtists,
         };
@@ -1152,7 +1163,148 @@ function _warmAlbumStreams(album) {
     }
 }
 
-async function _loadAlbumPayload({ id, link, query, provider }) {
+// ─── Album title memory ───────────────────────────────────────────────────────
+// Every album a client can open, it opened from a list WE served -- a search
+// result, an artist page, a home row -- so the title was in our hands one
+// request earlier. Remembering it means a failed album lookup can still be
+// recovered by name even when the client sends nothing but a numeric id.
+const _albumNames = new Map(); // album id -> title
+const _ALBUM_NAME_MAX = 800;
+
+function _rememberAlbumNames(albums) {
+    for (const album of (Array.isArray(albums) ? albums : [])) {
+        const id = String(album?.id ?? '').trim();
+        const title = String(album?.name ?? album?.title ?? '').trim();
+        if (!id || !title || title === 'Unknown Album') continue;
+        if (_albumNames.has(id)) _albumNames.delete(id);
+        _albumNames.set(id, title);
+    }
+    while (_albumNames.size > _ALBUM_NAME_MAX) {
+        _albumNames.delete(_albumNames.keys().next().value);
+    }
+}
+
+function _recallAlbumName(id) {
+    const key = String(id ?? '').trim();
+    return key ? (_albumNames.get(key) ?? '') : '';
+}
+
+/** The track list inside an album detail payload, or [] for anything else. */
+function _payloadSongs(payload) {
+    const d = payload?.data;
+    if (!d || Array.isArray(d.results)) return [];
+    const songs = d.songs ?? d.list ?? d.tracks;
+    return Array.isArray(songs) ? songs : [];
+}
+
+/** True when an album payload actually carries a track list. */
+function _payloadHasSongs(payload) {
+    return _payloadSongs(payload).length > 0;
+}
+
+/**
+ * How many of an album's tracks arrive with a usable stream.
+ *
+ * An album can load perfectly and still be unplayable: Gaana embeds an
+ * encrypted `urls` block per track that occasionally fails to decrypt, and a
+ * JioSaavn album can come back without `encrypted_media_url` on any track. Both
+ * produce a full track list with nothing behind it -- the "no playable songs"
+ * case, which is distinct from "album not found" and needs the same recovery.
+ */
+function _payloadPlayableCount(payload) {
+    return _payloadSongs(payload).filter(song => {
+        if (typeof song?.streamUrl === 'string' && song.streamUrl.startsWith('http')) return true;
+        return Array.isArray(song?.downloadUrl)
+            && song.downloadUrl.some(d => typeof d?.url === 'string' && d.url.startsWith('http'));
+    }).length;
+}
+
+/**
+ * Best available name for an album we could not open.
+ *
+ * The client sends one when it has it (it came from a search result), and when
+ * it does not, both providers' identifiers still carry it: a Gaana seokey IS
+ * the slugified title, and a JioSaavn perma_url embeds the same slug one path
+ * segment before the id.
+ */
+function _albumNameHint({ name, id, link }) {
+    const explicit = String(name ?? '').trim() || _recallAlbumName(id);
+    if (explicit) return explicit;
+
+    const slug = link ? extractSeokeyFromUrl(link) : (id && looksLikeGaanaSeokey(id) ? id : '');
+    const words = String(slug ?? '').replace(/[-_]+/g, ' ').trim();
+    // A bare id ("x2r2JfQW98M_", "55455073") slugifies into noise, not a title.
+    if (!words || words.length < 3 || !/[a-z]/i.test(words)) return '';
+    return words;
+}
+
+// How many album candidates a recovery may open before giving up. Each one is
+// a full detail request, and a wrong guess is worse than an honest failure, so
+// this stays small.
+const ALBUM_RECOVERY_MAX_CANDIDATES = 3;
+
+// Wall-clock ceiling for the whole recovery attempt.
+const ALBUM_RECOVERY_BUDGET_MS = 6000;
+
+/**
+ * Reopen an album through the OTHER catalogue after the direct lookup failed.
+ *
+ * An album id belongs to exactly one provider, so when its own provider cannot
+ * serve it there is nothing further to try on that side -- which is why this
+ * screen failed outright ("album not available / no playable songs") even for
+ * albums the other catalogue carries in full. The id is useless across the
+ * divide, but the NAME is not: both providers index the same releases under
+ * near-identical titles.
+ *
+ * Only a confident title match is accepted, and only a payload that actually
+ * contains tracks is returned, so a recovery either opens the album the user
+ * asked for or changes nothing.
+ */
+async function _recoverAlbumAcrossProviders({ nameHint, failedProvider }) {
+    if (!nameHint) return null;
+    const target = normText(nameHint);
+    if (!target) return null;
+
+    const [jioRes, gaanaRes] = await Promise.allSettled([
+        searchAlbumsDirect(nameHint, 5),
+        searchGaanaAlbums(nameHint, 5),
+    ]);
+
+    const jioAlbums = jioRes.status === 'fulfilled' ? (jioRes.value?.data?.results ?? []) : [];
+    const gaanaAlbums = gaanaRes.status === 'fulfilled' ? (gaanaRes.value?.data?.results ?? []) : [];
+
+    const candidates = [
+        ...gaanaAlbums.map(album => ({ album, provider: 'gaana' })),
+        ...jioAlbums.map(album => ({ album, provider: 'jiosaavn' })),
+    ].filter(({ album }) => areSearchTermsSimilar(normText(album?.name ?? album?.title ?? ''), target));
+
+    // The provider that just failed goes last: it is the least likely to
+    // suddenly answer, but a different release id on the same catalogue is
+    // still a better outcome than an error screen.
+    candidates.sort((a, b) => (a.provider === failedProvider ? 1 : 0) - (b.provider === failedProvider ? 1 : 0));
+
+    // Keeps the best non-playable-but-populated payload seen, in case no
+    // candidate turns out to have streams.
+    let best = null;
+
+    for (const { album, provider } of candidates.slice(0, ALBUM_RECOVERY_MAX_CANDIDATES)) {
+        const key = provider === 'gaana'
+            ? (album.seokey || album.id)
+            : (album.id || album.url);
+        if (!key) continue;
+        try {
+            const detail = provider === 'gaana'
+                ? await getGaanaAlbum(key)
+                : await getAlbumById(album.id, album.url);
+            if (_payloadPlayableCount(detail) > 0) return detail;
+            if (!best && _payloadHasSongs(detail)) best = detail;
+        } catch (_) { /* try the next candidate */ }
+    }
+
+    return best;
+}
+
+async function _loadAlbumPayload({ id, link, query, provider, name }) {
     let data;
     // A Gaana album is identified by a seokey slug, never by the numeric id
     // JioSaavn uses, so an explicit ?provider=gaana -- or an id that is plainly
@@ -1170,6 +1322,32 @@ async function _loadAlbumPayload({ id, link, query, provider }) {
         data = await getAlbumById(null, link);
     } else {
         data = await searchAlbums(query);
+    }
+
+    // The id lookup came back empty, or came back with a track list that has
+    // no streams behind it. An album id is meaningless to the other provider,
+    // so without a name-based second attempt the screen simply fails -- even
+    // for albums the other catalogue carries in full.
+    if (!query && _payloadPlayableCount(data) === 0) {
+        // Bounded: recovery costs two searches plus up to three album detail
+        // requests, and Gaana's album endpoint alone can take several seconds.
+        // An album screen that eventually fails is bad; one that hangs while
+        // failing is worse.
+        const recovered = await withSearchBudget(
+            _recoverAlbumAcrossProviders({
+                nameHint: _albumNameHint({ name, id, link }),
+                failedProvider: wantsGaana ? 'gaana' : 'jiosaavn',
+            }).catch(() => null),
+            ALBUM_RECOVERY_BUDGET_MS,
+            null,
+        );
+        // Only take the recovery when it is genuinely better. A track list the
+        // player can still resolve by id beats replacing it with a worse one.
+        if (recovered && _payloadPlayableCount(recovered) > 0) {
+            data = recovered;
+        } else if (recovered && !_payloadHasSongs(data)) {
+            data = recovered;
+        }
     }
 
     // Normalise: depending on the source, tracks may be under `list` or
@@ -1198,10 +1376,9 @@ async function _loadAlbumPayload({ id, link, query, provider }) {
     // as a single album collapsed the whole list into one "Unknown Album" with
     // zero songs, which is why album search never showed anything useful.
     if (Array.isArray(data?.data?.results)) {
-        return {
-            success: true,
-            data: { results: normalizeAlbumList(data.data.results) },
-        };
+        const results = normalizeAlbumList(data.data.results);
+        _rememberAlbumNames(results);
+        return { success: true, data: { results } };
     }
 
     if (data?.data) {
@@ -1218,6 +1395,10 @@ router.get('/albums', async (req, res) => {
     try {
         const { id, query, link } = req.query;
         const provider = String(req.query.provider ?? '').trim().toLowerCase() || null;
+        // Optional: the album title the client already has from the search
+        // result it opened. It is only ever a recovery hint -- the id still
+        // decides which album is loaded.
+        const name = String(req.query.name ?? req.query.title ?? '').trim();
 
         if (!id && !query && !link) {
             return res.status(400).json({ error: 'Either "id", "query", or "link" parameter is required' });
@@ -1232,7 +1413,7 @@ router.get('/albums', async (req, res) => {
         if (!data) {
             let pending = _albumInFlight.get(cacheKey);
             if (!pending) {
-                pending = _loadAlbumPayload({ id, link, query, provider })
+                pending = _loadAlbumPayload({ id, link, query, provider, name })
                     .finally(() => _albumInFlight.delete(cacheKey));
                 _albumInFlight.set(cacheKey, pending);
             }
@@ -1250,7 +1431,11 @@ router.get('/albums', async (req, res) => {
         // Return 503 (not 200) when all fallbacks failed so Cloudflare does NOT
         // cache the failure response. A 200 success:false gets cached for hours.
         if (data?.success === false && !data?.data) {
-            return res.status(503).json(data);
+            return res.status(503).json({
+                ...data,
+                code: 'ALBUM_UNAVAILABLE',
+                error: data.error || 'This album could not be opened on either provider',
+            });
         }
 
         // Let the edge and the client answer repeat opens without reaching us at
