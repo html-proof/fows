@@ -111,10 +111,33 @@ async function handlePlayback(req, res) {
         return res.status(400).json({ success: false, error: 'songId is required', code: 'BAD_REQUEST' });
     }
 
+    // ── Client-driven failover ────────────────────────────────────────────────
+    // The gateway URL is deterministic (built from the song id), so a client
+    // that hits a dead stream cannot ask for "a different URL" simply by
+    // re-resolving — it would rebuild the identical address. `retry=1` is how
+    // it says "the last thing you gave me does not play, find another":
+    //
+    //   * the cache is bypassed, so the dead URL is not served straight back;
+    //   * any URL named in `exclude` is banned from the result;
+    //   * the 302 fast path is skipped, so bytes flow through here and the
+    //     gateway can observe an upstream failure and fail over internally
+    //     instead of redirecting the player at a URL it cannot supervise.
+    const isRetry = req.query.retry === '1' || req.query.retry === 'true';
+    const excludeUrls = []
+        .concat(req.query.exclude || [])
+        .map(u => String(u || '').trim())
+        .filter(Boolean);
+
     const trackKey = generateTrackKey(songId, songTitle, songArtist, songAlbum);
 
     // ── 1. Resolve CDN URL (cache-first) ──────────────────────────────────────
-    let streamData = getCachedStream(trackKey, quality) || getCachedStream(songId, quality);
+    let streamData = isRetry
+        ? null
+        : (getCachedStream(trackKey, quality) || getCachedStream(songId, quality));
+    if (isRetry) {
+        invalidateStreamCache(trackKey, quality);
+        invalidateStreamCache(songId, quality);
+    }
     if (!streamData?.streamUrl) {
         try {
             streamData = await resolvePlayableStream({
@@ -124,6 +147,7 @@ async function handlePlayback(req, res) {
                 album: songAlbum,
                 language,
                 quality,
+                excludeUrls,
             });
         } catch (err) {
             if (err instanceof PlaybackResolveError) {
@@ -142,7 +166,8 @@ async function handlePlayback(req, res) {
     // container just adds TTFB + throttles bandwidth. A redirect lets ExoPlayer/
     // AVPlayer stream and seek straight from the CDN edge = near-instant start.
     // Gaana/Akamai (need Referer) and HLS still use the transparent proxy below.
-    if (!isHls && req.method === 'GET') {
+    // On a retry the redirect is deliberately skipped — see the note above.
+    if (!isHls && req.method === 'GET' && !isRetry) {
         const u = (streamData.streamUrl || '').toLowerCase();
         const isPublicSaavnCdn = u.includes('saavncdn.com')
             && (u.includes('.mp4') || u.includes('.m4a') || u.includes('.aac') || u.includes('.mp3'));
@@ -202,8 +227,14 @@ async function handlePlayback(req, res) {
                 invalidateStreamCache(trackKey, quality);
                 invalidateStreamCache(songId, quality);
                 try {
+                    // Ban the URL that just failed. Re-resolving without this
+                    // repeatedly returned the same dead address, so the single
+                    // retry was spent re-confirming the failure instead of
+                    // reaching a different bitrate or provider.
+                    excludeUrls.push(realAudioUrl);
                     streamData = await resolvePlayableStream({
                         id: songId, title: songTitle, artist: songArtist, album: songAlbum, language, quality,
+                        excludeUrls,
                     });
                     realAudioUrl = streamData.streamUrl;
                 } catch (resolveErr) {
@@ -232,7 +263,8 @@ async function handlePlayback(req, res) {
             invalidateStreamCache(trackKey, quality);
             invalidateStreamCache(songId, quality);
             try {
-                streamData = await resolvePlayableStream({ id: songId, title: songTitle, artist: songArtist, album: songAlbum, language, quality });
+                excludeUrls.push(realAudioUrl);
+                streamData = await resolvePlayableStream({ id: songId, title: songTitle, artist: songArtist, album: songAlbum, language, quality, excludeUrls });
                 realAudioUrl = streamData.streamUrl;
             } catch (_) {
                 return res.status(502).json({ success: false, error: 'Upstream network error', code: 'UPSTREAM_ERROR' });
