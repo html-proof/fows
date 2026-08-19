@@ -97,13 +97,59 @@ function dedupeByIdentity(items) {
     const seen = new Set();
     const out = [];
     for (const item of (Array.isArray(items) ? items : [])) {
-        const key = String(item?.canonicalId ?? '').trim()
-            || String(item?.id ?? '').trim();
+        const key = _recordingKey(item);
         if (key && seen.has(key)) continue;
         if (key) seen.add(key);
         out.push(item);
     }
     return out;
+}
+
+/**
+ * The identity of a RECORDING, computed from metadata alone.
+ *
+ * This deliberately does not consult the canonical-id database. Resolving
+ * identity is a per-row SQLite lookup, and doing it for several pages' worth of
+ * candidates on every search put that cost on the request path. The resolver
+ * keys on title, artist and duration anyway, so the same three fields answer
+ * the question here for free.
+ *
+ * Album is excluded on purpose -- it is the field that differs between the
+ * seventeen copies of one song a provider returns, one per release it appears
+ * on.
+ */
+function _recordingKey(song) {
+    if (!song) return '';
+    // Strip the release marker providers append when the same recording is
+    // listed under a film: 'Gehra Hua (From "Dhurandhar")' and 'Gehra Hua' are
+    // one recording.
+    const title = normText(song.name ?? song.title ?? '')
+        .replace(/\s*\bfrom\b\s+.*$/i, '')
+        .trim();
+    if (!title) return String(song.canonicalId ?? song.id ?? '').trim();
+
+    // Duration is the discriminator, NOT the artist credit. Providers list the
+    // same recording with the credits in different orders and sometimes drop
+    // one entirely ("Amitabh Bhattacharya, Sachin-Jigar, Arijit Singh" vs
+    // "Sachin-Jigar, Arijit Singh"), so any artist-derived key leaves the
+    // copies looking distinct. Length does not drift between re-releases, and
+    // it still separates a cover or a live take from the studio recording.
+    // Bucketed to five seconds because providers round differently.
+    const seconds = parseInt(song.duration ?? 0, 10) || 0;
+    if (seconds > 0) return `${title}::${Math.round(seconds / 5)}`;
+
+    // No duration to key on — fall back to the credits, unordered.
+    const rawArtist = song.primaryArtists
+        ?? (Array.isArray(song.artists?.primary)
+            ? song.artists.primary.map(a => a?.name ?? '').join(', ')
+            : (song.artist ?? ''));
+    const artists = String(rawArtist ?? '')
+        .split(/[,&]|\bfeat\.?\b|\bft\.?\b/i)
+        .map(a => normText(a))
+        .filter(Boolean)
+        .sort()
+        .join('|');
+    return `${title}::${artists}`;
 }
 
 // How deep into the ranked list to resolve canonical ids before cutting the
@@ -236,11 +282,11 @@ router.get('/search', async (req, res) => {
                 ? await rerankSongsForUser({ uid, songs: orderedSongs, query: rawQuery, preferredLanguages, mode: 'search' })
                 : orderedSongs;
             const songs = normalizeSongList(
-                dedupeByIdentity(
-                    attachCanonicalIds(
+                attachCanonicalIds(
+                    dedupeByIdentity(
                         finalSongs.slice(0, limit * IDENTITY_RESOLVE_DEPTH),
-                    ),
-                ).slice(0, limit),
+                    ).slice(0, limit),
+                ),
             );
             return res.json({
                 success: true,
@@ -471,12 +517,15 @@ router.get('/search', async (req, res) => {
         // Final identity pass, applied to more rows than fit on the page so
         // that collapsing duplicates pulls the next real songs up into the
         // freed slots instead of leaving a short page.
+        // Collapse duplicates across more candidates than fit on the page, so
+        // the freed slots pull up the next real songs — then resolve canonical
+        // ids for the page alone, which is all the client is given.
         const songsOut = normalizeSongList(
-            dedupeByIdentity(
-                attachCanonicalIds(
+            attachCanonicalIds(
+                dedupeByIdentity(
                     finalRanked.slice(0, limit * IDENTITY_RESOLVE_DEPTH),
-                ),
-            ).slice(0, limit),
+                ).slice(0, limit),
+            ),
         );
 
         // The album lanes are merged provider-by-provider upstream (JioSaavn

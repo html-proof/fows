@@ -106,7 +106,13 @@ const stmts = {
     getProviderMap:   db.prepare('SELECT track_id, confidence FROM provider_maps WHERE provider = ? AND provider_track_id = ?'),
     touchProviderMap: db.prepare('UPDATE provider_maps SET last_verified_at = ? WHERE provider = ? AND provider_track_id = ?'),
     getByIsrc:        db.prepare('SELECT id FROM tracks WHERE isrc = ?'),
-    getCandidates:    db.prepare('SELECT id, norm_title, artist_name, album_name, duration_ms FROM tracks WHERE norm_title LIKE ? LIMIT 20'),
+    // Range scan, not LIKE. SQLite cannot use an index for a case-insensitive
+    // LIKE, so `norm_title LIKE 'prefix%'` planned as SCAN tracks -- a full
+    // table scan per candidate lookup, on a table that grows with every search
+    // the service has ever answered. A half-open range on the same normalised
+    // column is an index seek against idx_tracks_norm and returns exactly the
+    // same rows (norm_title is already lower-cased by normText).
+    getCandidates:    db.prepare('SELECT id, norm_title, artist_name, album_name, duration_ms FROM tracks WHERE norm_title >= ? AND norm_title < ? LIMIT 20'),
     insertArtist:     db.prepare('INSERT OR IGNORE INTO artists (id, name, norm_name, image_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)'),
     insertAlbum:      db.prepare('INSERT OR IGNORE INTO albums (id, artist_id, title, norm_title, artwork_url, release_year, genre, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'),
     insertTrack:      db.prepare('INSERT OR IGNORE INTO tracks (id, title, norm_title, artist_id, album_id, artist_name, album_name, artwork_url, duration_ms, isrc, release_year, language, genre, is_explicit, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'),
@@ -186,7 +192,9 @@ function _findExisting(meta) {
     }
 
     const prefix = nt.slice(0, 15);
-    const candidates = stmts.getCandidates.all(`${prefix}%`);
+    // '\uffff' is above every character the normaliser emits, so [prefix,
+    // prefix+\uffff) is exactly the set LIKE 'prefix%' matched.
+    const candidates = stmts.getCandidates.all(prefix, `${prefix}\uffff`);
 
     let best = null, bestScore = -1;
     for (const c of candidates) {
