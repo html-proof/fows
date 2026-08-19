@@ -16,6 +16,7 @@ async function handlePlayerResolve(req, res) {
         artist: req.body?.artist || req.query?.artist || '',
         album: req.body?.album || req.query?.album || '',
         language: req.body?.language || req.query?.language || '',
+        quality: req.body?.quality || req.query?.quality || '',
     };
 
     if (!params.title && !params.id) {
@@ -36,6 +37,7 @@ async function handlePlayerResolve(req, res) {
                 proxyUrl: resolved.proxyUrl,
                 isPlayable: true,
                 bitrate: resolved.bitrate,
+                quality: resolved.quality,
                 contentType: resolved.contentType,
                 headers: resolved.headers,
                 provider: resolved.provider,

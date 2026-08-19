@@ -27,39 +27,112 @@ export class PlaybackResolveError extends Error {
     }
 }
 
+// ─── Spotify-style data-saver quality tiers ────────────────────────────────────
+// Each song's download URL exists at 320/160/96/48/12 kbps. Streaming the top
+// bitrate uses ~8 MB for a 3.5-minute song; the lower tiers keep mobile-data
+// use in Spotify's ~1-4 MB range. A tier defines the bitrate ladder the resolver
+// walks — the FIRST bitrate the CDN actually serves for that tier wins, so an
+// unavailable bitrate transparently falls through to the next best one.
+//
+//   Tier      Target   ~Data / 3.5-min song    (Spotify equivalent)
+//   ────────  ───────  ──────────────────────  ────────────────────
+//   low        48kbps  ~1.3 MB                 Low
+//   normal     96kbps  ~2.5 MB                 Normal   (default)
+//   high      160kbps  ~4.2 MB                 High
+//   max       320kbps  ~8.4 MB                 Very High
+export const QUALITY_LADDERS = {
+    low:    ['48kbps', '96kbps', '12kbps', '160kbps', '320kbps'],
+    normal: ['96kbps', '160kbps', '48kbps', '320kbps', '12kbps'],
+    high:   ['160kbps', '320kbps', '96kbps', '48kbps', '12kbps'],
+    max:    ['320kbps', '160kbps', '96kbps', '48kbps', '12kbps'],
+};
+
+export const DEFAULT_QUALITY = 'normal';
+
+/**
+ * Coerce any client-supplied quality hint into a canonical tier name.
+ * Accepts tier names (low/normal/high/max), Spotify-style aliases
+ * (data_saver, very_high, auto), or a raw bitrate ('96', '160kbps', 320).
+ */
+export function normalizeQuality(input) {
+    if (input === undefined || input === null || input === '') return DEFAULT_QUALITY;
+    const s = String(input).trim().toLowerCase();
+    if (QUALITY_LADDERS[s]) return s;
+    switch (s) {
+        case 'auto':
+        case 'automatic':
+        case 'standard':
+        case 'medium':
+            return 'normal';
+        case 'data_saver':
+        case 'datasaver':
+        case 'saver':
+        case 'lowest':
+        case 'economy':
+            return 'low';
+        case 'very_high':
+        case 'veryhigh':
+        case 'highest':
+        case 'lossless':
+        case 'best':
+            return 'max';
+    }
+    // Raw bitrate hint, e.g. "96", "160kbps", "320"
+    const kbps = parseInt(s, 10);
+    if (Number.isFinite(kbps)) {
+        if (kbps <= 60) return 'low';
+        if (kbps <= 128) return 'normal';
+        if (kbps <= 224) return 'high';
+        return 'max';
+    }
+    return DEFAULT_QUALITY;
+}
+
 // ─── Short TTL Memory Stream URL Cache ─────────────────────────────────────────
 // JioSaavn & Gaana CDN tokens typically expire in 20-60 mins.
 // We set a 15-minute TTL to ensure fresh playable URLs.
+// Cache entries are keyed per quality tier so a "low" request never returns a
+// previously cached "max" (320kbps) URL and vice-versa.
 const STREAM_CACHE_TTL_MS = 15 * 60 * 1000;
 const memoryStreamCache = new Map();
+
+function _cacheKey(trackKey, quality) {
+    return `${trackKey}::${normalizeQuality(quality)}`;
+}
 
 // In-flight resolution deduplication locks (keyed by track key)
 const inFlightResolves = new Map();
 
-export function getCachedStream(trackKey) {
+export function getCachedStream(trackKey, quality = DEFAULT_QUALITY) {
     if (!trackKey) return null;
-    const entry = memoryStreamCache.get(trackKey);
+    const entry = memoryStreamCache.get(_cacheKey(trackKey, quality));
     if (!entry) return null;
     if (Date.now() > entry.expiresAt) {
-        memoryStreamCache.delete(trackKey);
+        memoryStreamCache.delete(_cacheKey(trackKey, quality));
         return null;
     }
     return entry;
 }
 
-export function setCachedStream(trackKey, streamData) {
+export function setCachedStream(trackKey, streamData, quality = DEFAULT_QUALITY) {
     if (!trackKey || !streamData?.streamUrl) return;
-    memoryStreamCache.set(trackKey, {
+    memoryStreamCache.set(_cacheKey(trackKey, quality), {
         ...streamData,
         expiresAt: Date.now() + STREAM_CACHE_TTL_MS,
         cachedAt: Date.now(),
     });
 }
 
-export function invalidateStreamCache(trackKey) {
-    if (trackKey) {
-        memoryStreamCache.delete(trackKey);
+export function invalidateStreamCache(trackKey, quality) {
+    if (!trackKey) return;
+    // No tier given → drop every cached tier for this track.
+    if (quality === undefined) {
+        for (const tier of Object.keys(QUALITY_LADDERS)) {
+            memoryStreamCache.delete(_cacheKey(trackKey, tier));
+        }
+        return;
     }
+    memoryStreamCache.delete(_cacheKey(trackKey, quality));
 }
 
 export function generateTrackKey(id, title = '', artist = '', album = '') {
@@ -84,27 +157,47 @@ export function generateTrackKey(id, title = '', artist = '', album = '') {
  * pick the first bitrate the CDN actually serves, instead of blindly handing
  * the player a 320kbps URL that 404s.
  */
-function _extractDownloadCandidates(song) {
+function _labelForUrl(u) {
+    if (u.includes('_320') || u.includes('320')) return '320kbps';
+    if (u.includes('_160') || u.includes('160')) return '160kbps';
+    if (u.includes('_96')  || u.includes('96'))  return '96kbps';
+    if (u.includes('_48')  || u.includes('48'))  return '48kbps';
+    if (u.includes('_12')  || u.includes('12'))  return '12kbps';
+    return '320kbps';
+}
+
+function _extractDownloadCandidates(song, quality = DEFAULT_QUALITY) {
     if (!song) return [];
     const urls = Array.isArray(song.downloadUrl) ? song.downloadUrl : [];
-    const ordered = [];
-    const seen = new Set();
-    const push = (url, quality) => {
+
+    // Collect one URL per available bitrate label.
+    const byQuality = new Map();
+    const add = (url, q) => {
         if (typeof url !== 'string') return;
         const u = url.trim();
-        if (!u.startsWith('http') || seen.has(u)) return;
-        seen.add(u);
-        ordered.push({ url: u, quality: quality || (u.includes('320') ? '320kbps' : u.includes('160') ? '160kbps' : '320kbps') });
+        if (!u.startsWith('http')) return;
+        const label = q || _labelForUrl(u);
+        if (!byQuality.has(label)) byQuality.set(label, u);
     };
-    for (const q of ['320kbps', '160kbps', '96kbps', '48kbps', '12kbps']) {
-        push(urls.find(u => u.quality === q)?.url, q);
-    }
-    // Any remaining array entries not covered by the standard quality labels.
-    for (const u of urls) push(u?.url, u?.quality);
+    for (const entry of urls) add(entry?.url, entry?.quality);
     // Legacy single-string shapes.
-    push(song.streamUrl);
-    push(song.stream_url);
-    if (typeof song.downloadUrl === 'string') push(song.downloadUrl);
+    add(song.streamUrl);
+    add(song.stream_url);
+    if (typeof song.downloadUrl === 'string') add(song.downloadUrl);
+
+    // Order by the requested tier's ladder so the target bitrate is probed
+    // first and the resolver settles on the lowest-data URL that actually plays.
+    const ladder = QUALITY_LADDERS[normalizeQuality(quality)] || QUALITY_LADDERS[DEFAULT_QUALITY];
+    const ordered = [];
+    const seenUrl = new Set();
+    for (const q of ladder) {
+        const u = byQuality.get(q);
+        if (u && !seenUrl.has(u)) { seenUrl.add(u); ordered.push({ url: u, quality: q }); }
+    }
+    // Any bitrate labels not covered by the ladder, appended last.
+    for (const [q, u] of byQuality) {
+        if (!seenUrl.has(u)) { seenUrl.add(u); ordered.push({ url: u, quality: q }); }
+    }
     return ordered;
 }
 
@@ -117,8 +210,8 @@ function _extractDownloadCandidates(song) {
  * Bounded to the top few bitrates so cold-start latency stays low: a valid
  * 320kbps hit returns after a single probe RTT.
  */
-async function _firstPlayableCandidate(song, provider, { maxCandidates = 3, timeoutMs = 1800 } = {}) {
-    const candidates = _extractDownloadCandidates(song).slice(0, maxCandidates);
+async function _firstPlayableCandidate(song, provider, { maxCandidates = 3, timeoutMs = 1800, quality = DEFAULT_QUALITY } = {}) {
+    const candidates = _extractDownloadCandidates(song, quality).slice(0, maxCandidates);
     for (const c of candidates) {
         const probe = await probeStreamUrl(c.url, { timeoutMs });
         if (probe.isValid) {
@@ -170,7 +263,7 @@ function _scoreCandidate(targetTitle, targetArtist, candidate) {
  *
  * First lane to return a usable stream wins.
  */
-async function _resolveDirectById(songId) {
+async function _resolveDirectById(songId, quality = DEFAULT_QUALITY) {
     if (!songId) return null;
 
     let jioId = songId;
@@ -192,7 +285,7 @@ async function _resolveDirectById(songId) {
     // Probe-verify the chosen CDN URL (walking bitrates best→worst) before a
     // lane is allowed to win. Without this, an unverified 320kbps URL that the
     // CDN never encoded 404s straight through the 302 fast-path to the player.
-    const makeResult = (song, provider) => _firstPlayableCandidate(song, provider);
+    const makeResult = (song, provider) => _firstPlayableCandidate(song, provider, { quality });
 
     const lanes = [
         // Lane A: JioSaavn direct API (fastest when running from Indian region)
@@ -255,7 +348,7 @@ async function _resolveDirectById(songId) {
 /**
  * Fallback parallel search across JioSaavn and Gaana for song title + artist.
  */
-async function _resolveBySearch(title, artist = '', album = '') {
+async function _resolveBySearch(title, artist = '', album = '', quality = DEFAULT_QUALITY) {
     const cleanTitle = title.replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '').replace(/[,\-_]/g, ' ').trim();
     const primaryArtist = artist.split(',')[0].split('&')[0].replace(/[,\-_]/g, ' ').trim();
 
@@ -310,7 +403,7 @@ async function _resolveBySearch(title, artist = '', album = '') {
             // Race probes in parallel — return the first valid result (non-HLS preferred).
             // 2000ms timeout: CDN URLs need slightly more time than local probes.
             const probePromises = topCandidates.map(({ cand, provider }) =>
-                _firstPlayableCandidate(cand, provider, { maxCandidates: 2, timeoutMs: 2000 })
+                _firstPlayableCandidate(cand, provider, { maxCandidates: 2, timeoutMs: 2000, quality })
             );
 
             // Race probes — resolve as soon as the first valid result arrives.
@@ -344,15 +437,17 @@ export async function resolvePlayableStream(params = {}) {
     const songTitle = String(params.title || '').trim();
     const songArtist = String(params.artist || '').trim();
     const songAlbum = String(params.album || '').trim();
+    const quality = normalizeQuality(params.quality);
 
     if (!songId && !songTitle) {
         throw new PlaybackResolveError('Song ID or title is required for resolution', 'BAD_REQUEST');
     }
 
     const trackKey = generateTrackKey(songId, songTitle, songArtist, songAlbum);
+    const lockKey = _cacheKey(trackKey, quality);
 
-    // 1. Fast Memory Cache Check (Instant 0ms)
-    const cached = getCachedStream(trackKey);
+    // 1. Fast Memory Cache Check (Instant 0ms) — per quality tier
+    const cached = getCachedStream(trackKey, quality);
     if (cached && cached.streamUrl) {
         return {
             id: trackKey,
@@ -361,6 +456,7 @@ export async function resolvePlayableStream(params = {}) {
             streamUrl: cached.streamUrl,
             proxyUrl: `/api/stream/${trackKey}`,
             bitrate: cached.bitrate || '320kbps',
+            quality,
             contentType: cached.contentType || 'audio/mp4',
             isHls: cached.isHls || false,
             headers: getHeadersForStreamUrl(cached.streamUrl),
@@ -372,8 +468,8 @@ export async function resolvePlayableStream(params = {}) {
         };
     }
 
-    // 2. Single-flight lock: deduplicate concurrent requests for the exact same track
-    const activeLock = inFlightResolves.get(trackKey);
+    // 2. Single-flight lock: deduplicate concurrent requests for the same track+tier
+    const activeLock = inFlightResolves.get(lockKey);
     if (activeLock) {
         return activeLock;
     }
@@ -389,7 +485,7 @@ export async function resolvePlayableStream(params = {}) {
 
         return Promise.race([timeoutPromise, (async () => {
         // Step A: Direct lookup by ID if available
-        let winner = await _resolveDirectById(songId);
+        let winner = await _resolveDirectById(songId, quality);
 
         // Step B: Fallback search if direct lookup gave no playable stream
         if (!winner) {
@@ -408,7 +504,7 @@ export async function resolvePlayableStream(params = {}) {
             }
 
             if (searchTitle.length > 0 || searchArtist.length > 0) {
-                winner = await _resolveBySearch(searchTitle, searchArtist, searchAlbum);
+                winner = await _resolveBySearch(searchTitle, searchArtist, searchAlbum, quality);
             }
         }
 
@@ -425,6 +521,7 @@ export async function resolvePlayableStream(params = {}) {
             streamUrl: winner.streamUrl,
             proxyUrl: `/api/stream/${trackKey}`,
             bitrate: winner.quality || '320kbps',
+            quality,
             contentType: winner.contentType || 'audio/mp4',
             isHls: winner.isHls || false,
             headers,
@@ -435,20 +532,20 @@ export async function resolvePlayableStream(params = {}) {
             cached: false,
         };
 
-        // Cache the verified playable stream
+        // Cache the verified playable stream under its quality tier
         setCachedStream(trackKey, {
             ...resolvedData,
             title: songTitle,
             artist: songArtist,
-        });
+        }, quality);
 
         return resolvedData;
         })()]); // end Promise.race
     })().finally(() => {
-        inFlightResolves.delete(trackKey);
+        inFlightResolves.delete(lockKey);
     });
 
-    inFlightResolves.set(trackKey, resolvePromise);
+    inFlightResolves.set(lockKey, resolvePromise);
     return resolvePromise;
 }
 
@@ -468,6 +565,7 @@ export async function resolveStream(canonicalId, opts = {}) {
         artist: track?.artist_name ?? track?.artist ?? opts.overrideTrack?.artist_name ?? '',
         album: track?.album_name ?? track?.album ?? opts.overrideTrack?.album_name ?? '',
         language: track?.language ?? opts.overrideTrack?.language ?? '',
+        quality: opts.quality,
     });
 
     return {

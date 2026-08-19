@@ -194,10 +194,11 @@ router.get('/catalog/resolve/:id', async (req, res) => {
 
         const track = overrideTrack || getTrack(canonicalId);
         const durationSec = track && track.duration_ms ? Math.round(track.duration_ms / 1000) : 0;
-        const result = await resolveStream(canonicalId, { 
-            forceRefresh: forceRefresh || !!overrideTrack, 
+        const result = await resolveStream(canonicalId, {
+            forceRefresh: forceRefresh || !!overrideTrack,
             failedUrl,
-            overrideTrack
+            overrideTrack,
+            quality: req.query.quality,
         });
         return res.json({
             songId: canonicalId,
@@ -274,10 +275,11 @@ async function handlePlaybackRedirect(req, res) {
             };
         }
 
-        const result = await resolveStream(canonicalId, { 
-            forceRefresh: forceRefresh || !!overrideTrack, 
+        const result = await resolveStream(canonicalId, {
+            forceRefresh: forceRefresh || !!overrideTrack,
             failedUrl,
-            overrideTrack
+            overrideTrack,
+            quality: req.query.quality,
         });
 
         if (result.url) {

@@ -79,6 +79,7 @@ router.get('/prefetch/:songId', (req, res) => {
     const songArtist = req.query.artist || '';
     const songAlbum  = req.query.album  || '';
     const language   = req.query.language || '';
+    const quality    = req.query.quality || '';
 
     if (!songId) {
         return res.status(400).json({ success: false, error: 'songId is required' });
@@ -86,12 +87,12 @@ router.get('/prefetch/:songId', (req, res) => {
 
     // Check if already cached — if so, nothing to do.
     const trackKey = generateTrackKey(songId, songTitle, songArtist, songAlbum);
-    const alreadyCached = getCachedStream(trackKey) || getCachedStream(songId);
+    const alreadyCached = getCachedStream(trackKey, quality) || getCachedStream(songId, quality);
     res.status(alreadyCached ? 200 : 202).json({ success: true, cached: !!alreadyCached });
 
     if (!alreadyCached) {
         // Fire-and-forget background resolution — client has already received 202.
-        resolvePlayableStream({ id: songId, title: songTitle, artist: songArtist, album: songAlbum, language })
+        resolvePlayableStream({ id: songId, title: songTitle, artist: songArtist, album: songAlbum, language, quality })
             .catch(() => {});
     }
 });
@@ -104,6 +105,7 @@ async function handlePlayback(req, res) {
     const songArtist = req.query.artist || '';
     const songAlbum  = req.query.album  || '';
     const language   = req.query.language || '';
+    const quality    = req.query.quality || '';
 
     if (!songId) {
         return res.status(400).json({ success: false, error: 'songId is required', code: 'BAD_REQUEST' });
@@ -112,7 +114,7 @@ async function handlePlayback(req, res) {
     const trackKey = generateTrackKey(songId, songTitle, songArtist, songAlbum);
 
     // ── 1. Resolve CDN URL (cache-first) ──────────────────────────────────────
-    let streamData = getCachedStream(trackKey) || getCachedStream(songId);
+    let streamData = getCachedStream(trackKey, quality) || getCachedStream(songId, quality);
     if (!streamData?.streamUrl) {
         try {
             streamData = await resolvePlayableStream({
@@ -121,6 +123,7 @@ async function handlePlayback(req, res) {
                 artist: songArtist,
                 album: songAlbum,
                 language,
+                quality,
             });
         } catch (err) {
             if (err instanceof PlaybackResolveError) {
@@ -196,11 +199,11 @@ async function handlePlayback(req, res) {
             // CDN token expired / revoked / deleted — re-resolve once via fallback search, then retry
             if ((status === 404 || status === 401 || status === 403 || status === 410) && attempt === 1) {
                 console.warn(`[playback] CDN returned ${status} for ${songId} — re-resolving URL`);
-                invalidateStreamCache(trackKey);
-                invalidateStreamCache(songId);
+                invalidateStreamCache(trackKey, quality);
+                invalidateStreamCache(songId, quality);
                 try {
                     streamData = await resolvePlayableStream({
-                        id: songId, title: songTitle, artist: songArtist, album: songAlbum, language,
+                        id: songId, title: songTitle, artist: songArtist, album: songAlbum, language, quality,
                     });
                     realAudioUrl = streamData.streamUrl;
                 } catch (resolveErr) {
@@ -226,10 +229,10 @@ async function handlePlayback(req, res) {
                 });
             }
             // Network error on attempt 1 — try a fresh URL
-            invalidateStreamCache(trackKey);
-            invalidateStreamCache(songId);
+            invalidateStreamCache(trackKey, quality);
+            invalidateStreamCache(songId, quality);
             try {
-                streamData = await resolvePlayableStream({ id: songId, title: songTitle, artist: songArtist, album: songAlbum, language });
+                streamData = await resolvePlayableStream({ id: songId, title: songTitle, artist: songArtist, album: songAlbum, language, quality });
                 realAudioUrl = streamData.streamUrl;
             } catch (_) {
                 return res.status(502).json({ success: false, error: 'Upstream network error', code: 'UPSTREAM_ERROR' });

@@ -139,6 +139,7 @@ async function handleStreamResolve(req, res) {
         artist: req.body?.artist || req.query?.artist || '',
         album: req.body?.album || req.query?.album || '',
         language: req.body?.language || req.query?.language || '',
+        quality: req.body?.quality || req.query?.quality || '',
     };
 
     if (!params.id && !params.title) {
@@ -258,10 +259,11 @@ async function handleStreamProxy(req, res) {
     const songTitle  = req.query.title  || req.query.q || '';
     const songArtist = req.query.artist || '';
     const songAlbum  = req.query.album  || '';
+    const quality    = req.query.quality || '';
     const trackKey   = generateTrackKey(songId, songTitle, songArtist, songAlbum);
 
     // ── Resolve CDN URL (cache-first) ─────────────────────────────────────────
-    let streamData = getCachedStream(trackKey) || getCachedStream(songId);
+    let streamData = getCachedStream(trackKey, quality) || getCachedStream(songId, quality);
     if (!streamData?.streamUrl) {
         try {
             streamData = await resolvePlayableStream({
@@ -269,6 +271,7 @@ async function handleStreamProxy(req, res) {
                 title: songTitle,
                 artist: songArtist,
                 album: songAlbum,
+                quality,
             });
         } catch (err) {
             return res.status(404).json({
@@ -306,14 +309,15 @@ async function handleStreamProxy(req, res) {
                 console.warn(`[stream] Upstream ${statusCode} for ${songId} (attempt ${attempt}) — invalidating cache and re-resolving CDN URL`);
                 // Drain body
                 await upstreamRes.arrayBuffer();
-                invalidateStreamCache(trackKey);
-                invalidateStreamCache(songId);
+                invalidateStreamCache(trackKey, quality);
+                invalidateStreamCache(songId, quality);
                 try {
                     streamData = await resolvePlayableStream({
                         id: songId,
                         title: songTitle,
                         artist: songArtist,
                         album: songAlbum,
+                        quality,
                     });
                     realAudioUrl = streamData.streamUrl;
                 } catch (resolveErr) {
@@ -336,11 +340,11 @@ async function handleStreamProxy(req, res) {
             }
             console.warn(`[stream] Fetch error attempt ${attempt} for ${songId}:`, fetchErr.message);
             // On a network error on attempt 1, try re-resolving and retrying
-            invalidateStreamCache(trackKey);
-            invalidateStreamCache(songId);
+            invalidateStreamCache(trackKey, quality);
+            invalidateStreamCache(songId, quality);
             try {
                 streamData = await resolvePlayableStream({
-                    id: songId, title: songTitle, artist: songArtist, album: songAlbum,
+                    id: songId, title: songTitle, artist: songArtist, album: songAlbum, quality,
                 });
                 realAudioUrl = streamData.streamUrl;
             } catch (_) {
