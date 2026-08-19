@@ -86,7 +86,41 @@ export function decryptStreamPath(encryptedData) {
     }
 }
 
-async function fetchFromGaana(url, method = 'GET', body = null) {
+// Search fan-out means many concurrent Gaana calls; a stalled one must not
+// hold a user request open for the full 8s default.
+const SEARCH_REQUEST_TIMEOUT_MS = 2500;
+// Detail hydration is the expensive part of a Gaana search: one songDetail
+// request per hit, plus one stream-url request on top. Fan those out without a
+// cap and a single search turns into ~80 HTTP calls, which is what made search
+// slow enough to time out into "no results".
+const SEARCH_DETAIL_CONCURRENCY = 6;
+// Same reasoning as the JioSaavn client: overlapping lanes ask for the same
+// query concurrently, so collapse those onto a single upstream search.
+const SEARCH_DEDUPE_TTL_MS = 30_000;
+const searchInFlight = new Map();
+const searchMicroCache = new Map();
+
+/** Run `worker` over `items` with at most `concurrency` in flight. */
+async function _mapWithConcurrency(items, concurrency, worker) {
+    const results = new Array(items.length).fill(null);
+    let cursor = 0;
+
+    const runners = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+        while (cursor < items.length) {
+            const index = cursor++;
+            try {
+                results[index] = await worker(items[index], index);
+            } catch {
+                results[index] = null;
+            }
+        }
+    });
+
+    await Promise.all(runners);
+    return results;
+}
+
+async function fetchFromGaana(url, method = 'GET', body = null, options = {}) {
     const headers = {
         'User-Agent': USER_AGENT,
         'Accept': 'application/json, text/plain, */*',
@@ -106,7 +140,9 @@ async function fetchFromGaana(url, method = 'GET', body = null) {
         method,
         headers,
         body: body ? body.toString() : undefined,
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(
+            Number.isFinite(options?.timeoutMs) ? options.timeoutMs : 8000
+        ),
     });
 
     if (!res.ok) {
@@ -240,7 +276,46 @@ export async function getSongFromUrl(url) {
     };
 }
 
-export async function searchSongsOnly(query, limit = 20) {
+/**
+ * @param {object} [options]
+ * @param {number} [options.timeoutMs]    per-request budget
+ * @param {boolean} [options.withStreams] fetch a playable URL per hit (default
+ *   true for playback callers; search callers should pass false)
+ */
+export async function searchSongsOnly(query, limit = 20, options = {}) {
+    const cacheKey = `${String(query ?? '').toLowerCase()}|${limit}|${options?.withStreams !== false}`;
+
+    const cached = searchMicroCache.get(cacheKey);
+    if (cached && Date.now() - cached.storedAt <= SEARCH_DEDUPE_TTL_MS) return cached.songs;
+    if (cached) searchMicroCache.delete(cacheKey);
+
+    const inFlight = searchInFlight.get(cacheKey);
+    if (inFlight) return inFlight;
+
+    const promise = _searchSongsOnlyUncached(query, limit, options)
+        .then((songs) => {
+            if (Array.isArray(songs) && songs.length > 0) {
+                searchMicroCache.set(cacheKey, { storedAt: Date.now(), songs });
+                while (searchMicroCache.size > 200) {
+                    const oldest = searchMicroCache.keys().next().value;
+                    if (oldest === undefined) break;
+                    searchMicroCache.delete(oldest);
+                }
+            }
+            return songs;
+        });
+
+    searchInFlight.set(cacheKey, promise);
+    promise.catch(() => {}).finally(() => searchInFlight.delete(cacheKey));
+
+    return promise;
+}
+
+async function _searchSongsOnlyUncached(query, limit, options) {
+    const withStreams = options?.withStreams !== false;
+    const detailTimeoutMs = Number.isFinite(options?.timeoutMs)
+        ? options.timeoutMs
+        : SEARCH_REQUEST_TIMEOUT_MS;
     try {
         const cleanQuery = String(query || '')
             .replace(/[,\-_&]/g, ' ')
@@ -250,7 +325,7 @@ export async function searchSongsOnly(query, limit = 20) {
             .trim();
         if (!cleanQuery) return [];
         const searchUrl = `https://gaana.com/apiv2?type=search&keyword=${encodeURIComponent(cleanQuery)}`;
-        const searchResult = await fetchFromGaana(searchUrl, 'POST');
+        const searchResult = await fetchFromGaana(searchUrl, 'POST', null, { timeoutMs: detailTimeoutMs });
 
         const gr = searchResult.gr ?? [];
         if (!gr.length) return [];
@@ -268,35 +343,32 @@ export async function searchSongsOnly(query, limit = 20) {
 
         if (trackSeokeys.length === 0) return [];
 
-        // Fetch song details in parallel
-        const songPromises = trackSeokeys.map(async (seokey) => {
-            try {
-                const songDetailUrl = `https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seokey)}`;
-                const detailResult = await fetchFromGaana(songDetailUrl, 'POST');
-                if (detailResult.tracks && detailResult.tracks.length > 0) {
-                    const normalized = _normalise(detailResult.tracks[0], seokey);
-                    if (normalized) {
-                        const streamUrl = await _getStream(normalized.providerTrackId);
-                        if (streamUrl) {
-                            normalized.downloadUrl = [
-                                { quality: '320kbps', url: streamUrl },
-                                { quality: '160kbps', url: streamUrl },
-                                { quality: '96kbps', url: streamUrl }
-                            ];
-                        }
-                        return normalized;
-                    }
+        // Hydrate details with bounded concurrency. Callers that only need
+        // metadata (search/browse) skip the per-track stream lookup entirely —
+        // playback resolves Gaana streams by track id later, so fetching them
+        // here doubled the request count for URLs nobody read.
+        const songs = await _mapWithConcurrency(trackSeokeys, SEARCH_DETAIL_CONCURRENCY, async (seokey) => {
+            const songDetailUrl = `https://gaana.com/apiv2?type=songDetail&seokey=${encodeURIComponent(seokey)}`;
+            const detailResult = await fetchFromGaana(songDetailUrl, 'POST', null, { timeoutMs: detailTimeoutMs });
+            if (!detailResult.tracks?.length) return null;
+
+            const normalized = _normalise(detailResult.tracks[0], seokey);
+            if (!normalized) return null;
+
+            if (withStreams) {
+                const streamUrl = await _getStream(normalized.providerTrackId);
+                if (streamUrl) {
+                    normalized.downloadUrl = [
+                        { quality: '320kbps', url: streamUrl },
+                        { quality: '160kbps', url: streamUrl },
+                        { quality: '96kbps', url: streamUrl }
+                    ];
                 }
-                return null;
-            } catch {
-                return null;
             }
+            return normalized;
         });
 
-        const songResults = await Promise.allSettled(songPromises);
-        return songResults
-            .filter(r => r.status === 'fulfilled' && r.value !== null)
-            .map(r => r.value);
+        return songs.filter(Boolean);
     } catch (_) {
         return [];
     }

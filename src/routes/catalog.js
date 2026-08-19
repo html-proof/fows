@@ -48,6 +48,77 @@ import { normalizeSongMetadata, normalizeSongList } from '../services/metadataSe
 
 const router = Router();
 
+// ─── Search budget & response cache ───────────────────────────────────────────
+
+// A search must answer within a predictable wall-clock window. Providers are
+// raced against this budget and whatever has arrived is ranked and returned;
+// a lane that is still in flight is simply dropped rather than waited on.
+const SEARCH_BUDGET_MS = 4500;
+// Number of query variants fanned out to the smart-search path. Each variant
+// is itself a multi-variant, multi-provider search, so this multiplies fast —
+// keeping it small is what stops the provider from rate-limiting us into
+// empty results.
+const SEARCH_MAX_VARIANTS = 3;
+const SEARCH_RESPONSE_CACHE_TTL_MS = 60 * 1000;
+const SEARCH_RESPONSE_CACHE_MAX = 200;
+
+const searchResponseCache = new Map();
+
+function readSearchCache(key) {
+    const hit = searchResponseCache.get(key);
+    if (!hit) return null;
+    if (Date.now() - hit.storedAt > SEARCH_RESPONSE_CACHE_TTL_MS) {
+        searchResponseCache.delete(key);
+        return null;
+    }
+    // Hand out a copy: the caller passes this list through personalisation and
+    // canonical-ID attachment, and the cached entry is shared by every user.
+    return hit.songs.slice();
+}
+
+function writeSearchCache(key, songs) {
+    if (!Array.isArray(songs) || songs.length === 0) return; // never cache a miss
+    searchResponseCache.set(key, { storedAt: Date.now(), songs: songs.slice() });
+    while (searchResponseCache.size > SEARCH_RESPONSE_CACHE_MAX) {
+        const oldest = searchResponseCache.keys().next().value;
+        if (oldest === undefined) break;
+        searchResponseCache.delete(oldest);
+    }
+}
+
+/**
+ * Wait for every lane, but stop early on either of two conditions:
+ *   - `budgetMs` is spent (stragglers are dropped, partial data survives), or
+ *   - `isEnough` reports that the lanes which already settled carry a good
+ *     enough answer, so the remaining ones are redundant.
+ * Each lane records its own result as it settles, so nothing already fetched is
+ * thrown away in either case.
+ */
+async function settleWithinBudget(lanes, budgetMs, isEnough) {
+    let timer;
+    let resolveEarly;
+
+    const budget = new Promise(resolve => {
+        timer = setTimeout(resolve, budgetMs);
+        timer.unref?.();
+    });
+    const early = new Promise(resolve => { resolveEarly = resolve; });
+
+    let pending = lanes.length;
+    for (const lane of lanes) {
+        lane.settled.finally(() => {
+            pending -= 1;
+            if (pending === 0) return resolveEarly();
+            try {
+                if (isEnough?.(lanes)) resolveEarly();
+            } catch { /* a predicate failure must never stall the search */ }
+        });
+    }
+
+    await Promise.race([early, budget]);
+    clearTimeout(timer);
+}
+
 // ─── Auth helper ──────────────────────────────────────────────────────────────
 
 async function resolveUid(req) {
@@ -77,38 +148,85 @@ router.get('/catalog/search', async (req, res) => {
     const page  = Math.max(1, parseInt(req.query.page ?? '1', 10) || 1);
     const limit = Math.min(40, Math.max(5, parseInt(req.query.limit ?? '40', 10) || 40));
 
+    const startedAt = Date.now();
+
     try {
         const analysis = analyzeQuery(rawQ);
         const primaryQ = analysis.cleanTitle || rawQ;
-        const searchVariants = buildSearchVariants(analysis);
+        const cacheKey = `${primaryQ.toLowerCase()}|${page}|${limit}`;
 
-        // Parallel multi-provider search: JioSaavn variants + Gaana direct
-        const [gaanaResults, ...variantResults] = await Promise.all([
-            searchGaanaSongsOnly(primaryQ, limit).catch(() => []),
-            ...searchVariants.map(variant =>
-                searchSongsSmart(variant || primaryQ, { preferredLanguages: [], waitForFresh: true })
-                    .catch(async () => {
-                        const payload = await searchSongsOnly(variant || primaryQ, page).catch(() => null);
-                        return payload?.data?.results ?? [];
-                    })
-            )
-        ]);
+        let songs = readSearchCache(cacheKey);
 
-        const candidateGroups = [
-            { source: 'gaana', weight: 0.90, songs: Array.isArray(gaanaResults) ? gaanaResults : [] },
-            ...variantResults.map((songs, index) => ({
-                source: index === 0 ? 'exact' : `variant:${index}`,
-                weight: Math.max(0.45, 1 - index * 0.15),
-                songs: Array.isArray(songs) ? songs : (songs?.data?.results ?? []),
-            }))
-        ];
+        if (!songs) {
+            const searchVariants = buildSearchVariants(analysis).slice(0, SEARCH_MAX_VARIANTS);
 
-        // Deduplicate → rank
-        let songs = filterRelevantSongs(
-            fuseSongCandidates(candidateGroups, analysis),
-            analysis,
-            { minKeep: Math.min(12, limit) },
-        ).slice(0, limit);
+            // Parallel multi-provider search: JioSaavn variants + Gaana direct.
+            // `waitForFresh` is deliberately off — a slightly stale cached hit
+            // returned instantly beats a fresh one the user waited seconds for,
+            // and the smart-search layer refreshes it in the background.
+            const lanes = [
+                {
+                    source: 'gaana',
+                    weight: 0.90,
+                    songs: [],
+                    promise: searchGaanaSongsOnly(primaryQ, Math.min(limit, 12), { withStreams: false }),
+                },
+                ...searchVariants.map((variant, index) => ({
+                    source: index === 0 ? 'exact' : `variant:${index}`,
+                    weight: Math.max(0.45, 1 - index * 0.15),
+                    songs: [],
+                    promise: searchSongsSmart(variant || primaryQ, { preferredLanguages: [] })
+                        .catch(async () => {
+                            const payload = await searchSongsOnly(variant || primaryQ, page).catch(() => null);
+                            return payload?.data?.results ?? [];
+                        }),
+                })),
+            ];
+
+            for (const lane of lanes) {
+                lane.settled = lane.promise.then(
+                    (value) => {
+                        lane.songs = Array.isArray(value) ? value : (value?.data?.results ?? []);
+                    },
+                    () => { lane.songs = []; },
+                );
+            }
+
+            // The primary ("exact") lane is the one that decides the answer;
+            // the rest only broaden it. Once it has come back with a full page
+            // of candidates there is nothing to gain by waiting on the others.
+            const primaryLane = lanes.find(lane => lane.source === 'exact');
+            await settleWithinBudget(lanes, SEARCH_BUDGET_MS, () => (
+                (primaryLane?.songs?.length ?? 0) >= Math.min(limit, 20)
+            ));
+
+            const candidateGroups = lanes.map(({ source, weight, songs: laneSongs }) => ({
+                source,
+                weight,
+                songs: laneSongs,
+            }));
+
+            // An empty or slow search is the failure mode users actually feel,
+            // and it is invisible from the outside (it still returns HTTP 200).
+            // Log which lane came up short so it can be diagnosed from the logs.
+            const elapsedMs = Date.now() - startedAt;
+            if (candidateGroups.every(group => group.songs.length === 0) || elapsedMs > SEARCH_BUDGET_MS) {
+                console.warn('[catalog/search] degraded', {
+                    q: rawQ,
+                    ms: elapsedMs,
+                    lanes: candidateGroups.map(g => `${g.source}=${g.songs.length}`).join(' '),
+                });
+            }
+
+            // Deduplicate → rank
+            songs = filterRelevantSongs(
+                fuseSongCandidates(candidateGroups, analysis),
+                analysis,
+                { minKeep: Math.min(12, limit) },
+            ).slice(0, limit);
+
+            writeSearchCache(cacheKey, songs);
+        }
 
         // Personalise if user is known
         if (uid) {

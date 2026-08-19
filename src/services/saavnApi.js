@@ -32,7 +32,16 @@ const SEARCH_CACHE_FRESH_TTL_MS = 2 * 60 * 1000;
 const SEARCH_CACHE_STALE_TTL_MS = 20 * 60 * 1000;
 const SEARCH_CACHE_MAX_ENTRIES = 300;
 const SMART_SEARCH_MAX_VARIANTS = 4;
+// Budget for the variant loop. Once it is spent we stop opening new rounds.
 const SMART_SEARCH_MAX_LATENCY_MS = 2000;
+// Hard ceiling for one smart search, fallback passes included. The variant
+// budget above is only checked between rounds, so without this the trailing
+// global/direct fallbacks could add several unbounded seconds on top of it.
+const SMART_SEARCH_TOTAL_BUDGET_MS = 3500;
+// JioSaavn direct is the authoritative source and gets the full budget.
+// Secondary sources only broaden the result set, so they are cut off early
+// rather than being allowed to gate a round that already has good hits.
+const SMART_SEARCH_SECONDARY_BUDGET_MS = 1200;
 const PRIMARY_SEARCH_TIMEOUT_MS = 2200;
 const FALLBACK_SEARCH_TIMEOUT_MS = 1800;
 const CATALOG_SEARCH_TIMEOUT_MS = 1500;
@@ -277,11 +286,29 @@ function triggerBackgroundSmartSearchRefresh(context) {
     });
 }
 
+/**
+ * Resolve `promise` normally, or yield `onExpiry` once the deadline passes.
+ * The underlying request keeps running (its own timeout will end it) but we
+ * stop *waiting* on it, so one slow provider cannot stretch the whole search.
+ */
+function _raceDeadline(promise, deadlineAt, onExpiry) {
+    const left = deadlineAt - Date.now();
+    if (left <= 0) return Promise.resolve(onExpiry);
+    return Promise.race([
+        promise,
+        new Promise(resolve => {
+            const timer = setTimeout(() => resolve(onExpiry), left);
+            timer.unref?.();
+        }),
+    ]);
+}
+
 async function computeSmartSearchResults({
     normalizedQuery,
     preferredLanguages,
 }) {
     const startedAt = Date.now();
+    const hardDeadlineAt = startedAt + SMART_SEARCH_TOTAL_BUDGET_MS;
     const variants = buildSearchQueryVariants(normalizedQuery);
     const languageHint = extractLanguageHint(normalizedQuery);
     const preferredLanguageSet = new Set(preferredLanguages);
@@ -312,16 +339,45 @@ async function computeSmartSearchResults({
         const variant = variants[i];
         const shouldFetchBroad = i < 2 || ranked.size < SMART_SEARCH_MIN_RESULTS;
         const shouldFetchFallback = i === 0 || ranked.size < Math.ceil(SMART_SEARCH_MIN_RESULTS / 2);
+        const secondaryDeadlineAt = Math.min(
+            hardDeadlineAt,
+            Date.now() + SMART_SEARCH_SECONDARY_BUDGET_MS,
+        );
         const jobs = [
-            { key: 'direct', promise: searchSongsOnlyDirect(variant, 25) },
-            { key: 'gaana', promise: searchGaanaSongsOnly(variant, 20) },
+            {
+                key: 'direct',
+                deadlineAt: hardDeadlineAt,
+                promise: searchSongsOnlyDirect(variant, 25),
+            },
+            {
+                key: 'gaana',
+                deadlineAt: secondaryDeadlineAt,
+                promise: searchGaanaSongsOnly(variant, 12, { withStreams: false }),
+            },
         ];
 
         if (shouldFetchBroad && ranked.size < Math.ceil(SMART_SEARCH_MIN_RESULTS / 2)) {
-            jobs.push({ key: 'primary', promise: searchSongsOnlyPrimary(variant, 1).catch(() => null) });
+            jobs.push({
+                key: 'primary',
+                deadlineAt: secondaryDeadlineAt,
+                promise: searchSongsOnlyPrimary(variant, 1).catch(() => null),
+            });
         }
 
-        const settled = await Promise.allSettled(jobs.map(job => job.promise));
+        // Race each provider on its own. Racing the combined allSettled would
+        // throw away a fast provider's results whenever a slow one dragged the
+        // round past the deadline -- which is precisely how a search that had
+        // usable hits in hand still came back empty.
+        const settled = await Promise.all(jobs.map(job =>
+            _raceDeadline(
+                job.promise.then(
+                    value => ({ status: 'fulfilled', value }),
+                    reason => ({ status: 'rejected', reason }),
+                ),
+                job.deadlineAt ?? hardDeadlineAt,
+                { status: 'rejected', reason: 'deadline' },
+            )
+        ));
         const resultsByKey = {};
         for (let j = 0; j < settled.length; j += 1) {
             resultsByKey[jobs[j].key] = settled[j];
@@ -376,11 +432,24 @@ async function computeSmartSearchResults({
         }
     }
 
-    if (!hasExactRankedMatch(ranked)) {
-        const globalSettled = await Promise.allSettled([
+    // Only widen to the un-varied query if there is still budget left, or if we
+    // have nothing at all to show (an empty result is worth waiting for).
+    const canWidenGlobally = Date.now() < hardDeadlineAt || ranked.size === 0;
+    if (!hasExactRankedMatch(ranked) && canWidenGlobally) {
+        const globalDeadlineAt = Math.max(hardDeadlineAt, Date.now() + 1200);
+        const globalSettled = await Promise.all([
             searchSongsOnlyDirect(normalizedQuery, 40),
-            searchGaanaSongsOnly(normalizedQuery, 20),
-        ]);
+            searchGaanaSongsOnly(normalizedQuery, 12, { withStreams: false }),
+        ].map(promise =>
+            _raceDeadline(
+                promise.then(
+                    value => ({ status: 'fulfilled', value }),
+                    reason => ({ status: 'rejected', reason }),
+                ),
+                globalDeadlineAt,
+                { status: 'rejected', reason: 'deadline' },
+            )
+        ));
 
         const directSongs = globalSettled[0]?.status === 'fulfilled'
             ? (globalSettled[0].value?.data?.results ?? [])
@@ -411,9 +480,16 @@ async function computeSmartSearchResults({
 
     // If both proxy APIs returned nothing (common when server runs outside India),
     // fall back to the official JioSaavn API with built-in URL decryption.
-    if (ranked.size < SMART_SEARCH_MIN_RESULTS) {
+    // Last resort, and only when we would otherwise hand back an empty list —
+    // repeating a call we already made is not worth extra seconds when the user
+    // already has something to look at.
+    if (ranked.size === 0) {
         try {
-            const directResults = await searchSongsOnlyDirect(normalizedQuery, 40);
+            const directResults = await _raceDeadline(
+                searchSongsOnlyDirect(normalizedQuery, 40),
+                Date.now() + 1500,
+                null,
+            );
             const directSongs = directResults?.data?.results ?? [];
             if (directSongs.length > 0) {
                 addRankedSongs({

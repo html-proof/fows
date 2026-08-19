@@ -18,6 +18,39 @@ const DIRECT_BASE    = 'https://www.jiosaavn.com/api.php';
 const CONNECT_TIMEOUT = 6000;
 const BODY_TIMEOUT    = 8000;
 const MAX_REQUEST_ATTEMPTS = 2;
+// Search is latency-critical and is fanned out across many queries, so it gets
+// a hard wall-clock budget instead of the generous connect/body timeouts above.
+// Without this a single stalled socket could hold a request for ~14s (two
+// attempts x 8s body timeout) and blow every caller's deadline.
+const SEARCH_REQUEST_TIMEOUT_MS = 4000;
+// The search fan-out asks for the same query string from several lanes at once
+// (route variants overlap with the smart-search layer's own variants). Those
+// duplicates queue up against the same origin and then abort on their own
+// deadline without ever reaching the wire -- an upstream that answers in ~300ms
+// looked like a hard failure. Collapse identical searches onto one request.
+const SEARCH_DEDUPE_TTL_MS = 30_000;
+const searchInFlight = new Map();
+const searchMicroCache = new Map();
+
+function _readSearchMicroCache(key) {
+    const hit = searchMicroCache.get(key);
+    if (!hit) return null;
+    if (Date.now() - hit.storedAt > SEARCH_DEDUPE_TTL_MS) {
+        searchMicroCache.delete(key);
+        return null;
+    }
+    return hit.songs;
+}
+
+function _writeSearchMicroCache(key, songs) {
+    if (!Array.isArray(songs) || songs.length === 0) return;
+    searchMicroCache.set(key, { storedAt: Date.now(), songs });
+    while (searchMicroCache.size > 200) {
+        const oldest = searchMicroCache.keys().next().value;
+        if (oldest === undefined) break;
+        searchMicroCache.delete(oldest);
+    }
+}
 
 // ─── DES decryption ───────────────────────────────────────────────────────────
 
@@ -116,15 +149,27 @@ function _htmlDecode(str) {
 
 // ─── HTTP helper ──────────────────────────────────────────────────────────────
 
-async function _apiCall(params) {
+async function _apiCall(params, options = {}) {
     const url = new URL(DIRECT_BASE);
     for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
     url.searchParams.set('_format', 'json');
     url.searchParams.set('_marker', '0');
     if (!params.ctx) url.searchParams.set('ctx', 'web6dot0');
 
+    // A caller-supplied budget caps the *total* time spent here, retry
+    // included, so a hung upstream can never outlive its caller's deadline.
+    const budgetMs = Number.isFinite(options?.timeoutMs) ? options.timeoutMs : null;
+    const expiresAt = budgetMs ? Date.now() + budgetMs : null;
+    const msLeft = () => (expiresAt === null ? Infinity : expiresAt - Date.now());
+
     let lastError;
     for (let attempt = 1; attempt <= MAX_REQUEST_ATTEMPTS; attempt++) {
+        const left = msLeft();
+        if (left <= 0) {
+            lastError = lastError ?? new Error(`budget of ${budgetMs}ms exhausted`);
+            break;
+        }
+
         try {
             const { statusCode, body } = await request(url.toString(), {
                 method: 'GET',
@@ -134,8 +179,9 @@ async function _apiCall(params) {
                     'Referer':    'https://www.jiosaavn.com/',
                     'Origin':     'https://www.jiosaavn.com',
                 },
-                connectTimeout: CONNECT_TIMEOUT,
-                bodyTimeout:    BODY_TIMEOUT,
+                connectTimeout: Math.min(CONNECT_TIMEOUT, left),
+                bodyTimeout:    Math.min(BODY_TIMEOUT, left),
+                signal:         expiresAt === null ? undefined : AbortSignal.timeout(left),
             });
 
             if (statusCode !== 200) {
@@ -146,8 +192,10 @@ async function _apiCall(params) {
             lastError = error;
             // A rejected request can have an empty message (notably some
             // abort/socket errors on hosted runtimes). Retry once before
-            // surfacing it to the fallback chain.
-            if (attempt < MAX_REQUEST_ATTEMPTS) continue;
+            // surfacing it to the fallback chain -- but only if the budget
+            // still leaves room for a second attempt to actually finish.
+            if (attempt < MAX_REQUEST_ATTEMPTS && msLeft() > 250) continue;
+            break;
         }
     }
 
@@ -252,7 +300,28 @@ export async function getTrendingDirect(type = 'song', language = 'hindi', limit
  * Search songs via JioSaavn's own API endpoint.
  * Returns normalised song objects matching the saavn.sumit.co proxy format.
  */
-export async function searchSongsDirect(query, limit = 20) {
+export async function searchSongsDirect(query, limit = 20, options = {}) {
+    const cacheKey = `${String(query ?? '').toLowerCase()}|${limit}`;
+
+    const cached = _readSearchMicroCache(cacheKey);
+    if (cached) return cached;
+
+    const inFlight = searchInFlight.get(cacheKey);
+    if (inFlight) return inFlight;
+
+    const promise = _searchSongsDirectUncached(query, limit, options)
+        .then((songs) => {
+            _writeSearchMicroCache(cacheKey, songs);
+            return songs;
+        });
+
+    searchInFlight.set(cacheKey, promise);
+    promise.catch(() => {}).finally(() => searchInFlight.delete(cacheKey));
+
+    return promise;
+}
+
+async function _searchSongsDirectUncached(query, limit, options) {
     const data = await _apiCall({
         '__call': 'search.getResults',
         'q':      query,
@@ -260,6 +329,10 @@ export async function searchSongsDirect(query, limit = 20) {
         // provider silently falls back to ten results.
         'n':      String(Math.min(limit, 40)),
         'p':      '1',
+    }, {
+        timeoutMs: Number.isFinite(options?.timeoutMs)
+            ? options.timeoutMs
+            : SEARCH_REQUEST_TIMEOUT_MS,
     });
 
     const results = (data?.results ?? []).filter(r =>
@@ -290,8 +363,8 @@ export async function getSongDirect(id) {
  * Wrap direct search results in the paginated envelope that searchSongsOnly
  * callers expect: { data: { results, start, total } }
  */
-export async function searchSongsOnlyDirect(query, limit = 20) {
-    const songs = await searchSongsDirect(query, limit);
+export async function searchSongsOnlyDirect(query, limit = 20, options = {}) {
+    const songs = await searchSongsDirect(query, limit, options);
     return {
         data: {
             results: songs,
