@@ -103,6 +103,42 @@ function _cacheKey(trackKey, quality) {
 // In-flight resolution deduplication locks (keyed by track key)
 const inFlightResolves = new Map();
 
+// ─── Resolution deadline ───────────────────────────────────────────────────────
+// The caller is released after RESOLVE_BUDGET_MS, so any work still running past
+// that point is orphaned: nobody reads its result, but it keeps holding sockets
+// and probing CDNs. Every sequential step below checks the shared deadline and
+// bails, and probe timeouts are clamped to whatever budget is left. Without this
+// an abandoned resolve could keep grinding for a minute or more.
+const RESOLVE_BUDGET_MS = 7000;
+
+function _msLeft(deadlineAt) {
+    if (!deadlineAt) return Infinity;
+    return deadlineAt - Date.now();
+}
+
+function _expired(deadlineAt) {
+    return _msLeft(deadlineAt) <= 0;
+}
+
+/**
+ * Stop waiting on `promise` once the deadline passes and yield `onExpiry`
+ * instead. Upstream search clients carry their own 6-8s connect/body timeouts,
+ * which on their own can outlive the whole resolution budget.
+ */
+function _withDeadline(promise, deadlineAt, onExpiry = null) {
+    const left = _msLeft(deadlineAt);
+    if (!Number.isFinite(left)) return promise;
+    if (left <= 0) return Promise.resolve(onExpiry);
+    return new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(onExpiry), left);
+        if (typeof timer.unref === 'function') timer.unref();
+        promise.then(
+            (v) => { clearTimeout(timer); resolve(v); },
+            () => { clearTimeout(timer); resolve(onExpiry); },
+        );
+    });
+}
+
 export function getCachedStream(trackKey, quality = DEFAULT_QUALITY) {
     if (!trackKey) return null;
     const entry = memoryStreamCache.get(_cacheKey(trackKey, quality));
@@ -210,10 +246,13 @@ function _extractDownloadCandidates(song, quality = DEFAULT_QUALITY) {
  * Bounded to the top few bitrates so cold-start latency stays low: a valid
  * 320kbps hit returns after a single probe RTT.
  */
-async function _firstPlayableCandidate(song, provider, { maxCandidates = 3, timeoutMs = 1800, quality = DEFAULT_QUALITY } = {}) {
+async function _firstPlayableCandidate(song, provider, { maxCandidates = 3, timeoutMs = 1800, quality = DEFAULT_QUALITY, deadlineAt = null } = {}) {
     const candidates = _extractDownloadCandidates(song, quality).slice(0, maxCandidates);
     for (const c of candidates) {
-        const probe = await probeStreamUrl(c.url, { timeoutMs });
+        // Never start a probe we have no budget left to finish.
+        const budget = Math.min(timeoutMs, _msLeft(deadlineAt));
+        if (budget <= 0) return null;
+        const probe = await probeStreamUrl(c.url, { timeoutMs: budget });
         if (probe.isValid) {
             return {
                 streamUrl: c.url,
@@ -263,7 +302,7 @@ function _scoreCandidate(targetTitle, targetArtist, candidate) {
  *
  * First lane to return a usable stream wins.
  */
-async function _resolveDirectById(songId, quality = DEFAULT_QUALITY) {
+async function _resolveDirectById(songId, quality = DEFAULT_QUALITY, deadlineAt = null) {
     if (!songId) return null;
 
     let jioId = songId;
@@ -285,7 +324,7 @@ async function _resolveDirectById(songId, quality = DEFAULT_QUALITY) {
     // Probe-verify the chosen CDN URL (walking bitrates best→worst) before a
     // lane is allowed to win. Without this, an unverified 320kbps URL that the
     // CDN never encoded 404s straight through the 302 fast-path to the player.
-    const makeResult = (song, provider) => _firstPlayableCandidate(song, provider, { quality });
+    const makeResult = (song, provider) => _firstPlayableCandidate(song, provider, { quality, deadlineAt });
 
     const lanes = [
         // Lane A: JioSaavn direct API (fastest when running from Indian region)
@@ -330,16 +369,24 @@ async function _resolveDirectById(songId, quality = DEFAULT_QUALITY) {
     return new Promise((resolve) => {
         let remaining = lanes.length;
         let fallback = null;
+        let settled = false;
+        const finish = (r) => { if (!settled) { settled = true; resolve(r); } };
+        // Hard stop: if a lane hangs past the deadline, stop waiting for it.
+        const left = _msLeft(deadlineAt);
+        if (Number.isFinite(left)) {
+            const capTimer = setTimeout(() => finish(fallback), Math.max(0, left));
+            if (typeof capTimer.unref === 'function') capTimer.unref();
+        }
         for (const lane of lanes) {
             lane.then((r) => {
                 if (r && !r.isHls) {
-                    resolve(r);              // best case — return immediately
+                    finish(r);               // best case — return immediately
                 } else if (r && !fallback) {
                     fallback = r;            // keep first HLS/any as a fallback
                 }
             }).catch(() => {}).finally(() => {
                 remaining -= 1;
-                if (remaining === 0) resolve(fallback);
+                if (remaining === 0) finish(fallback);
             });
         }
     });
@@ -348,7 +395,7 @@ async function _resolveDirectById(songId, quality = DEFAULT_QUALITY) {
 /**
  * Fallback parallel search across JioSaavn and Gaana for song title + artist.
  */
-async function _resolveBySearch(title, artist = '', album = '', quality = DEFAULT_QUALITY) {
+async function _resolveBySearch(title, artist = '', album = '', quality = DEFAULT_QUALITY, deadlineAt = null) {
     const cleanTitle = title.replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '').replace(/[,\-_]/g, ' ').trim();
     const primaryArtist = artist.split(',')[0].split('&')[0].replace(/[,\-_]/g, ' ').trim();
 
@@ -358,21 +405,24 @@ async function _resolveBySearch(title, artist = '', album = '', quality = DEFAUL
     ].filter(q => q && q.trim().length > 1);
 
     for (const query of queries) {
+        // Queries run sequentially — don't start another round we can't finish.
+        if (_expired(deadlineAt)) return null;
         try {
             const [jioRes, gaanaRes, proxyRes] = await Promise.allSettled([
-                searchSongsDirect(query, 3).catch(() => [])
+                _withDeadline(searchSongsDirect(query, 3).catch(() => [])
                     .then(async res => {
                         if (Array.isArray(res) && res.length > 0) return res;
                         const fallback = await searchSongsOnly(query, 1).catch(() => null);
                         return fallback?.data?.results || [];
-                    }),
-                searchGaanaSongsOnly(query, 3).catch(() => []),
+                    }), deadlineAt, []),
+                _withDeadline(searchGaanaSongsOnly(query, 3).catch(() => []), deadlineAt, []),
                 // saavn.sumit.co proxy search — geo-transparent; returns pre-decrypted URLs
                 requestJsonWithTimeoutExported(
                     `${SAAVN_PROXY_BASE}/api/search/songs?query=${encodeURIComponent(query)}&limit=3`,
-                    { timeoutMs: 5000, label: 'saavn-proxy search' },
+                    { timeoutMs: Math.max(1, Math.min(5000, _msLeft(deadlineAt))), label: 'saavn-proxy search' },
                 ).then(r => r?.data?.results || []).catch(() => []),
             ]);
+            if (_expired(deadlineAt)) return null;
 
             const jioCandidates  = (jioRes.status   === 'fulfilled' && Array.isArray(jioRes.value))   ? jioRes.value   : [];
             const gaanaCandidates = (gaanaRes.status === 'fulfilled' && Array.isArray(gaanaRes.value)) ? gaanaRes.value : [];
@@ -403,7 +453,7 @@ async function _resolveBySearch(title, artist = '', album = '', quality = DEFAUL
             // Race probes in parallel — return the first valid result (non-HLS preferred).
             // 2000ms timeout: CDN URLs need slightly more time than local probes.
             const probePromises = topCandidates.map(({ cand, provider }) =>
-                _firstPlayableCandidate(cand, provider, { maxCandidates: 2, timeoutMs: 2000, quality })
+                _firstPlayableCandidate(cand, provider, { maxCandidates: 2, timeoutMs: 2000, quality, deadlineAt })
             );
 
             // Race probes — resolve as soon as the first valid result arrives.
@@ -474,18 +524,11 @@ export async function resolvePlayableStream(params = {}) {
         return activeLock;
     }
 
-    const resolvePromise = (async () => {
+    const deadlineAt = startTime + RESOLVE_BUDGET_MS;
 
-        // Overall 7s timeout — parallel lanes resolve in 2–5s; 7s catches stragglers
-        const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new PlaybackResolveError(
-                `Resolution timed out for "${songTitle || songId}"`, 'TIMEOUT'
-            )), 7000)
-        );
-
-        return Promise.race([timeoutPromise, (async () => {
+    const workPromise = (async () => {
         // Step A: Direct lookup by ID if available
-        let winner = await _resolveDirectById(songId, quality);
+        let winner = await _resolveDirectById(songId, quality, deadlineAt);
 
         // Step B: Fallback search if direct lookup gave no playable stream
         if (!winner) {
@@ -504,13 +547,20 @@ export async function resolvePlayableStream(params = {}) {
             }
 
             if (searchTitle.length > 0 || searchArtist.length > 0) {
-                winner = await _resolveBySearch(searchTitle, searchArtist, searchAlbum, quality);
+                winner = await _resolveBySearch(searchTitle, searchArtist, searchAlbum, quality, deadlineAt);
             }
         }
 
         if (!winner || !winner.streamUrl) {
-            console.error(`[StreamResolver] No stream found for "${songTitle || songId}" after ${Date.now() - startTime}ms`);
-            throw new PlaybackResolveError(`No playable stream found for "${songTitle || songId}"`, 'STREAM_NOT_FOUND');
+            const elapsed = Date.now() - startTime;
+            const code = elapsed >= RESOLVE_BUDGET_MS ? 'TIMEOUT' : 'STREAM_NOT_FOUND';
+            console.error(`[StreamResolver] No stream found for "${songTitle || songId}" after ${elapsed}ms (${code})`);
+            throw new PlaybackResolveError(
+                code === 'TIMEOUT'
+                    ? `Resolution timed out for "${songTitle || songId}"`
+                    : `No playable stream found for "${songTitle || songId}"`,
+                code,
+            );
         }
 
         const headers = getHeadersForStreamUrl(winner.streamUrl);
@@ -540,13 +590,17 @@ export async function resolvePlayableStream(params = {}) {
         }, quality);
 
         return resolvedData;
-        })()]); // end Promise.race
-    })().finally(() => {
+    })();
+
+    // The lock is held for the lifetime of the real work, not just until the
+    // caller's timeout fires — otherwise a client retry at 7s would start a
+    // second full pipeline while the first is still running, and each retry
+    // would pile more concurrent upstream work onto the same track.
+    workPromise.catch(() => {}).finally(() => {
         inFlightResolves.delete(lockKey);
     });
-
-    inFlightResolves.set(lockKey, resolvePromise);
-    return resolvePromise;
+    inFlightResolves.set(lockKey, workPromise);
+    return workPromise;
 }
 
 /**
