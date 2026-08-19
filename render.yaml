@@ -1,0 +1,59 @@
+# Render blueprint: the Node gateway plus the Python ML service.
+#
+# Both fit the 512 MB free/starter instance. The ML service is a separate
+# service on purpose -- it has its own memory profile and its own deploy cadence
+# (a retrain redeploys only it), and if it goes down the gateway keeps serving
+# with local heuristics.
+
+services:
+  - type: web
+    name: music-hub-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: starter
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Wire the gateway to the ML service below. Render substitutes the
+      # deployed host, so this survives service recreation.
+      - key: ML_SERVICE_URL
+        fromService:
+          type: web
+          name: music-ml-service
+          property: hostport
+      # Generated once by Render and shared with the ML service, so the two
+      # agree on a secret without it ever being committed.
+      - key: ML_SERVICE_API_KEY
+        generateValue: true
+      - key: ML_ENABLED
+        value: "true"
+      - key: ML_TIMEOUT_MS
+        value: "800"
+      - key: ML_RECOMMENDATION_TIMEOUT_MS
+        value: "2000"
+      # Secrets set in the Render dashboard, never in this file.
+      - key: FIREBASE_DATABASE_URL
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: ADMIN_NOTIFY_KEY
+        sync: false
+
+  - type: web
+    name: music-ml-service
+    runtime: docker
+    dockerfilePath: ./music-app-backend/ml-service/Dockerfile
+    dockerContext: ./music-app-backend/ml-service
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: MODEL_DIR
+        value: artifacts
+      # Must match the gateway's ML_SERVICE_API_KEY. Copy the generated value
+      # from the gateway service in the dashboard, or set both by hand.
+      - key: ML_SERVICE_API_KEY
+        sync: false

@@ -1,4 +1,5 @@
 import { getUserRealtimeProfile } from './database.js';
+import { getModelScores } from './mlClient.js';
 
 const PROFILE_CACHE_TTL_MS = 2 * 60 * 1000;
 const PROFILE_CACHE_MAX_ENTRIES = 300;
@@ -61,6 +62,20 @@ const NN_BIAS_1 = [0.1, 0.05, 0.02, 0.06, 0.04, 0.08];
 const NN_WEIGHTS_2 = [0.8, 0.9, 0.7, 0.85, 0.75, 0.8];
 const NN_BIAS_2 = 0.12;
 
+// Share of the final score handed to the trained model in ml-service, when it
+// has an opinion about this user. Search stays deliberately conservative: a
+// collaborative model that outranks an exact title match is a regression, not
+// personalization. Recommendations are where a learned model should lead.
+const TRAINED_MODEL_WEIGHT = {
+    search: 0.15,
+    recommendation: 0.40,
+};
+// Songs the model has never seen come back at 0.5 ("no opinion"). Treating that
+// as a real score would drag every unseen song toward the middle of the list,
+// so it is ignored instead.
+const NEUTRAL_MODEL_SCORE = 0.5;
+const NEUTRAL_MODEL_EPSILON = 1e-6;
+
 /**
  * Personalized reranking for search and recommendations.
  * Returns songs sorted by user-specific relevance.
@@ -77,7 +92,21 @@ export async function rerankSongsForUser({
 
     const safeMode = mode === 'recommendation' ? 'recommendation' : 'search';
     const normalizedQuery = normalizeText(query);
-    const profile = await getCachedUserProfile(uid);
+
+    // Fetch the profile and the trained scores concurrently: the ML call is a
+    // network hop and must not be serialised behind the Firebase read. It
+    // resolves to null whenever the model is unavailable or has never seen this
+    // user, in which case ranking proceeds exactly as it did before.
+    const [profile, modelScores] = await Promise.all([
+        getCachedUserProfile(uid),
+        getModelScores({
+            uid,
+            songIds: safeSongs.map(song => String(song?.id || song?.songId || '').trim()),
+            mode: safeMode,
+        }),
+    ]);
+
+    const modelWeight = modelScores ? TRAINED_MODEL_WEIGHT[safeMode] : 0;
     const userVector = buildUserEmbedding(profile);
     const preferredLanguageSet = new Set(
         normalizeStringArray(preferredLanguages.length > 0 ? preferredLanguages : profile.languages)
@@ -135,6 +164,7 @@ export async function rerankSongsForUser({
             trendingScore * 0.10 +
             moodMatchScore * 0.05
         );
+        const modelScore = resolveModelScore(modelScores, songFields.id);
         let finalScore;
 
         if (safeMode === 'search') {
@@ -147,8 +177,12 @@ export async function rerankSongsForUser({
                 interactionScore * 0.03
             );
             finalScore = finalScore * 0.88 + nnScore * 0.12;
+            finalScore = blendTrainedScore(finalScore, modelScore, modelWeight);
 
             // Guardrails: never let weak lexical matches outrank strong ones.
+            // These run after the trained score is folded in, so the model can
+            // reorder within a relevance tier but cannot lift an off-topic song
+            // above a genuine match.
             if (effectiveQueryTerms.length >= 2 && lexicalScore < 0.2) {
                 finalScore *= 0.45;
             } else if (lexicalScore < 0.35) {
@@ -161,11 +195,13 @@ export async function rerankSongsForUser({
                 popularityScore * 0.15 +
                 trendingScore * 0.10
             ) * 0.7 + nnScore * 0.3;
+            finalScore = blendTrainedScore(finalScore, modelScore, modelWeight);
         }
 
         return {
             ...song,
             _ranking: {
+                modelScore: modelScore === null ? null : Number(modelScore.toFixed(4)),
                 finalScore: Number(finalScore.toFixed(4)),
                 textRankScore: Number(textRankScore.toFixed(4)),
                 lexicalScore: Number(lexicalScore.toFixed(4)),
@@ -200,6 +236,27 @@ export async function rerankSongsForUser({
 
     // Keep low-relevance results at the bottom while preserving output size.
     return [...strongMatches, ...weakMatches];
+}
+
+/**
+ * Pull this song's trained score out of the ML response.
+ *
+ * Returns null when there is no usable signal -- no model, no entry, or the
+ * neutral 0.5 the service returns for a song it has never seen.
+ */
+function resolveModelScore(modelScores, songId) {
+    if (!modelScores || !songId) return null;
+
+    const score = modelScores.get(songId);
+    if (!Number.isFinite(score)) return null;
+    if (Math.abs(score - NEUTRAL_MODEL_SCORE) < NEUTRAL_MODEL_EPSILON) return null;
+
+    return clamp01(score);
+}
+
+function blendTrainedScore(baseScore, modelScore, weight) {
+    if (modelScore === null || weight <= 0) return baseScore;
+    return clamp01(baseScore * (1 - weight) + modelScore * weight);
 }
 
 async function getCachedUserProfile(uid) {

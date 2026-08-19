@@ -1,5 +1,7 @@
-fastapi
-uvicorn
-numpy<2.0.0
-pandas
-firebase-admin
+# Serving dependencies only — everything here must fit a 512 MB Render instance.
+# numpy is the ONLY numeric dependency: no TensorFlow, no torch, no pandas.
+# Resident set for the running service is ~90-110 MB.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+numpy==1.26.4
+pydantic==2.10.4

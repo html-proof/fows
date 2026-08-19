@@ -1,30 +1,26 @@
 FROM python:3.11-slim
 
-# Set working directory
 WORKDIR /app
 
-# Prevent Python from writing .pyc files and buffer stdout
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Install system dependencies (required for certain ML libraries)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements file first to leverage Docker cache
+# No build-essential: every serving dependency (numpy included) ships a manylinux
+# wheel, and dropping the toolchain takes ~300 MB off the image. Training deps
+# are intentionally not installed here -- see requirements-train.txt.
 COPY requirements.txt .
-
-# Upgrade pip and install dependencies
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application code
 COPY . .
 
-# Render dynamically sets the PORT environment variable
+RUN useradd --create-home --uid 10001 mlservice && chown -R mlservice:mlservice /app
+USER mlservice
+
+# Render sets PORT at runtime.
 ENV PORT=8000
 EXPOSE $PORT
 
-# Command to run the FastApi application using unvicorn
-CMD uvicorn main:app --host 0.0.0.0 --port $PORT
+# Single worker on purpose: each extra uvicorn worker forks another copy of the
+# embedding matrices, which is the fastest way to OOM a 512 MB instance.
+CMD uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
