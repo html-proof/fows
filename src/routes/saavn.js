@@ -9,11 +9,12 @@ import {
     getArtistSongs,
     getSongById,
     getAlbumById,
+    getGaanaAlbum,
     searchAlbums,
     getLyricsBySongId,
 } from '../services/saavnApi.js';
 import { searchSongsDirect, searchAlbumsDirect, autocompleteAlbumSearch, getTrendingDirect } from '../services/jiosaavnDirect.js';
-import { searchSongsOnly as searchGaanaSongsOnly } from '../services/gaanaApi.js';
+import { searchSongsOnly as searchGaanaSongsOnly, looksLikeGaanaSeokey } from '../services/gaanaApi.js';
 import { auth } from '../config/firebase.js';
 import { getGlobalTrending } from '../services/database.js';
 import {
@@ -1005,86 +1006,174 @@ router.get('/songs/:id/lyrics', async (req, res) => {
 // Album API (public)
 // Example 1: /api/albums?id=xxxxxxx
 // Example 2: /api/albums?query=Evolve
+//
+// Opening an album is the hottest read in the app, and every tap used to pay
+// the full upstream round trip plus canonical-id assignment and normalisation
+// all over again -- the tenth open of an album was exactly as slow as the
+// first. Cache the finished payload and collapse simultaneous taps onto a
+// single fetch, so a repeat open (and the second half of a double tap) answers
+// from memory in about a millisecond.
+//
+// The TTL stays well under the ~25 min JioSaavn CDN URL lifetime so a cached
+// album can never hand the player a stream URL that has already expired.
+const _albumCache = new Map();    // cacheKey -> { data, expiresAt }
+const _albumInFlight = new Map(); // cacheKey -> Promise<data>
+const _ALBUM_TTL_MS = 10 * 60 * 1000; // 10 min
+const _ALBUM_CACHE_MAX = 300;
+
+function _readAlbumCache(key) {
+    const hit = _albumCache.get(key);
+    if (!hit) return null;
+    if (hit.expiresAt <= Date.now()) {
+        _albumCache.delete(key);
+        return null;
+    }
+    // Re-insert so Map insertion order stays least-recently-used first, which
+    // is what the eviction in _writeAlbumCache relies on.
+    _albumCache.delete(key);
+    _albumCache.set(key, hit);
+    return hit.data;
+}
+
+function _writeAlbumCache(key, data) {
+    _albumCache.set(key, { data, expiresAt: Date.now() + _ALBUM_TTL_MS });
+    if (_albumCache.size > _ALBUM_CACHE_MAX) {
+        _albumCache.delete(_albumCache.keys().next().value);
+    }
+}
+
+// Pre-warm playbackResolver's stream cache for every track in this album.
+//
+// The album payload's streamUrl is the TOP bitrate (320kbps). The cache is
+// keyed per quality tier, and setCachedStream defaults to the 'normal' tier --
+// so warming it with this URL used to file a 320kbps stream under 'normal',
+// which is the tier every request without an explicit ?quality= resolves to.
+// Opening an album page therefore pinned each of its tracks to ~8 MB/song for
+// the next 15 minutes, no matter what quality the player asked for.
+//
+// Warm the tier the URL actually belongs to instead, so a 'normal' or 'low'
+// request still resolves its own bitrate.
+//
+// This runs on cached responses too: it is pure in-memory bookkeeping, and the
+// resolver's own cache expires sooner than this route's, so re-warming keeps a
+// tap-to-play after a cached album open just as fast as after a cold one.
+function _warmAlbumStreams(album) {
+    if (!Array.isArray(album?.songs)) return;
+    for (const song of album.songs) {
+        if (!song.streamUrl) continue;
+        const bitrate = bitrateLabelForStreamUrl(song.streamUrl);
+        const streamInfo = {
+            streamUrl: song.streamUrl,
+            bitrate,
+            contentType: song.streamUrl.includes('.mp4') ? 'audio/mp4' : 'audio/mpeg',
+            isHls: song.streamUrl.includes('.m3u8'),
+            provider: 'jiosaavn',
+            title: song.name || song.title,
+            artist: song.artist || song.primaryArtists,
+        };
+        const tier = normalizeQuality(bitrate);
+        if (song.id) setCachedStream(song.id, streamInfo, tier);
+        if (song.canonicalId) setCachedStream(song.canonicalId, streamInfo, tier);
+        if (song.providerId) setCachedStream(song.providerId, streamInfo, tier);
+        const trackKey = generateTrackKey(song.id, song.name, song.artist, album.name);
+        setCachedStream(trackKey, streamInfo, tier);
+    }
+}
+
+async function _loadAlbumPayload({ id, link, query, provider }) {
+    let data;
+    // A Gaana album is identified by a seokey slug, never by the numeric id
+    // JioSaavn uses, so an explicit ?provider=gaana -- or an id that is plainly
+    // a slug -- goes straight to Gaana instead of burning the JioSaavn attempts
+    // that are guaranteed to miss first.
+    const wantsGaana = provider === 'gaana'
+        || (id && looksLikeGaanaSeokey(id))
+        || (link && /(^|\.)gaana\.com/i.test(link));
+
+    if (wantsGaana && (id || link)) {
+        data = await getGaanaAlbum(id || link);
+    } else if (id) {
+        data = await getAlbumById(id);
+    } else if (link) {
+        data = await getAlbumById(null, link);
+    } else {
+        data = await searchAlbums(query);
+    }
+
+    // Normalise: depending on the source, tracks may be under `list` or
+    // `tracks`; unify everything to `songs` before sending to the client.
+    if (data?.data) {
+        const alt = data.data.list ?? data.data.tracks;
+        if (Array.isArray(alt) && !Array.isArray(data.data.songs)) {
+            data = { ...data, data: { ...data.data, songs: alt } };
+        }
+    }
+
+    // Album detail payloads contain raw provider tracks. Assign canonical
+    // IDs here so the mobile player resolves each tapped album track via
+    // the verified playback resolver instead of guessing from metadata.
+    if (data?.data?.songs && Array.isArray(data.data.songs)) {
+        data = {
+            ...data,
+            data: {
+                ...data.data,
+                songs: attachCanonicalIds(data.data.songs),
+            },
+        };
+    }
+
+    // A `query` lookup answers with a RESULT SET, not one album. Normalising it
+    // as a single album collapsed the whole list into one "Unknown Album" with
+    // zero songs, which is why album search never showed anything useful.
+    if (Array.isArray(data?.data?.results)) {
+        return {
+            success: true,
+            data: { results: normalizeAlbumList(data.data.results) },
+        };
+    }
+
+    if (data?.data) {
+        data = {
+            success: true,
+            data: normalizeAlbumMetadata(data.data),
+        };
+    }
+
+    return data;
+}
+
 router.get('/albums', async (req, res) => {
     try {
         const { id, query, link } = req.query;
+        const provider = String(req.query.provider ?? '').trim().toLowerCase() || null;
 
         if (!id && !query && !link) {
             return res.status(400).json({ error: 'Either "id", "query", or "link" parameter is required' });
         }
 
-        let data;
-        if (id) {
-            data = await getAlbumById(id);
-        } else if (link) {
-            data = await getAlbumById(null, link);
-        } else {
-            data = await searchAlbums(query);
-        }
+        const cacheKey = `${provider ?? 'auto'}|` + (id ? `id:${id}`
+            : link ? `link:${link}`
+            : `query:${String(query).trim().toLowerCase()}`);
 
-        // Normalise: depending on the source, tracks may be under `list` or
-        // `tracks`; unify everything to `songs` before sending to the client.
-        if (data?.data) {
-            const alt = data.data.list ?? data.data.tracks;
-            if (Array.isArray(alt) && !Array.isArray(data.data.songs)) {
-                data = { ...data, data: { ...data.data, songs: alt } };
+        let data = _readAlbumCache(cacheKey);
+
+        if (!data) {
+            let pending = _albumInFlight.get(cacheKey);
+            if (!pending) {
+                pending = _loadAlbumPayload({ id, link, query, provider })
+                    .finally(() => _albumInFlight.delete(cacheKey));
+                _albumInFlight.set(cacheKey, pending);
             }
+            data = await pending;
+
+            // Never cache a failure: a 503 that sticks for 10 minutes is far
+            // worse than re-paying one upstream round trip.
+            if (data?.data && data?.success !== false) _writeAlbumCache(cacheKey, data);
         }
 
-        // Album detail payloads contain raw provider tracks. Assign canonical
-        // IDs here so the mobile player resolves each tapped album track via
-        // the verified playback resolver instead of guessing from metadata.
-        if (data?.data?.songs && Array.isArray(data.data.songs)) {
-            data = {
-                ...data,
-                data: {
-                    ...data.data,
-                    songs: attachCanonicalIds(data.data.songs),
-                },
-            };
-        }
-
-        if (data?.data) {
-            const normalized = normalizeAlbumMetadata(data.data);
-            // Pre-warm playbackResolver stream cache for every track in this album.
-            //
-            // The album payload's streamUrl is the TOP bitrate (320kbps). The
-            // cache is keyed per quality tier, and setCachedStream defaults to
-            // the 'normal' tier — so warming it with this URL used to file a
-            // 320kbps stream under 'normal', which is the tier every request
-            // without an explicit ?quality= resolves to. Opening an album page
-            // therefore pinned each of its tracks to ~8 MB/song for the next 15
-            // minutes, no matter what quality the player asked for.
-            //
-            // Warm the tier the URL actually belongs to instead, so a 'normal'
-            // or 'low' request still resolves its own bitrate.
-            if (Array.isArray(normalized?.songs)) {
-                for (const song of normalized.songs) {
-                    if (song.streamUrl) {
-                        const bitrate = bitrateLabelForStreamUrl(song.streamUrl);
-                        const streamInfo = {
-                            streamUrl: song.streamUrl,
-                            bitrate,
-                            contentType: song.streamUrl.includes('.mp4') ? 'audio/mp4' : 'audio/mpeg',
-                            isHls: song.streamUrl.includes('.m3u8'),
-                            provider: 'jiosaavn',
-                            title: song.name || song.title,
-                            artist: song.artist || song.primaryArtists,
-                        };
-                        const tier = normalizeQuality(bitrate);
-                        if (song.id) setCachedStream(song.id, streamInfo, tier);
-                        if (song.canonicalId) setCachedStream(song.canonicalId, streamInfo, tier);
-                        if (song.providerId) setCachedStream(song.providerId, streamInfo, tier);
-                        const trackKey = generateTrackKey(song.id, song.name, song.artist, normalized.name);
-                        setCachedStream(trackKey, streamInfo, tier);
-                    }
-                }
-            }
-            data = {
-                success: true,
-                data: normalized,
-            };
-        }
+        // Only album *detail* payloads carry tracks worth warming; a search
+        // result set has none.
+        _warmAlbumStreams(data?.data);
 
         // Return 503 (not 200) when all fallbacks failed so Cloudflare does NOT
         // cache the failure response. A 200 success:false gets cached for hours.
@@ -1092,6 +1181,14 @@ router.get('/albums', async (req, res) => {
             return res.status(503).json(data);
         }
 
+        // Let the edge and the client answer repeat opens without reaching us at
+        // all -- but bounded by the same TTL as the in-process cache, NOT by the
+        // generic 1 h/6 h album policy in app.js. That policy is right for album
+        // metadata and wrong for this payload: the track list it carries embeds
+        // stream URLs, and Gaana's are signed with a ~4 h expiry, so a 6 h edge
+        // copy would keep serving links that no longer play.
+        const albumMaxAge = Math.floor(_ALBUM_TTL_MS / 1000);
+        res.set('Cache-Control', `public, max-age=${albumMaxAge}, s-maxage=${albumMaxAge}`);
         res.json(data);
     } catch (error) {
         console.error('Album API error:', error.message);

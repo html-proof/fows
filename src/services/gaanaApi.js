@@ -26,15 +26,28 @@ export function extractSeokeyFromUrl(input) {
         const urlObj = new URL(clean.startsWith('http') ? clean : `https://${clean}`);
         const parts = urlObj.pathname.split('/').filter(Boolean);
         // /song/chaleya -> 'chaleya'
-        if (parts.length >= 2 && parts[0] === 'song') {
+        if (parts.length >= 2 && (parts[0] === 'song' || parts[0] === 'album')) {
             return parts[1];
         }
         return parts[parts.length - 1] || clean;
     } catch {
-        const match = clean.match(/\/song\/([a-zA-Z0-9-_]+)/);
+        const match = clean.match(/\/(?:song|album)\/([a-zA-Z0-9-_]+)/);
         if (match && match[1]) return match[1];
         return clean.replace(/^.*[\\\/]/, '');
     }
+}
+
+/**
+ * True when `value` looks like a Gaana seokey (a slug) rather than a numeric
+ * JioSaavn id or a canonical `trk_`/`alb_` id. Callers that accept an id from
+ * either provider use this to decide which provider to ask.
+ */
+export function looksLikeGaanaSeokey(value) {
+    const v = String(value ?? '').trim();
+    if (!v) return false;
+    if (/^(?:trk_|alb_|art_)/.test(v)) return false;
+    if (/^\d+$/.test(v)) return false;
+    return /^[a-z0-9]+(?:-[a-z0-9]+)*$/i.test(v);
 }
 
 /**
@@ -89,6 +102,9 @@ export function decryptStreamPath(encryptedData) {
 // Search fan-out means many concurrent Gaana calls; a stalled one must not
 // hold a user request open for the full 8s default.
 const SEARCH_REQUEST_TIMEOUT_MS = 2500;
+// An album lookup is a single request that the user is watching a spinner for,
+// so it can afford a slightly longer budget than one lane of a search fan-out.
+const ALBUM_REQUEST_TIMEOUT_MS = 4000;
 // Detail hydration is the expensive part of a Gaana search: one songDetail
 // request per hit, plus one stream-url request on top. Fan those out without a
 // cap and a single search turns into ~80 HTTP calls, which is what made search
@@ -374,6 +390,202 @@ async function _searchSongsOnlyUncached(query, limit, options) {
     }
 }
 
+// ─── Albums ───────────────────────────────────────────────────────────────────
+// Gaana used to be a songs-only provider here: it could answer a search and
+// resolve a stream, but the app had no way to open a Gaana album, so every
+// album screen depended on JioSaavn alone and an album JioSaavn could not serve
+// simply failed.
+//
+// `type=albumDetail` returns the whole track list AND an encrypted stream path
+// per track in a single response, so an album costs exactly one upstream
+// request -- no per-track songDetail/stream fan-out like the search path pays.
+const ALBUM_CACHE_TTL_MS = 10 * 60 * 1000;
+const ALBUM_CACHE_MAX = 200;
+const albumInFlight = new Map();
+const albumMicroCache = new Map();
+
+function _readAlbumMicroCache(key) {
+    const hit = albumMicroCache.get(key);
+    if (!hit) return null;
+    if (Date.now() - hit.storedAt > ALBUM_CACHE_TTL_MS) {
+        albumMicroCache.delete(key);
+        return null;
+    }
+    return hit.value;
+}
+
+function _writeAlbumMicroCache(key, value) {
+    albumMicroCache.set(key, { storedAt: Date.now(), value });
+    while (albumMicroCache.size > ALBUM_CACHE_MAX) {
+        const oldest = albumMicroCache.keys().next().value;
+        if (oldest === undefined) break;
+        albumMicroCache.delete(oldest);
+    }
+}
+
+/**
+ * Collapse concurrent identical album lookups onto one upstream request and
+ * serve repeats from memory. Same shape as the search dedupe above.
+ */
+function _dedupeAlbumCall(key, work) {
+    const cached = _readAlbumMicroCache(key);
+    if (cached) return Promise.resolve(cached);
+
+    const existing = albumInFlight.get(key);
+    if (existing) return existing;
+
+    const promise = work().then((value) => {
+        if (value && value.success) _writeAlbumMicroCache(key, value);
+        return value;
+    });
+
+    albumInFlight.set(key, promise);
+    promise.catch(() => {}).finally(() => albumInFlight.delete(key));
+    return promise;
+}
+
+// Gaana serves HLS renditions rather than the fixed 320/160/96 mp4 ladder
+// JioSaavn uses: `high` is the 128 kbps master playlist, `medium` the 64 kbps
+// one, `auto` an adaptive playlist. Label each with its real bitrate so the
+// resolver files it under the tier it actually belongs to instead of assuming
+// the top rung and pinning every client to the richest stream.
+const GAANA_STREAM_QUALITIES = [
+    { key: 'high',   quality: '128kbps' },
+    { key: 'medium', quality: '64kbps'  },
+    { key: 'auto',   quality: 'auto'    },
+];
+
+/**
+ * Build the downloadUrl ladder from the `urls` block embedded in a track, which
+ * album detail responses carry for every track. Returns [] when none decrypt.
+ */
+function _streamsFromEmbeddedUrls(rawUrls) {
+    if (!rawUrls || typeof rawUrls !== 'object') return [];
+    const out = [];
+    for (const { key, quality } of GAANA_STREAM_QUALITIES) {
+        const message = rawUrls[key]?.message;
+        if (!message) continue;
+        const url = decryptStreamPath(message);
+        if (url) out.push({ quality, url });
+    }
+    return out;
+}
+
+function _normaliseAlbumTrack(raw, album) {
+    const normalized = _normalise(raw, raw?.seokey);
+    if (!normalized) return null;
+
+    normalized.downloadUrl = _streamsFromEmbeddedUrls(raw.urls);
+    // Name the default explicitly. Downstream normalisation picks the last
+    // ladder entry when it finds no 320kbps rung, which on Gaana's ladder is
+    // the adaptive `auto` playlist -- fine to keep as a fallback, wrong as the
+    // stream every client gets handed by default.
+    normalized.streamUrl = normalized.downloadUrl.find(d => d.quality === '128kbps')?.url
+        ?? normalized.downloadUrl[0]?.url
+        ?? null;
+    normalized.albumSeokey = String(raw.albumseokey ?? album?.seokey ?? '');
+    if (raw.isrc) normalized.isrc = String(raw.isrc);
+    return normalized;
+}
+
+/**
+ * Fetch a Gaana album (metadata + full track list) by seokey or gaana.com URL.
+ *
+ * Returns the same envelope as the JioSaavn album clients so callers can treat
+ * the two interchangeably: { success, data: { id, name, songs: [...] } }.
+ */
+export async function getAlbumById(seokeyOrUrl) {
+    const seokey = extractSeokeyFromUrl(seokeyOrUrl);
+    if (!seokey) return { success: false, data: null };
+
+    return _dedupeAlbumCall(`album:${seokey.toLowerCase()}`, async () => {
+        try {
+            const url = `https://gaana.com/apiv2?type=albumDetail&seokey=${encodeURIComponent(seokey)}`;
+            const detail = await fetchFromGaana(url, 'POST', null, { timeoutMs: ALBUM_REQUEST_TIMEOUT_MS });
+
+            const tracks = Array.isArray(detail?.tracks) ? detail.tracks : [];
+            if (tracks.length === 0) return { success: false, data: null };
+
+            const album = detail.album ?? {};
+            const songs = tracks.map(t => _normaliseAlbumTrack(t, album)).filter(Boolean);
+            if (songs.length === 0) return { success: false, data: null };
+
+            const artists = Array.isArray(album.artist) ? album.artist
+                : Array.isArray(detail.artist_detail) ? detail.artist_detail
+                : [];
+            const artwork = fixAlbumArt(
+                detail.atw || album.artwork || songs[0]?.artwork_max || '',
+                '640x640',
+            );
+
+            return {
+                success: true,
+                data: {
+                    id: String(album.seokey ?? seokey),
+                    provider: 'gaana',
+                    seokey: String(album.seokey ?? seokey),
+                    providerAlbumId: String(songs[0]?.albumId ?? ''),
+                    name: String(album.title ?? songs[0]?.album?.name ?? ''),
+                    artist: artists.map(a => a?.name).filter(Boolean).join(', '),
+                    artists: { primary: artists.map(a => ({ id: a?.artist_id ?? null, name: a?.name ?? '' })) },
+                    language: String(album.language ?? songs[0]?.language ?? '').toLowerCase(),
+                    year: detail.release_year ? String(detail.release_year) : null,
+                    artwork_max: artwork,
+                    songCount: songs.length,
+                    songs,
+                },
+            };
+        } catch (_) {
+            return { success: false, data: null };
+        }
+    });
+}
+
+/**
+ * Search Gaana for albums. Reuses the same `type=search` endpoint the song
+ * search uses -- the response already carries album hits alongside tracks, so
+ * this costs one request and no extra hydration.
+ */
+export async function searchAlbums(query, limit = 20) {
+    const cleanQuery = String(query ?? '').trim();
+    if (!cleanQuery) return { success: false, data: { results: [] } };
+
+    return _dedupeAlbumCall(`albumsearch:${cleanQuery.toLowerCase()}|${limit}`, async () => {
+        try {
+            const url = `https://gaana.com/apiv2?type=search&keyword=${encodeURIComponent(cleanQuery)}`;
+            const result = await fetchFromGaana(url, 'POST', null, { timeoutMs: SEARCH_REQUEST_TIMEOUT_MS });
+
+            const seen = new Set();
+            const results = [];
+            for (const group of (result?.gr ?? [])) {
+                for (const item of (group?.gd ?? [])) {
+                    if (item?.ty !== 'Album' || !item.seo || seen.has(item.seo)) continue;
+                    seen.add(item.seo);
+                    const art = fixAlbumArt(item.aw ?? '', '640x640');
+                    results.push({
+                        id: String(item.seo),
+                        provider: 'gaana',
+                        seokey: String(item.seo),
+                        providerAlbumId: String(item.id ?? item.iid ?? ''),
+                        name: String(item.ti ?? ''),
+                        title: String(item.ti ?? ''),
+                        artist: String(item.sti ?? ''),
+                        language: String(item.language ?? (Array.isArray(item.lang) ? item.lang[0] : '') ?? ''),
+                        artwork_max: art,
+                        image: art ? [{ quality: '640x640', url: art }] : [],
+                    });
+                    if (results.length >= limit) break;
+                }
+                if (results.length >= limit) break;
+            }
+
+            return { success: results.length > 0, data: { results } };
+        } catch (_) {
+            return { success: false, data: { results: [] } };
+        }
+    });
+}
+
 export async function resolveSongStream(song) {
     const trackId = String(song?.providerTrackId ?? song?.track_id ?? song?.id ?? '').trim();
     const streamUrl = await _getStream(trackId);
@@ -384,7 +596,10 @@ export async function resolveSongStream(song) {
 export default {
     getSongById,
     getSongFromUrl,
+    getAlbumById,
+    searchAlbums,
     extractSeokeyFromUrl,
+    looksLikeGaanaSeokey,
     fixAlbumArt,
     searchSongsOnly,
     resolveSongStream,

@@ -249,7 +249,12 @@ export function generateTrackKey(id, title = '', artist = '', album = '') {
  * is never mistaken for a cheap one.
  */
 export function bitrateLabelForStreamUrl(url) {
-    const match = String(url || '').match(/_(12|48|96|160|320)(?:_[^./]*)?\.(?:mp4|m4a|mp3|aac)/i);
+    // JioSaavn encodes the bitrate as a `_320` suffix on the filename; Gaana
+    // makes it the filename itself (`.../769403/128.mp4.master.m3u8`) and offers
+    // a different ladder. Accept both separators and both ladders -- an
+    // unrecognised URL falls back to 320kbps, which would file a Gaana stream
+    // under the `max` tier and hand every client the richest rendition.
+    const match = String(url || '').match(/[_/](12|48|64|96|128|160|320)(?:_[^./]*)?\.(?:mp4|m4a|mp3|aac)/i);
     return match ? `${match[1]}kbps` : '320kbps';
 }
 

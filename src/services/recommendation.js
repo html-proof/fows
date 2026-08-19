@@ -8,6 +8,7 @@ import {
     getSessionPlays,
 } from './database.js';
 import { searchSongsOnly, searchSongsSmart, getSongById } from './saavnApi.js';
+import { searchSongsOnly as searchGaanaSongsOnly } from './gaanaApi.js';
 import { rerankSongsForUser } from './personalizationModel.js';
 
 // ── Constants ──
@@ -926,6 +927,73 @@ const MOOD_CATALOG = {
 /**
  * Returns the mood catalog (list of available moods with metadata).
  */
+// How long the mood/radio generators will wait on Gaana before answering with
+// JioSaavn alone. Cross-provider variety is worth having, never worth making a
+// mood rail or a radio queue feel slow.
+const GAANA_SEED_BUDGET_MS = 2500;
+// Gaana hits per seed query. Enough to change the texture of a rail without
+// letting one provider dominate a queue that is still ranked on JioSaavn ids.
+const GAANA_SEED_LIMIT = 8;
+
+/**
+ * Run a set of seed queries across BOTH providers and return the merged, de-
+ * duplicated songs.
+ *
+ * The mood and radio generators used to search JioSaavn only, so every rail in
+ * the app was drawn from one catalogue -- a song Gaana had and JioSaavn did not
+ * could never surface, no matter how well it matched the mood. Gaana runs as a
+ * best-effort second lane: merged when it answers inside the budget, dropped
+ * silently when it does not.
+ */
+async function _searchSeedsAcrossProviders(queries) {
+    const jioLane = Promise.all(
+        queries.map(q => searchSongsOnly(q).catch(() => ({ data: { results: [] } })))
+    );
+
+    // withStreams:false keeps this to one request per query -- playback resolves
+    // a Gaana stream by track id later, so fetching URLs nobody has tapped yet
+    // would double the request count for nothing.
+    const gaanaLane = Promise.all(
+        queries.map(q => searchGaanaSongsOnly(q, GAANA_SEED_LIMIT, { withStreams: false }).catch(() => []))
+    );
+
+    const [jioResults, gaanaResults] = await Promise.all([
+        jioLane,
+        Promise.race([
+            gaanaLane,
+            new Promise(resolve => {
+                const timer = setTimeout(() => resolve([]), GAANA_SEED_BUDGET_MS);
+                timer.unref?.();
+            }),
+        ]),
+    ]);
+
+    const seen = new Set();
+    const songs = [];
+
+    const push = (song) => {
+        if (!song) return;
+        // Gaana and JioSaavn ids never collide, so also key on title+artist to
+        // keep the same track from appearing twice under two provider ids.
+        const contentKey = `${normalizeText(song.name || song.title || '')}|${normalizeText(extractArtistNames(song)[0] || '')}`;
+        const idKey = song.id ? `id:${song.id}` : null;
+        if (idKey && seen.has(idKey)) return;
+        if (contentKey !== '|' && seen.has(contentKey)) return;
+        if (idKey) seen.add(idKey);
+        if (contentKey !== '|') seen.add(contentKey);
+        songs.push(song);
+    };
+
+    for (const res of jioResults) {
+        for (const song of (res?.data?.results || [])) push(song);
+    }
+    for (const list of (Array.isArray(gaanaResults) ? gaanaResults : [])) {
+        for (const song of (Array.isArray(list) ? list : [])) push(song);
+    }
+
+    return songs;
+}
+
 export function getMoodCatalog() {
     return Object.entries(MOOD_CATALOG).map(([id, meta]) => ({ id, ...meta }));
 }
@@ -940,20 +1008,7 @@ export async function generateMoodSongs({ mood, languages = [], limit = 20 }) {
     const lang = (languages[0] || '').toLowerCase();
     const queries = meta.queries.map(q => lang ? `${lang} ${q}` : q);
 
-    const results = await Promise.all(
-        queries.map(q => searchSongsOnly(q).catch(() => ({ data: { results: [] } })))
-    );
-
-    const seen = new Set();
-    const songs = [];
-    for (const res of results) {
-        for (const song of (res?.data?.results || [])) {
-            if (!seen.has(song.id)) {
-                seen.add(song.id);
-                songs.push(song);
-            }
-        }
-    }
+    const songs = await _searchSeedsAcrossProviders(queries);
 
     return shuffleArray(songs).slice(0, limit);
 }
@@ -993,20 +1048,8 @@ export async function generateRadioQueue({ seedType, seedId, seedName, languages
 
     if (queries.length === 0) queries.push(lang ? `${lang} popular songs` : 'popular songs');
 
-    const results = await Promise.all(
-        queries.slice(0, 4).map(q => searchSongsOnly(q).catch(() => ({ data: { results: [] } })))
-    );
-
-    const seen = new Set();
-    const songs = [];
-    for (const res of results) {
-        for (const song of (res?.data?.results || [])) {
-            if (!seen.has(song.id) && !excluded.has(song.id)) {
-                seen.add(song.id);
-                songs.push(song);
-            }
-        }
-    }
+    const merged = await _searchSeedsAcrossProviders(queries.slice(0, 4));
+    const songs = merged.filter(song => !excluded.has(song.id));
 
     return shuffleArray(songs).slice(0, limit);
 }

@@ -26,6 +26,11 @@ const SEARCH_REQUEST_TIMEOUT_MS = 4000;
 // song.getDetails sits directly in front of playback: the resolver still has to
 // probe CDN candidates after it returns, so its slice of the budget is smaller.
 const SONG_REQUEST_TIMEOUT_MS = 2500;
+// content.getAlbumDetails sits in front of the album screen, which the user is
+// staring at while it runs. Without a wall-clock budget a single stalled socket
+// could hold it for ~14s (two attempts x 8s body timeout) before the proxy
+// fallbacks below it even got a turn.
+const ALBUM_REQUEST_TIMEOUT_MS = 4000;
 // The search fan-out asks for the same query string from several lanes at once
 // (route variants overlap with the smart-search layer's own variants). Those
 // duplicates queue up against the same origin and then abort on their own
@@ -220,7 +225,7 @@ export async function getAlbumByIdDirect(albumId) {
     const data = await _apiCall({
         '__call': 'content.getAlbumDetails',
         'albumid': String(albumId),
-    });
+    }, { timeoutMs: ALBUM_REQUEST_TIMEOUT_MS });
 
     // Direct API returns tracks under `list` (array of raw song objects)
     const list = Array.isArray(data?.list) ? data.list

@@ -10,7 +10,12 @@ import {
     getArtistSongsDirect,
     getArtistAlbumsDirect,
 } from './jiosaavnDirect.js';
-import { getSongById as getGaanaSongById, searchSongsOnly as searchGaanaSongsOnly } from './gaanaApi.js';
+import {
+    getSongById as getGaanaSongById,
+    searchSongsOnly as searchGaanaSongsOnly,
+    getAlbumById as getGaanaAlbumById,
+    searchAlbums as searchGaanaAlbums,
+} from './gaanaApi.js';
 import { getProviderAlbumId } from './identityResolver.js';
 
 function describeProviderError(error) {
@@ -595,7 +600,30 @@ export async function getAlbumById(id, url) {
         } catch (_) { /* fall through */ }
     }
 
+    // Last resort: Gaana. It is a genuinely different catalogue, not just
+    // another route to the same one, so an album JioSaavn cannot serve often
+    // still opens here instead of failing the screen outright.
+    const gaanaKey = url || id;
+    if (gaanaKey) {
+        try {
+            const res = await getGaanaAlbumById(gaanaKey);
+            if (_albumHasSongs(res)) return res;
+        } catch (_) { /* fall through */ }
+    }
+
     return { success: false, error: 'Service temporarily unavailable', data: null };
+}
+
+/**
+ * Fetch an album straight from Gaana. Exposed so callers holding a Gaana
+ * seokey can skip the JioSaavn attempts that are guaranteed to miss.
+ */
+export async function getGaanaAlbum(seokeyOrUrl) {
+    try {
+        return await getGaanaAlbumById(seokeyOrUrl);
+    } catch (_) {
+        return { success: false, error: 'Service temporarily unavailable', data: null };
+    }
 }
 
 function _albumHasSongs(res) {
@@ -611,6 +639,58 @@ function _albumHasSongs(res) {
  * @returns {Promise<object>} Album search results
  */
 export async function searchAlbums(query) {
+    // Ask both catalogues at once. Gaana is best-effort: its hits are appended
+    // when they arrive in time and silently dropped when they do not, so adding
+    // a second provider widens coverage without making the search any slower
+    // than its slowest *required* lane.
+    const [jioResult, gaanaResult] = await Promise.allSettled([
+        _searchAlbumsJioSaavn(query),
+        searchGaanaAlbums(query, 20).catch(() => null),
+    ]);
+
+    const jio = jioResult.status === 'fulfilled' ? jioResult.value : null;
+    const gaana = gaanaResult.status === 'fulfilled' ? gaanaResult.value : null;
+
+    const jioResults = Array.isArray(jio?.data?.results) ? jio.data.results : [];
+    const gaanaResults = Array.isArray(gaana?.data?.results) ? gaana.data.results : [];
+
+    // JioSaavn first: it is the provider the rest of the app resolves against
+    // most cheaply, so it stays the preferred match when both have the album.
+    const seen = new Set();
+    const merged = [];
+    for (const album of [...jioResults, ...gaanaResults]) {
+        const key = `${normalizeQuery(album?.name ?? album?.title ?? '')}|${normalizeQuery(_albumArtistName(album))}`;
+        if (key === '|' || seen.has(key)) continue;
+        seen.add(key);
+        merged.push(album);
+    }
+
+    if (merged.length === 0) {
+        return jio ?? { success: false, error: 'No album results', data: { results: [] } };
+    }
+
+    return { success: true, data: { results: merged } };
+}
+
+/**
+ * The two providers name the album artist differently -- JioSaavn returns
+ * `primaryArtists`, Gaana returns `artist` -- so the cross-provider dedupe key
+ * has to read both, or the same album shows up twice under two ids.
+ */
+function _albumArtistName(album) {
+    if (!album || typeof album !== 'object') return '';
+    if (typeof album.artist === 'string' && album.artist.trim()) return album.artist;
+    if (typeof album.primaryArtists === 'string' && album.primaryArtists.trim()) return album.primaryArtists;
+    if (Array.isArray(album.primaryArtists)) {
+        return album.primaryArtists.map(a => (typeof a === 'string' ? a : a?.name ?? '')).filter(Boolean).join(', ');
+    }
+    if (Array.isArray(album.artists?.primary)) {
+        return album.artists.primary.map(a => a?.name ?? '').filter(Boolean).join(', ');
+    }
+    return '';
+}
+
+async function _searchAlbumsJioSaavn(query) {
     try {
         return await searchAlbumsDirect(query, 20);
     } catch (_) { /* fall through to proxy */ }
@@ -869,6 +949,7 @@ export default {
     searchSongsSmart,
     getSongById,
     getAlbumById,
+    getGaanaAlbum,
     searchAlbums,
     searchArtists,
     getArtistSongs,

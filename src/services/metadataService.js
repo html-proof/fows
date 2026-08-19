@@ -132,10 +132,20 @@ export function normalizeSongMetadata(rawSong, options = {}) {
         rawSong.isAvailable !== false &&
         rawSong.status !== 'unavailable';
 
+    // Which provider this row came from, and that provider's own track id.
+    // Normalisation flattens every source into one shape, which was fine while
+    // everything came from JioSaavn -- but a Gaana track's stream is resolved by
+    // its Gaana track id, so dropping these made Gaana results unplayable once
+    // they had passed through here.
+    const provider = rawSong.provider || (rawSong.seokey ? 'gaana' : null);
+
     return {
         id,
         canonicalId: canonicalId || (id.startsWith('trk_') ? id : null),
         providerId: providerId || id,
+        provider,
+        providerTrackId: rawSong.providerTrackId || rawSong.track_id || null,
+        seokey: rawSong.seokey || null,
         name: title,
         title,
         artist: artistName || 'Unknown Artist',
@@ -257,6 +267,8 @@ export function normalizeAlbumMetadata(rawAlbum) {
             ? rawAlbum.image
             : (imageUrl ? [{ quality: '500x500', url: imageUrl }] : []),
         songs,
+        provider: rawAlbum.provider || (rawAlbum.seokey ? 'gaana' : null),
+        seokey: rawAlbum.seokey || null,
         type: rawAlbum.type || rawAlbum.header_desc || 'album',
         url: rawAlbum.url || rawAlbum.perma_url || null,
     };
