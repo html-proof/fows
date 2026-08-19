@@ -21,6 +21,7 @@ import {
     getCachedStream,
     invalidateStreamCache,
     generateTrackKey,
+    markStreamUrlOutcome,
     PlaybackResolveError,
 } from '../services/playbackResolver.js';
 import { getHeadersForStreamUrl, probeStreamUrl } from '../services/streamValidator.js';
@@ -30,6 +31,12 @@ import { fetchAndFlattenM3u8 } from './stream.js';
 import { authenticateUser } from '../middleware/auth.js';
 
 const router = express.Router();
+
+// How many upstream URLs one playback request may burn through before giving
+// up. Each failed attempt re-resolves with the dead URL excluded, so this is
+// literally how many different sources — bitrates, then providers — the
+// gateway is allowed to try on the client's behalf.
+const MAX_UPSTREAM_ATTEMPTS = 3;
 
 // ─── Shared helpers ───────────────────────────────────────────────────────────
 
@@ -189,7 +196,9 @@ async function handlePlayback(req, res) {
         const hostUrl = forwardedHost
             ? `https://${forwardedHost}`
             : `${req.protocol}://${req.get('host')}`;
-        const rewritten = await fetchAndFlattenM3u8(streamData.streamUrl, hostUrl);
+        // Hand the flattener the tier the client asked for so it picks a
+        // rendition that matches, instead of the first (heaviest) one listed.
+        const rewritten = await fetchAndFlattenM3u8(streamData.streamUrl, hostUrl, { quality });
         if (rewritten) {
             setCorsHeaders(res);
             res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
@@ -207,7 +216,7 @@ async function handlePlayback(req, res) {
     let realAudioUrl = streamData.streamUrl;
     let attempt = 0;
 
-    while (attempt < 2) {
+    while (attempt < MAX_UPSTREAM_ATTEMPTS) {
         attempt++;
         try {
             upstreamRes = await fetch(realAudioUrl, {
@@ -221,9 +230,17 @@ async function handlePlayback(req, res) {
 
             const { status } = upstreamRes;
 
-            // CDN token expired / revoked / deleted — re-resolve once via fallback search, then retry
-            if ((status === 404 || status === 401 || status === 403 || status === 410) && attempt === 1) {
+            // CDN token expired / revoked / deleted — re-resolve via fallback
+            // search and retry. Every attempt but the last may fail over: one
+            // retry only ever reached a second URL, and when a track's whole
+            // JioSaavn ladder is dead the working source is the OTHER provider,
+            // one hop further down.
+            if ((status === 404 || status === 401 || status === 403 || status === 410)
+                && attempt < MAX_UPSTREAM_ATTEMPTS) {
                 console.warn(`[playback] CDN returned ${status} for ${songId} — re-resolving URL`);
+                // Real upstream verdict — remember it so no later request wastes
+                // a probe on this URL.
+                markStreamUrlOutcome(realAudioUrl, false);
                 invalidateStreamCache(trackKey, quality);
                 invalidateStreamCache(songId, quality);
                 try {
@@ -248,9 +265,12 @@ async function handlePlayback(req, res) {
                 continue;  // retry with fresh URL
             }
 
+            // Upstream served it: the strongest possible evidence this URL is
+            // playable. Recorded so the next resolve returns it without probing.
+            if (status >= 200 && status < 300) markStreamUrlOutcome(realAudioUrl, true);
             break;  // good status — exit loop
         } catch (fetchErr) {
-            if (attempt >= 2) {
+            if (attempt >= MAX_UPSTREAM_ATTEMPTS) {
                 console.error(`[playback] Upstream fetch failed for ${songId}:`, fetchErr.message);
                 return res.status(502).json({
                     success: false,
@@ -259,7 +279,8 @@ async function handlePlayback(req, res) {
                     detail: fetchErr.message,
                 });
             }
-            // Network error on attempt 1 — try a fresh URL
+            // Network error — try a fresh URL
+            markStreamUrlOutcome(realAudioUrl, false);
             invalidateStreamCache(trackKey, quality);
             invalidateStreamCache(songId, quality);
             try {
@@ -270,6 +291,24 @@ async function handlePlayback(req, res) {
                 return res.status(502).json({ success: false, error: 'Upstream network error', code: 'UPSTREAM_ERROR' });
             }
         }
+    }
+
+    // Every failover has been spent and upstream is still refusing. Piping the
+    // CDN's error body through as audio gave the player a "stream" that stalls
+    // forever instead of failing; a clean JSON error lets it move on to the
+    // next source immediately.
+    if (upstreamRes.status >= 400) {
+        markStreamUrlOutcome(realAudioUrl, false);
+        invalidateStreamCache(trackKey, quality);
+        invalidateStreamCache(songId, quality);
+        console.error(`[playback] Upstream still ${upstreamRes.status} for ${songId} after ${attempt} attempts`);
+        setCorsHeaders(res);
+        return res.status(502).json({
+            success: false,
+            error: 'No playable source responded for this track',
+            code: 'STREAM_UNAVAILABLE',
+            upstreamStatus: upstreamRes.status,
+        });
     }
 
     // ── 3. Stream response back to Flutter ────────────────────────────────────

@@ -52,6 +52,12 @@ const MAX_LIMIT = 60;
 // search feel slow, so Gaana is best-effort: merged when it is quick enough,
 // silently dropped when it is not.
 const GAANA_SEARCH_BUDGET_MS = 3500;
+// The budget handed to the Gaana client itself, kept just inside the lane's
+// own deadline. Gaana hydrates one detail request per hit, so without an inner
+// budget a slow tail meant the whole lane returned nothing and an entire
+// catalogue vanished from the results; with it, the hits that arrived in time
+// are merged and the stragglers finish in the background for the next search.
+const GAANA_SEARCH_HYDRATION_MS = GAANA_SEARCH_BUDGET_MS - 400;
 
 /**
  * Resolves to [promise]'s value, or to [fallback] if it has not settled within
@@ -66,6 +72,34 @@ function withSearchBudget(promise, ms, fallback) {
         new Promise(resolve => { timer = setTimeout(() => resolve(fallback), ms); }),
     ]);
 }
+/**
+ * Round-robins a provider-grouped list so a fixed-size slice keeps every
+ * provider represented. Order within a provider is preserved, and rows without
+ * a provider field are treated as one group, so a single-provider list comes
+ * back unchanged.
+ */
+function interleaveByProvider(items) {
+    const list = Array.isArray(items) ? items.filter(Boolean) : [];
+    if (list.length <= 1) return list;
+
+    const buckets = new Map();
+    for (const item of list) {
+        const key = String(item?.provider ?? 'default');
+        if (!buckets.has(key)) buckets.set(key, []);
+        buckets.get(key).push(item);
+    }
+    if (buckets.size <= 1) return list;
+
+    const lanes = [...buckets.values()];
+    const out = [];
+    for (let i = 0; out.length < list.length; i++) {
+        for (const lane of lanes) {
+            if (i < lane.length) out.push(lane[i]);
+        }
+    }
+    return out;
+}
+
 const ALBUM_LIMIT = 20;
 const MAX_RELATED_LANGUAGES = 5;
 const MAX_ALBUM_LANGUAGE_BUCKETS = 4;
@@ -121,9 +155,35 @@ router.get('/search', async (req, res) => {
 
         // ── Step 2: Load-more (page > 1) — only songs, re-ranked ────────────
         if (page > 1) {
-            const songsData = await searchSongsOnly(nlpExpandedQuery, page);
+            // Load-more used to query JioSaavn alone, so a user who kept
+            // scrolling silently lost every Gaana-only track that page 1 had
+            // shown them. Both catalogues are asked here for the same reason
+            // they are asked on page 1: the second page of a search is still
+            // the same search.
+            const [songsRes, gaanaRes] = await Promise.allSettled([
+                searchSongsOnly(nlpExpandedQuery, page),
+                withSearchBudget(
+                    searchGaanaSongsOnly(primaryQuery, 20 * page, { budgetMs: GAANA_SEARCH_HYDRATION_MS })
+                        .catch(() => []),
+                    GAANA_SEARCH_BUDGET_MS,
+                    [],
+                ),
+            ]);
+            const songsData = songsRes.status === 'fulfilled' ? songsRes.value : null;
             const rawSongs = songsData?.data?.results ?? [];
-            const scored = rankSongs(deduplicateSongs(rawSongs), analysis);
+            const gaanaPageSongs = gaanaRes.status === 'fulfilled' && Array.isArray(gaanaRes.value)
+                ? gaanaRes.value
+                : [];
+            // Gaana has no page cursor of its own, so ask for `page` pages'
+            // worth of hits and drop the ones earlier pages already showed.
+            const gaanaSlice = gaanaPageSongs.slice(20 * (page - 1));
+            const merged = gaanaSlice.length > 0
+                ? fuseSongCandidates([
+                    { source: 'jiosaavn', weight: 1.0, songs: rawSongs },
+                    { source: 'gaana', weight: 0.9, songs: gaanaSlice },
+                ], analysis)
+                : rawSongs;
+            const scored = rankSongs(deduplicateSongs(merged), analysis);
             const orderedSongs = preferredLanguages.length > 0
                 ? prioritizeSongsByLanguage(scored, preferredLanguages)
                 : scored;
@@ -169,7 +229,8 @@ router.get('/search', async (req, res) => {
         // they arrive within GAANA_SEARCH_BUDGET_MS and dropped otherwise. The
         // JioSaavn variants are unaffected either way.
         const gaanaFetch = withSearchBudget(
-            searchGaanaSongsOnly(primaryQuery, 20).catch(() => []),
+            searchGaanaSongsOnly(primaryQuery, 20, { budgetMs: GAANA_SEARCH_HYDRATION_MS })
+                .catch(() => []),
             GAANA_SEARCH_BUDGET_MS,
             [],
         );
@@ -215,10 +276,16 @@ router.get('/search', async (req, res) => {
             }
         }
 
+        // minKeep is the floor on how many songs survive relevance filtering.
+        // Pinning it at 20 while the client asked for `limit` (up to 60) threw
+        // away results the user had explicitly requested, which is a large part
+        // of "not all the songs are showing" — especially for the second
+        // provider, whose rows score slightly lower and were the first to be
+        // cut.
         const rankedByEngine = filterRelevantSongs(
             fuseSongCandidates(candidateGroups, analysis),
             analysis,
-            { minKeep: Math.min(20, limit) },
+            { minKeep: limit },
         );
 
         // Apply language preference as a secondary sort layer (doesn't override exact matches)
@@ -312,7 +379,7 @@ router.get('/search', async (req, res) => {
                                 { source: 'search', weight: 1.1, songs: finalRanked },
                             ], analysis),
                             analysis,
-                            { minKeep: Math.min(20, limit) },
+                            { minKeep: limit },
                         );
                         finalRanked = ranked;
                     }
@@ -322,10 +389,15 @@ router.get('/search', async (req, res) => {
 
         const songsOut = normalizeSongList(attachCanonicalIds(finalRanked.slice(0, limit)));
 
+        // The album lanes are merged provider-by-provider upstream (JioSaavn
+        // first, then Gaana), so a flat `.slice(0, ALBUM_LIMIT)` cut Gaana off
+        // entirely whenever JioSaavn alone filled the list — the exact case
+        // where the missing album is the one only Gaana has. Interleaving keeps
+        // both catalogues represented inside the same cap.
         const albumsOut = normalizeAlbumList(
-            albumsData.status === 'fulfilled'
-                ? (albumsData.value?.data?.results ?? []).slice(0, ALBUM_LIMIT)
-                : []
+            interleaveByProvider(
+                albumsData.status === 'fulfilled' ? (albumsData.value?.data?.results ?? []) : [],
+            ).slice(0, ALBUM_LIMIT)
         );
         const artistsOut = normalizeArtistList(
             artistsData.status === 'fulfilled'
