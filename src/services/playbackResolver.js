@@ -464,6 +464,29 @@ async function _firstPlayableCandidate(song, provider, { maxCandidates = 3, time
         };
     }
 
+    // An HLS candidate is not probed over the network. The gateway has to fetch
+    // that playlist anyway to rewrite its segment URLs, so probing it first
+    // spends a second round trip to the CDN on learning what the fetch that
+    // follows would have told us — and on the cold path that round trip is the
+    // difference between answering inside the client's format-probe window and
+    // missing it, which is what left an HLS track buffering forever instead of
+    // playing.
+    //
+    // Nothing is taken on trust: the flatten downstream is the real check, and
+    // a playlist that cannot be fetched or parsed makes the gateway re-resolve
+    // with this URL banned rather than hand the player something broken.
+    const preferredIsHls = preferred.url.includes('.m3u8');
+    if (preferredIsHls) {
+        return {
+            streamUrl: preferred.url,
+            quality: preferred.quality,
+            contentType: 'application/vnd.apple.mpegurl',
+            isHls: true,
+            provider,
+            song,
+        };
+    }
+
     // Never start probes we have no budget left to finish.
     const budget = Math.min(timeoutMs, _msLeft(deadlineAt));
     if (budget <= 0) return null;

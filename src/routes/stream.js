@@ -138,6 +138,50 @@ function _pickVariant(text, ceilingKbps) {
         : known.reduce((best, v) => (v.kbps < best.kbps ? v : best)).uri;
 }
 
+// ─── Flattened-playlist cache ─────────────────────────────────────────────────
+//
+// Rebuilding a playlist means fetching it from Akamai — sometimes twice, when a
+// master playlist points at a rendition — and that round trip is the whole
+// reason an HLS track feels slower to start than a progressive one.
+//
+// It is also paid more than once for a single tap. The client asks this
+// endpoint what format the track is before it builds a player, and then asks
+// again for real; the queue prefetch asks a third time. Each of those used to
+// flatten from scratch.
+//
+// Held briefly and keyed on everything that changes the answer — the playlist,
+// the tier it was built for, and the host the segment URLs point at. The TTL
+// sits under the edge's own 240s so a cached playlist can never outlive the
+// segment tokens it names.
+const FLATTEN_TTL_MS = 180 * 1000;
+const FLATTEN_MAX = 200;
+const flattenCache = new Map();     // key -> { playlist, at }
+const flattenInFlight = new Map();  // key -> Promise
+
+function _flattenKey(playlistUrl, hostUrl, quality) {
+    return `${playlistUrl}::${hostUrl}::${quality || ''}`;
+}
+
+function _readFlattenCache(key) {
+    const hit = flattenCache.get(key);
+    if (!hit) return null;
+    if (Date.now() - hit.at > FLATTEN_TTL_MS) {
+        flattenCache.delete(key);
+        return null;
+    }
+    return hit.playlist;
+}
+
+function _writeFlattenCache(key, playlist) {
+    if (!playlist) return;
+    if (flattenCache.size >= FLATTEN_MAX) {
+        // Map keeps insertion order — drop the oldest entry.
+        const oldest = flattenCache.keys().next().value;
+        if (oldest !== undefined) flattenCache.delete(oldest);
+    }
+    flattenCache.set(key, { playlist, at: Date.now() });
+}
+
 // ─── Recursive HLS Playlist Flattener ─────────────────────────────────────────
 /**
  * @param {string} playlistUrl
@@ -148,6 +192,33 @@ function _pickVariant(text, ceilingKbps) {
  * @param {number} [options.depth]   recursion guard
  */
 export async function fetchAndFlattenM3u8(playlistUrl, hostUrl, options = {}) {
+    const depth = Number.isFinite(options?.depth) ? options.depth : 0;
+    const quality = options?.quality ?? '';
+
+    // Only the outermost call is cached. A recursive step is an implementation
+    // detail of the call above it and has no independent meaning.
+    if (depth === 0) {
+        const key = _flattenKey(playlistUrl, hostUrl, quality);
+        const cached = _readFlattenCache(key);
+        if (cached) return cached;
+
+        // Two requests for the same playlist arriving together — which is
+        // exactly what the format probe and the playback request are — do the
+        // work once and share it.
+        const inFlight = flattenInFlight.get(key);
+        if (inFlight) return inFlight;
+
+        const work = _flattenM3u8(playlistUrl, hostUrl, { ...options, depth: 0 })
+            .then((playlist) => { _writeFlattenCache(key, playlist); return playlist; })
+            .finally(() => { flattenInFlight.delete(key); });
+        flattenInFlight.set(key, work);
+        return work;
+    }
+
+    return _flattenM3u8(playlistUrl, hostUrl, options);
+}
+
+async function _flattenM3u8(playlistUrl, hostUrl, options = {}) {
     const depth = Number.isFinite(options?.depth) ? options.depth : 0;
     const quality = options?.quality ?? '';
     const ceilingKbps = _hlsCeilingKbps(quality);

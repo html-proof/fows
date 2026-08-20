@@ -100,7 +100,25 @@ router.get('/prefetch/:songId', (req, res) => {
 
     if (!alreadyCached) {
         // Fire-and-forget background resolution — client has already received 202.
+        //
+        // For an HLS track the playlist is rebuilt here as well. Resolving
+        // alone left the expensive half — the fetch from the CDN and the
+        // segment rewrite — to be paid by the request that follows, which is
+        // the one the listener is waiting on. Flattening it now means that
+        // request reads a cached playlist instead, and the client learns the
+        // track's format inside the window it allows for the question.
+        const forwardedHost = req.headers['x-forwarded-host'];
+        const hostUrl = forwardedHost
+            ? `https://${forwardedHost}`
+            : `${req.protocol}://${req.get('host')}`;
         resolvePlayableStream({ id: songId, title: songTitle, artist: songArtist, album: songAlbum, language, quality })
+            .then((resolved) => {
+                const url = resolved?.streamUrl || '';
+                if (resolved?.isHls || url.includes('.m3u8')) {
+                    return fetchAndFlattenM3u8(url, hostUrl, { quality });
+                }
+                return null;
+            })
             .catch(() => {});
     }
 });
@@ -249,7 +267,34 @@ async function handlePlayback(req, res) {
             : `${req.protocol}://${req.get('host')}`;
         // Hand the flattener the tier the client asked for so it picks a
         // rendition that matches, instead of the first (heaviest) one listed.
-        const rewritten = await fetchAndFlattenM3u8(streamData.streamUrl, hostUrl, { quality });
+        let rewritten = await fetchAndFlattenM3u8(streamData.streamUrl, hostUrl, { quality });
+
+        // The flatten is what actually proves an HLS source: it fetches the
+        // playlist, so a dead or unparseable one shows up here. Ban it and
+        // resolve again rather than falling through to the byte proxy, which
+        // would stream a playlist to the player as though it were audio — a
+        // "stream" that can only ever buffer.
+        if (!rewritten) {
+            console.warn(`[playback] HLS playlist unusable for ${songId} — re-resolving`);
+            markStreamUrlOutcome(streamData.streamUrl, false);
+            invalidateStreamCache(trackKey, quality);
+            invalidateStreamCache(songId, quality);
+            try {
+                excludeUrls.push(streamData.streamUrl);
+                streamData = await resolvePlayableStream({
+                    id: songId, title: songTitle, artist: songArtist, album: songAlbum,
+                    language, quality, excludeUrls,
+                });
+                isHls = streamData.isHls || (streamData.streamUrl || '').includes('.m3u8');
+                if (isHls) {
+                    rewritten = await fetchAndFlattenM3u8(streamData.streamUrl, hostUrl, { quality });
+                }
+            } catch (_) {
+                // Nothing else resolved — fall through to the proxy, which
+                // reports a clean failure the player can act on.
+            }
+        }
+
         if (rewritten) {
             setCorsHeaders(res);
             res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
