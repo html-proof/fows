@@ -62,6 +62,24 @@ export const QUALITY_LADDERS = {
 
 export const DEFAULT_QUALITY = 'normal';
 
+// The tier expressed as a number: the most data per second the listener has
+// agreed to spend. Everything below decides against this, because a ladder of
+// label strings cannot answer "is 128 more than the user asked for?" — and
+// 128 is exactly what one provider serves.
+const TIER_CEILING_KBPS = { low: 48, normal: 96, high: 160, max: 320 };
+
+export function qualityCeilingKbps(quality) {
+    return TIER_CEILING_KBPS[normalizeQuality(quality)] ?? TIER_CEILING_KBPS[DEFAULT_QUALITY];
+}
+
+/** The bitrate a candidate really carries, in kbps, or null if unknown. */
+export function kbpsOfStreamUrl(url) {
+    const label = bitrateLabelForStreamUrl(url, null);
+    if (!label) return null;
+    const n = parseInt(label, 10);
+    return Number.isFinite(n) ? n : null;
+}
+
 /**
  * Coerce any client-supplied quality hint into a canonical tier name.
  * Accepts tier names (low/normal/high/max), Spotify-style aliases
@@ -222,7 +240,7 @@ const SEARCH_HEDGE_AFTER_MS = 1200;
 // indefinitely would make every JioSaavn track as slow as the slowest Gaana
 // lookup. A JioSaavn answer that arrives first is therefore held, not
 // discarded, and used the moment this window closes with Gaana still silent.
-const GAANA_PREFERENCE_MS = 700;
+const GAANA_PREFERENCE_MS = 350;
 
 // Budget for a resolve that is recovering from a URL the client already saw
 // fail. It is wider than the normal one because the cheap answers have been
@@ -369,14 +387,14 @@ export function generateTrackKey(id, title = '', artist = '', album = '', langua
  * Falls back to the top bitrate when no token is present, so an unlabelled URL
  * is never mistaken for a cheap one.
  */
-export function bitrateLabelForStreamUrl(url) {
+export function bitrateLabelForStreamUrl(url, fallback = '320kbps') {
     // JioSaavn encodes the bitrate as a `_320` suffix on the filename; Gaana
     // makes it the filename itself (`.../769403/128.mp4.master.m3u8`) and offers
     // a different ladder. Accept both separators and both ladders -- an
     // unrecognised URL falls back to 320kbps, which would file a Gaana stream
     // under the `max` tier and hand every client the richest rendition.
-    const match = String(url || '').match(/[_/](12|48|64|96|128|160|320)(?:_[^./]*)?\.(?:mp4|m4a|mp3|aac)/i);
-    return match ? `${match[1]}kbps` : '320kbps';
+    const match = String(url || '').match(/[_/](12|48|64|96|128|160|320)(?:_[^./]*)?\.(?:mp4|m4a|mp3|aac|m3u8)/i);
+    return match ? `${match[1]}kbps` : fallback;
 }
 
 function _labelForUrl(u) {
@@ -387,14 +405,22 @@ function _extractDownloadCandidates(song, quality = DEFAULT_QUALITY) {
     if (!song) return [];
     const urls = Array.isArray(song.downloadUrl) ? song.downloadUrl : [];
 
-    // Collect one URL per available bitrate label.
-    const byQuality = new Map();
-    const add = (url, q) => {
+    // One entry per distinct URL, labelled with the bitrate it really carries.
+    //
+    // The URL wins over the provider's own label wherever the URL states a
+    // bitrate, because one provider's labels are fiction: Gaana lists the same
+    // single address three times as 320, 160 and 96 kbps, while the file it
+    // points at is 128 either way. Believing those labels meant a listener on
+    // 96 kbps was handed 128 — a third more data than they had agreed to — and
+    // a listener on 320 was told they had it when they did not.
+    const byUrl = new Map();
+    const add = (url, declared) => {
         if (typeof url !== 'string') return;
         const u = url.trim();
         if (!u.startsWith('http')) return;
-        const label = q || _labelForUrl(u);
-        if (!byQuality.has(label)) byQuality.set(label, u);
+        if (byUrl.has(u)) return;
+        const label = bitrateLabelForStreamUrl(u, null) || declared || _labelForUrl(u);
+        byUrl.set(u, label);
     };
     for (const entry of urls) add(entry?.url, entry?.quality);
     // Legacy single-string shapes.
@@ -402,20 +428,29 @@ function _extractDownloadCandidates(song, quality = DEFAULT_QUALITY) {
     add(song.stream_url);
     if (typeof song.downloadUrl === 'string') add(song.downloadUrl);
 
-    // Order by the requested tier's ladder so the target bitrate is probed
-    // first and the resolver settles on the lowest-data URL that actually plays.
-    const ladder = QUALITY_LADDERS[normalizeQuality(quality)] || QUALITY_LADDERS[DEFAULT_QUALITY];
-    const ordered = [];
-    const seenUrl = new Set();
-    for (const q of ladder) {
-        const u = byQuality.get(q);
-        if (u && !seenUrl.has(u)) { seenUrl.add(u); ordered.push({ url: u, quality: q }); }
-    }
-    // Any bitrate labels not covered by the ladder, appended last.
-    for (const [q, u] of byQuality) {
-        if (!seenUrl.has(u)) { seenUrl.add(u); ordered.push({ url: u, quality: q }); }
-    }
-    return ordered;
+    // The selected tier is a ceiling on data spent, so ordering is arithmetic
+    // rather than a fixed ladder of labels — a ladder can only rank the
+    // bitrates it was written with, and silently appended anything else (128,
+    // 64) at the end where it could still be served.
+    //
+    //   1. exactly what was asked for
+    //   2. below it, richest first
+    //   3. above it, smallest first — only ever reached when the track is
+    //      published at no bitrate the listener's budget allows, where the
+    //      alternative is silence
+    const ceiling = qualityCeilingKbps(quality);
+    const scored = [...byUrl.entries()].map(([url, label]) => {
+        const kbps = parseInt(label, 10);
+        return { url, quality: label, kbps: Number.isFinite(kbps) ? kbps : ceiling };
+    });
+    scored.sort((a, b) => {
+        const aOver = a.kbps > ceiling;
+        const bOver = b.kbps > ceiling;
+        if (aOver !== bOver) return aOver ? 1 : -1;   // within budget first
+        return aOver ? a.kbps - b.kbps                // over: smallest overshoot
+                     : b.kbps - a.kbps;               // within: richest allowed
+    });
+    return scored.map(({ url, quality: q }) => ({ url, quality: q }));
 }
 
 /**
@@ -720,43 +755,85 @@ async function _resolveDirectById(songId, quality = DEFAULT_QUALITY, deadlineAt 
     ];
     const gaanaLaneIndex = lanes.length - 1;
 
-    // Gaana first, then whoever answers.
+    // Gaana first, but never at the cost of the quality that was chosen.
     //
-    // The lanes still run together and none waits on another; what changed is
-    // whose answer is taken. A result from any other lane is held for
-    // GAANA_PREFERENCE_MS before it is used, so Gaana answering inside that
-    // window wins outright, while Gaana not carrying the track -- or being slow
-    // -- costs the window and nothing more.
+    // The lanes all run together; what this decides is whose answer is taken.
+    // Two rules, in order:
     //
-    // Everything still ends the instant every lane has settled, and the
-    // deadline is still a hard stop, so this can only delay an answer by the
-    // preference window and can never turn a playable track into a failure.
+    //   1. The selected quality is a budget, not a suggestion. A source above
+    //      it is never taken while anything at or below it exists, and a source
+    //      below it loses to one closer to it — so 320 means 320 where the
+    //      track has it, and 96 means 96 even when a provider would rather hand
+    //      over its 128.
+    //   2. Between sources that are equally close, Gaana wins, because it is
+    //      the primary catalogue. Failing that, a progressive source beats an
+    //      HLS one, as it always did.
+    //
+    // An answer that already sits exactly on the budget cannot be improved on,
+    // so it ends the race immediately. Anything less waits for the other lanes,
+    // bounded by GAANA_PREFERENCE_MS and by the resolution deadline, so this
+    // can only ever delay an answer — never turn a playable track into a
+    // failure, and never leave a track unplayed because the ideal bitrate does
+    // not exist.
+    const ceiling = qualityCeilingKbps(quality);
+    const kbpsOf = (r) => {
+        const n = parseInt(r?.quality, 10);
+        return Number.isFinite(n) ? n : ceiling;
+    };
+
+    // Lower is better.
+    const rank = (r, isGaana) => {
+        const kbps = kbpsOf(r);
+        return [
+            kbps > ceiling ? 1 : 0,              // over budget: last resort
+            kbps > ceiling ? kbps : -kbps,       // closest to the budget
+            isGaana ? 0 : 1,                     // primary catalogue
+            r.isHls ? 1 : 0,                     // progressive preferred
+        ];
+    };
+    const better = (a, b) => {
+        if (!b) return true;
+        for (let i = 0; i < a.length; i++) {
+            if (a[i] !== b[i]) return a[i] < b[i];
+        }
+        return false;
+    };
+
     return new Promise((resolve) => {
         let remaining = lanes.length;
-        let alternative = null;      // best non-Gaana answer so far
+        let best = null;
+        let bestRank = null;
         let settled = false;
         let releaseTimer = null;
 
-        const finish = (r) => {
+        const finish = () => {
             if (settled) return;
             settled = true;
             if (releaseTimer) clearTimeout(releaseTimer);
-            resolve(r);
+            resolve(best);
         };
 
         // Hard stop: if a lane hangs past the deadline, stop waiting for it.
         const left = _msLeft(deadlineAt);
         if (Number.isFinite(left)) {
-            const capTimer = setTimeout(() => finish(alternative), Math.max(0, left));
+            const capTimer = setTimeout(finish, Math.max(0, left));
             if (typeof capTimer.unref === 'function') capTimer.unref();
         }
 
-        // The window only starts once there is something to hold: before the
-        // first alternative arrives there is nothing to be preferred over.
-        const holdForGaana = () => {
+        // Only worth waiting once there is something to improve on.
+        //
+        // The window closes on an answer that fits the budget; it does not
+        // close on one that overspends. A source above the selected quality is
+        // a last resort, so it waits for every other lane rather than being
+        // accepted the moment a timer expires — which is how a 96 kbps request
+        // was being handed a 128 kbps stream while the 96 was still in flight.
+        const holdForBetter = () => {
             if (releaseTimer || settled) return;
             const wait = Math.max(0, Math.min(GAANA_PREFERENCE_MS, _msLeft(deadlineAt)));
-            releaseTimer = setTimeout(() => finish(alternative), wait);
+            releaseTimer = setTimeout(() => {
+                releaseTimer = null;
+                if (kbpsOf(best) <= ceiling) finish();
+            }, wait);
             if (typeof releaseTimer.unref === 'function') releaseTimer.unref();
         };
 
@@ -764,17 +841,18 @@ async function _resolveDirectById(songId, quality = DEFAULT_QUALITY, deadlineAt 
             const isGaanaLane = index === gaanaLaneIndex;
             lane.then((r) => {
                 if (!r) return;
-                if (isGaanaLane) {
-                    finish(r);                  // the primary catalogue answered
+                const candidate = rank(r, isGaanaLane);
+                if (better(candidate, bestRank)) { best = r; bestRank = candidate; }
+                // Exactly on budget, from the primary catalogue or not — no
+                // later answer can beat it on the rule that matters most.
+                if (kbpsOf(best) === ceiling && (isGaanaLane || best === r)) {
+                    finish();
                     return;
                 }
-                // Among the fallbacks a progressive source still beats an HLS
-                // one, exactly as before.
-                if (!alternative || (alternative.isHls && !r.isHls)) alternative = r;
-                holdForGaana();
+                holdForBetter();
             }).catch(() => {}).finally(() => {
                 remaining -= 1;
-                if (remaining === 0) finish(alternative);
+                if (remaining === 0) finish();
             });
         });
     });
