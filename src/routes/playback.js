@@ -166,7 +166,7 @@ async function handlePlayback(req, res) {
         }
     }
 
-    const isHls = streamData.isHls || (streamData.streamUrl || '').includes('.m3u8');
+    let isHls = streamData.isHls || (streamData.streamUrl || '').includes('.m3u8');
 
     // ── Fast path: 302-redirect to public JioSaavn CDN (no byte-proxy) ─────────
     // saavncdn.com progressive MP4/AAC/MP3 files are public — they require no
@@ -179,19 +179,61 @@ async function handlePlayback(req, res) {
         const u = (streamData.streamUrl || '').toLowerCase();
         const isPublicSaavnCdn = u.includes('saavncdn.com')
             && (u.includes('.mp4') || u.includes('.m4a') || u.includes('.aac') || u.includes('.mp3'));
-        // ...and only for a URL something has actually played. A redirect puts
-        // the stream beyond this gateway's reach: if it turns out to be dead
-        // the player gets the CDN's 404 directly and nothing here can fail over
-        // to another bitrate or provider. A URL with no positive evidence
-        // behind it — the memory of its last play has expired, or the process
-        // has forgotten it — is streamed through the proxy below instead, where
-        // a failure is caught and answered with a different source. Freshly
-        // resolved URLs are probe-verified, so the ordinary tap still redirects.
-        if (isPublicSaavnCdn && isStreamUrlKnownGood(streamData.streamUrl)) {
-            setCorsHeaders(res);
-            res.setHeader('Cache-Control', 'no-store');
-            res.setHeader('X-Stream-Provider', streamData.provider || 'jiosaavn');
-            return res.redirect(302, streamData.streamUrl);
+        // ...but never at a URL nothing has vouched for. A redirect puts the
+        // stream beyond this gateway's reach: if that URL is dead the player
+        // gets the CDN's 404 directly and nothing here can fail over to another
+        // bitrate or provider.
+        //
+        // A freshly resolved URL is probe-verified, so the ordinary tap answers
+        // straight away. Only when the evidence has aged out — a warm cache
+        // entry whose last play is no longer remembered — is one HEAD spent
+        // confirming it, and a URL that fails that check is replaced by
+        // re-resolving with it banned. Falling through to the byte proxy
+        // instead would be worse than slow: the client probes this very
+        // endpoint to learn whether a track is HLS, and a proxied answer makes
+        // that probe download the whole song before playback can even start.
+        if (isPublicSaavnCdn) {
+            let verified = isStreamUrlKnownGood(streamData.streamUrl);
+
+            if (!verified) {
+                const probe = await probeStreamUrl(streamData.streamUrl, { timeoutMs: 1500 })
+                    .catch(() => ({ isValid: false }));
+                markStreamUrlOutcome(streamData.streamUrl, probe.isValid);
+                verified = probe.isValid;
+
+                if (!verified) {
+                    // The cached URL has died. Ban it and resolve again, which
+                    // is the same failover the byte-proxy path performs — done
+                    // here so the answer is still a redirect the client can
+                    // stream from the edge.
+                    console.warn(`[playback] Cached URL no longer serves for ${songId} — re-resolving`);
+                    invalidateStreamCache(trackKey, quality);
+                    invalidateStreamCache(songId, quality);
+                    try {
+                        excludeUrls.push(streamData.streamUrl);
+                        streamData = await resolvePlayableStream({
+                            id: songId, title: songTitle, artist: songArtist, album: songAlbum,
+                            language, quality, excludeUrls,
+                        });
+                        isHls = streamData.isHls || (streamData.streamUrl || '').includes('.m3u8');
+                        const v = (streamData.streamUrl || '').toLowerCase();
+                        verified = !isHls
+                            && v.includes('saavncdn.com')
+                            && (v.includes('.mp4') || v.includes('.m4a') || v.includes('.aac') || v.includes('.mp3'));
+                    } catch (_) {
+                        // Nothing else resolved — fall through to the proxy,
+                        // which will report a clean failure to the player.
+                        verified = false;
+                    }
+                }
+            }
+
+            if (verified) {
+                setCorsHeaders(res);
+                res.setHeader('Cache-Control', 'no-store');
+                res.setHeader('X-Stream-Provider', streamData.provider || 'jiosaavn');
+                return res.redirect(302, streamData.streamUrl);
+            }
         }
     }
 
