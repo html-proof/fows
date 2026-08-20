@@ -426,15 +426,18 @@ router.get('/search', async (req, res) => {
         let candidateGroups = songResults.status === 'fulfilled'
             ? songResults.value.map((songs, index) => ({
                 source: index === 0 ? 'exact' : `variant:${index}`,
-                weight: Math.max(0.45, 1 - index * 0.15),
+                // Below the Gaana group, which is the primary catalogue now.
+                weight: Math.max(0.4, 0.9 - index * 0.15),
                 songs,
             }))
             : [];
 
-        // Merge the Gaana lane as its own retrieval group. Weight sits just
-        // below the exact JioSaavn variant (1.0) so cross-provider coverage is
-        // additive: a Gaana-only soundtrack ranks high enough to be found,
-        // without displacing an exact match from the primary catalogue.
+        // Merge the Gaana lane as its own retrieval group. It carries the top
+        // weight, because Gaana is the primary catalogue: where both provider
+        // lanes retrieve the same song, the Gaana row is the one that leads.
+        // The JioSaavn variants sit a step below rather than being pushed out,
+        // so coverage stays additive — most of the catalogue exists only there,
+        // and a Gaana-only soundtrack was always the point of asking both.
         // Cross-provider duplicates collapse in fuseSongCandidates — Gaana rows
         // carry no songId/canonicalId, so getSongIdentityKey falls through to
         // the normalized title::artist key that both providers share.
@@ -442,7 +445,7 @@ router.get('/search', async (req, res) => {
             ? gaanaSongs.value
             : [];
         if (gaanaList.length > 0) {
-            candidateGroups.push({ source: 'gaana', weight: 0.9, songs: gaanaList });
+            candidateGroups.push({ source: 'gaana', weight: 1.0, songs: gaanaList });
         }
 
         // ── Artist queries deserve the artist's catalogue ───────────────────

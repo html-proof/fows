@@ -212,6 +212,18 @@ const RESOLVE_BUDGET_MS = 5000;
 // longer eat the whole budget before the fallback has even been attempted.
 const SEARCH_HEDGE_AFTER_MS = 1200;
 
+// Gaana is the primary catalogue: when it can answer for a track, its source is
+// the one served. JioSaavn is not demoted to a last resort though -- it stays
+// the fallback for everything Gaana does not carry, which is most of the
+// catalogue, so preferring the other provider cannot leave a track unplayable.
+//
+// The preference is bounded rather than absolute. Gaana streams as HLS, which
+// costs a playlist fetch the progressive path does not pay, and waiting on it
+// indefinitely would make every JioSaavn track as slow as the slowest Gaana
+// lookup. A JioSaavn answer that arrives first is therefore held, not
+// discarded, and used the moment this window closes with Gaana still silent.
+const GAANA_PREFERENCE_MS = 700;
+
 // Budget for a resolve that is recovering from a URL the client already saw
 // fail. It is wider than the normal one because the cheap answers have been
 // ruled out by definition: what is left is a cross-provider search, and cutting
@@ -691,7 +703,10 @@ async function _resolveDirectById(songId, quality = DEFAULT_QUALITY, deadlineAt 
             return makeResult(song, 'jiosaavn');
         })(),
 
-        // Lane C: Gaana direct API
+        // Lane C: Gaana direct API -- the primary catalogue (see
+        // GAANA_PREFERENCE_MS). Its answer wins the race outright; the other
+        // lanes only answer for a track Gaana does not carry, or when it is too
+        // slow to be worth waiting for.
         (async () => {
             if (!gaanaId || gaanaId.startsWith('trk_')) return null;
             const detail = await _withDeadline(
@@ -703,35 +718,65 @@ async function _resolveDirectById(songId, quality = DEFAULT_QUALITY, deadlineAt 
             return makeResult(song, 'gaana');
         })(),
     ];
+    const gaanaLaneIndex = lanes.length - 1;
 
-    // TRUE RACE: return the first lane that yields a usable progressive (non-HLS)
-    // stream the instant it arrives — do NOT wait for the slowest lane's 5s timeout.
-    // If no lane produces a non-HLS source, fall back to the first HLS/any result
-    // once every lane has settled. This is the single biggest cold-start win:
-    // a fast JioSaavn-direct hit (~300ms) is no longer blocked behind the proxy.
+    // Gaana first, then whoever answers.
+    //
+    // The lanes still run together and none waits on another; what changed is
+    // whose answer is taken. A result from any other lane is held for
+    // GAANA_PREFERENCE_MS before it is used, so Gaana answering inside that
+    // window wins outright, while Gaana not carrying the track -- or being slow
+    // -- costs the window and nothing more.
+    //
+    // Everything still ends the instant every lane has settled, and the
+    // deadline is still a hard stop, so this can only delay an answer by the
+    // preference window and can never turn a playable track into a failure.
     return new Promise((resolve) => {
         let remaining = lanes.length;
-        let fallback = null;
+        let alternative = null;      // best non-Gaana answer so far
         let settled = false;
-        const finish = (r) => { if (!settled) { settled = true; resolve(r); } };
+        let releaseTimer = null;
+
+        const finish = (r) => {
+            if (settled) return;
+            settled = true;
+            if (releaseTimer) clearTimeout(releaseTimer);
+            resolve(r);
+        };
+
         // Hard stop: if a lane hangs past the deadline, stop waiting for it.
         const left = _msLeft(deadlineAt);
         if (Number.isFinite(left)) {
-            const capTimer = setTimeout(() => finish(fallback), Math.max(0, left));
+            const capTimer = setTimeout(() => finish(alternative), Math.max(0, left));
             if (typeof capTimer.unref === 'function') capTimer.unref();
         }
-        for (const lane of lanes) {
+
+        // The window only starts once there is something to hold: before the
+        // first alternative arrives there is nothing to be preferred over.
+        const holdForGaana = () => {
+            if (releaseTimer || settled) return;
+            const wait = Math.max(0, Math.min(GAANA_PREFERENCE_MS, _msLeft(deadlineAt)));
+            releaseTimer = setTimeout(() => finish(alternative), wait);
+            if (typeof releaseTimer.unref === 'function') releaseTimer.unref();
+        };
+
+        lanes.forEach((lane, index) => {
+            const isGaanaLane = index === gaanaLaneIndex;
             lane.then((r) => {
-                if (r && !r.isHls) {
-                    finish(r);               // best case — return immediately
-                } else if (r && !fallback) {
-                    fallback = r;            // keep first HLS/any as a fallback
+                if (!r) return;
+                if (isGaanaLane) {
+                    finish(r);                  // the primary catalogue answered
+                    return;
                 }
+                // Among the fallbacks a progressive source still beats an HLS
+                // one, exactly as before.
+                if (!alternative || (alternative.isHls && !r.isHls)) alternative = r;
+                holdForGaana();
             }).catch(() => {}).finally(() => {
                 remaining -= 1;
-                if (remaining === 0) finish(fallback);
+                if (remaining === 0) finish(alternative);
             });
-        }
+        });
     });
 }
 
@@ -781,22 +826,27 @@ async function _runSearchRound(query, title, artist, quality, deadlineAt, exclud
                 const score = _scoreCandidate(title, artist, cand);
                 if (score >= 0.45) scoredCandidates.push({ cand, score, provider: 'jiosaavn' });
             }
+            // The primary catalogue, so an equally good match there is the one
+            // taken. The nudge is deliberately small: it settles ties and near
+            // ties, and never lifts a poor Gaana match over a clearly better
+            // JioSaavn one. It used to sit on the JioSaavn proxy rows.
             for (const cand of gaanaCandidates) {
                 if (!accept(cand)) continue;
                 const score = _scoreCandidate(title, artist, cand);
-                if (score >= 0.45) scoredCandidates.push({ cand, score, provider: 'gaana' });
+                if (score >= 0.45) scoredCandidates.push({ cand, score: score + 0.05, provider: 'gaana' });
             }
-            // Proxy results already have pre-decrypted URLs — give them a small boost
             for (const cand of proxyCandidates) {
                 if (!accept(cand)) continue;
                 const score = _scoreCandidate(title, artist, cand);
-                if (score >= 0.45) scoredCandidates.push({ cand, score: score + 0.05, provider: 'jiosaavn' });
+                if (score >= 0.45) scoredCandidates.push({ cand, score, provider: 'jiosaavn' });
             }
 
             // Collect top candidates from each distinct provider so a dead provider doesn't crowd out valid ones
             const topJio   = scoredCandidates.filter(c => c.provider === 'jiosaavn').slice(0, 2);
             const topGaana = scoredCandidates.filter(c => c.provider === 'gaana').slice(0, 2);
-            const topCandidates = [...topJio, ...topGaana];
+            // Primary catalogue first. The probes are raced, so this settles
+            // who wins a tie rather than who gets to run.
+            const topCandidates = [...topGaana, ...topJio];
 
             if (topCandidates.length === 0) return null;
 
