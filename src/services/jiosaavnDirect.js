@@ -280,6 +280,22 @@ export async function getAlbumByIdDirect(albumId) {
  * Fetch trending songs or albums via JioSaavn's content.getTrending endpoint.
  * Returns an array of normalised objects { id, name, type, image, url, language, year, artists }.
  */
+/**
+ * Flattens a trending credit field to a comma-separated string. The field is a
+ * plain string for songs but an { id, name } object -- or a list of them -- for
+ * albums, so it cannot simply be interpolated.
+ */
+function _trendingArtistNames(value) {
+    if (value == null) return null;
+    if (typeof value === 'string') return value.trim() || null;
+    const list = Array.isArray(value) ? value : [value];
+    const names = list
+        .map(entry => (typeof entry === 'string' ? entry : entry?.name ?? ''))
+        .map(name => String(name).trim())
+        .filter(Boolean);
+    return names.length > 0 ? names.join(', ') : null;
+}
+
 export async function getTrendingDirect(type = 'song', language = 'hindi', limit = 20) {
     const data = await _apiCall({
         '__call':          'content.getTrending',
@@ -292,16 +308,40 @@ export async function getTrendingDirect(type = 'song', language = 'hindi', limit
         ? data
         : Object.values(data ?? {}).filter(v => v && typeof v === 'object' && !Array.isArray(v));
 
-    return list.slice(0, limit).map(item => ({
-        id:       String(item.id ?? ''),
-        name:     _htmlDecode(item.title ?? item.name ?? ''),
-        type:     item.type ?? type,
-        image:    item.image ?? null,
-        url:      item.perma_url ?? item.url ?? null,
-        language: item.language ?? language,
-        year:     item.year ?? null,
-        artists:  item.subtitle ?? item.more_info?.music ?? null,
-    })).filter(item => item.name);
+    return list.slice(0, limit).map(item => {
+        // The endpoint now wraps every entry as { type, details, language } and
+        // keeps the song fields inside `details`; it used to return them flat.
+        // Reading only the flat shape meant `name` came back undefined for each
+        // of the 24 rows, the filter below then dropped all of them, and the
+        // caller silently fell through to its search fallback -- which is why
+        // trending served three copies of one song instead of a chart.
+        //
+        // Both shapes are read, so this survives the API changing back.
+        const details = (item && typeof item.details === 'object' && item.details)
+            ? item.details
+            : item;
+        // Songs and albums do not share field names here. A song carries
+        // id/song/primary_artists; an album carries albumid/title/artist and no
+        // `id` at all, so keying only on `id` left every trending album with an
+        // empty id and nothing to navigate to.
+        return {
+            id:       String(details.id ?? details.albumid ?? item.id ?? ''),
+            name:     _htmlDecode(details.song ?? details.title ?? details.name ?? ''),
+            // `details.type` is present but empty on trending rows.
+            type:     details.type || item.type || type,
+            image:    details.image ?? item.image ?? null,
+            url:      details.perma_url ?? details.url ?? item.perma_url ?? null,
+            language: details.language ?? item.language ?? language,
+            year:     details.year ?? item.year ?? null,
+            // A song states its credits as a plain string; an album states them
+            // as { id, name } (or a list of those), which stringified to
+            // "[object Object]" on every trending album row.
+            artists:  _trendingArtistNames(
+                details.primary_artists ?? details.singers ?? details.music
+                ?? details.artist ?? item.subtitle ?? item.more_info?.music,
+            ),
+        };
+    }).filter(item => item.name);
 }
 
 /**
