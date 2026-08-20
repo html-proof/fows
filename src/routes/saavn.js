@@ -56,6 +56,10 @@ const MAX_LIMIT = 60;
 // without it. Cross-provider coverage is valuable but never worth making every
 // search feel slow, so Gaana is best-effort: merged when it is quick enough,
 // silently dropped when it is not.
+// How many query variants Gaana is asked in parallel. Two covers the specific
+// end of the list — the combinations naming the film, the performer or the
+// language — without turning one search into a fan-out storm.
+const GAANA_VARIANT_LIMIT = 2;
 const GAANA_SEARCH_BUDGET_MS = 3500;
 // The budget handed to the Gaana client itself, kept just inside the lane's
 // own deadline. Gaana hydrates one detail request per hit, so without an inner
@@ -391,9 +395,22 @@ router.get('/search', async (req, res) => {
         // Bounded so it can never slow a search down: results are merged if
         // they arrive within GAANA_SEARCH_BUDGET_MS and dropped otherwise. The
         // JioSaavn variants are unaffected either way.
+        // Gaana is asked the same *questions* JioSaavn is asked, not just the
+        // bare title. It used to receive `primaryQuery` alone — the title with
+        // the film, the performer and the language stripped back off — so a
+        // search that named any of them reached one catalogue fully and the
+        // other only in its vaguest form. The two most specific variants go to
+        // Gaana too, in parallel with each other and with everything else, and
+        // they share the one budget that was already there: nothing waits
+        // longer than before, and a variant that misses it is simply dropped.
+        const gaanaVariants = searchVariants.slice(0, GAANA_VARIANT_LIMIT);
         const gaanaFetch = withSearchBudget(
-            searchGaanaSongsOnly(primaryQuery, 20, { budgetMs: GAANA_SEARCH_HYDRATION_MS })
-                .catch(() => []),
+            Promise.all(
+                gaanaVariants.map(variant =>
+                    searchGaanaSongsOnly(variant, 20, { budgetMs: GAANA_SEARCH_HYDRATION_MS })
+                        .catch(() => []),
+                ),
+            ).then(lists => lists.flat()).catch(() => []),
             GAANA_SEARCH_BUDGET_MS,
             [],
         );
@@ -401,7 +418,7 @@ router.get('/search', async (req, res) => {
         const [songResults, albumsData, artistsData, gaanaSongs] = await Promise.allSettled([
             Promise.all(songFetches),
             searchAlbums(albumSearchQuery),
-            searchArtists(primaryQuery),
+            searchArtists(analysis.artist || primaryQuery),
             gaanaFetch,
         ]);
 
@@ -442,8 +459,11 @@ router.get('/search', async (req, res) => {
         const topArtist = ARTIST_CATALOGUE_ENABLED && artistsData.status === 'fulfilled'
             ? (artistsData.value?.data?.results ?? [])[0]
             : null;
+        // When a performer was named outright, that name is what the artist
+        // card has to match — not the title text the query also carried.
+        const artistIntentQuery = analysis.artist || primaryQuery;
         const artistNameMatchesQuery = topArtist
-            && areSearchTermsSimilar(normText(topArtist.name ?? ''), normText(primaryQuery));
+            && areSearchTermsSimilar(normText(topArtist.name ?? ''), normText(artistIntentQuery));
         if (topArtist?.id && artistNameMatchesQuery) {
             const artistSongs = await withSearchBudget(
                 getArtistSongs(String(topArtist.id)).catch(() => null),

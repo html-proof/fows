@@ -132,7 +132,12 @@ function _cacheKey(trackKey, quality) {
 //
 // Kept deliberately short-lived: CDN tokens expire, so "good" is only trusted
 // briefly, while "dead" is remembered longer because a 404 rarely heals.
-const URL_OK_TTL_MS   = 5 * 60 * 1000;
+// Matched to STREAM_CACHE_TTL_MS on purpose. A URL sitting in the stream cache
+// was probe-verified when it was put there, so the two memories should expire
+// together; while they did not, a cached URL could outlive the proof that it
+// plays, and the gateway had to choose between redirecting the player at
+// something unproven or paying for a fresh probe on a warm hit.
+const URL_OK_TTL_MS   = 15 * 60 * 1000;
 const URL_DEAD_TTL_MS = 30 * 60 * 1000;
 const URL_OUTCOME_MAX = 5000;
 const urlOutcomes = new Map(); // url -> { ok: boolean, at: number }
@@ -158,6 +163,20 @@ export function markStreamUrlOutcome(url, ok) {
     if (!u.startsWith('http')) return;
     urlOutcomes.set(u, { ok: !!ok, at: Date.now() });
     _pruneUrlOutcomes();
+}
+
+/**
+ * Whether a URL is currently remembered as having played.
+ *
+ * The playback gateway asks before handing the player a URL it will not be
+ * able to supervise: a 302 to the CDN is the fastest possible start, but it
+ * also puts the stream outside the gateway's reach, so nothing can fail over
+ * if that URL turns out to be dead. Only a URL with positive evidence behind
+ * it earns that path; everything else is streamed through the gateway, where
+ * a failure is caught and answered with a different source.
+ */
+export function isStreamUrlKnownGood(url) {
+    return _urlOutcome(String(url || '')) === 'ok';
 }
 
 /** 'ok' | 'dead' | null (unknown / expired). */
@@ -600,39 +619,51 @@ async function _resolveDirectById(songId, quality = DEFAULT_QUALITY, deadlineAt 
     // return still has to be probe-verified before the lane can win.
     const detailTimeoutMs = Math.max(1, Math.min(2500, Math.round(_msLeft(deadlineAt) / 2)));
 
-    const lanes = [
-        // Lane A: JioSaavn direct API (fastest when running from Indian region)
-        (async () => {
-            if (!jioId || jioId.startsWith('trk_')) return null;
-            const song = await getSongDirect(jioId, { timeoutMs: detailTimeoutMs }).catch(() => null);
-            return makeResult(song, 'jiosaavn');
-        })(),
+    // Lane A: JioSaavn direct API (fastest when running from Indian region)
+    const laneA = (async () => {
+        if (!jioId || jioId.startsWith('trk_')) return null;
+        const song = await getSongDirect(jioId, { timeoutMs: detailTimeoutMs }).catch(() => null);
+        return makeResult(song, 'jiosaavn');
+    })();
 
-        // Lane B: saavn.sumit.co proxy — geo-transparent third-party wrapper.
-        // Returns pre-decrypted CDN URLs so no DES/encryption step needed here.
-        // The proxy may be cold, but it is the most reliable non-Indian path —
-        // it still only gets its share of the budget, since a 5 s wait here used
-        // to outlive the entire resolution it was supposed to serve.
-        (async () => {
-            if (!jioId || jioId.startsWith('trk_')) return null;
-            try {
-                const res = await requestJsonWithTimeoutExported(
-                    `${SAAVN_PROXY_BASE}/api/songs/${encodeURIComponent(jioId)}`,
-                    { timeoutMs: detailTimeoutMs, label: 'saavn-proxy song' },
-                );
-                // Proxy may return { data: song } or { data: [song] }
-                const song = Array.isArray(res?.data) ? res.data[0] : res?.data;
-                return makeResult(song, 'jiosaavn');
-            } catch (_) {
-                return null;
-            }
-        })(),
+    // Lane B: saavn.sumit.co proxy — geo-transparent third-party wrapper.
+    // Returns pre-decrypted CDN URLs so no DES/encryption step needed here.
+    // The proxy may be cold, but it is the most reliable non-Indian path —
+    // it still only gets its share of the budget, since a 5 s wait here used
+    // to outlive the entire resolution it was supposed to serve.
+    const laneB = (async () => {
+        if (!jioId || jioId.startsWith('trk_')) return null;
+        try {
+            const res = await requestJsonWithTimeoutExported(
+                `${SAAVN_PROXY_BASE}/api/songs/${encodeURIComponent(jioId)}`,
+                { timeoutMs: detailTimeoutMs, label: 'saavn-proxy song' },
+            );
+            // Proxy may return { data: song } or { data: [song] }
+            const song = Array.isArray(res?.data) ? res.data[0] : res?.data;
+            return makeResult(song, 'jiosaavn');
+        } catch (_) {
+            return null;
+        }
+    })();
+
+    const lanes = [
+        laneA,
+
+        laneB,
 
         // Lane B2: a second JioSaavn mapping for the same canonical track, if
-        // the catalog holds one. Only exists when there is genuinely another
-        // release to try, so an ordinary track's fan-out is unchanged.
+        // the catalog holds one — the same recording issued on another release.
+        //
+        // A fallback, never a competitor. Raced alongside the others it
+        // sometimes won, and then one track answered from two different
+        // releases depending on which lane happened to be quicker — the same
+        // audio, but a different URL per tap and per quality tier, which no
+        // cache can hold on to. It runs only once the primary mapping has come
+        // up empty, so the answer for a playable track is always the same one.
         (async () => {
             if (!altJioId) return null;
+            const [a, b] = await Promise.all([laneA.catch(() => null), laneB.catch(() => null)]);
+            if (a || b || _expired(deadlineAt)) return null;
             const song = await getSongDirect(altJioId, { timeoutMs: detailTimeoutMs }).catch(() => null);
             return makeResult(song, 'jiosaavn');
         })(),

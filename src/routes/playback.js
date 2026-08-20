@@ -22,6 +22,7 @@ import {
     invalidateStreamCache,
     generateTrackKey,
     markStreamUrlOutcome,
+    isStreamUrlKnownGood,
     PlaybackResolveError,
 } from '../services/playbackResolver.js';
 import { getHeadersForStreamUrl, probeStreamUrl } from '../services/streamValidator.js';
@@ -178,7 +179,15 @@ async function handlePlayback(req, res) {
         const u = (streamData.streamUrl || '').toLowerCase();
         const isPublicSaavnCdn = u.includes('saavncdn.com')
             && (u.includes('.mp4') || u.includes('.m4a') || u.includes('.aac') || u.includes('.mp3'));
-        if (isPublicSaavnCdn) {
+        // ...and only for a URL something has actually played. A redirect puts
+        // the stream beyond this gateway's reach: if it turns out to be dead
+        // the player gets the CDN's 404 directly and nothing here can fail over
+        // to another bitrate or provider. A URL with no positive evidence
+        // behind it — the memory of its last play has expired, or the process
+        // has forgotten it — is streamed through the proxy below instead, where
+        // a failure is caught and answered with a different source. Freshly
+        // resolved URLs are probe-verified, so the ordinary tap still redirects.
+        if (isPublicSaavnCdn && isStreamUrlKnownGood(streamData.streamUrl)) {
             setCorsHeaders(res);
             res.setHeader('Cache-Control', 'no-store');
             res.setHeader('X-Stream-Provider', streamData.provider || 'jiosaavn');
