@@ -750,11 +750,30 @@ async function _resolveBySearch(title, artist = '', album = '', quality = DEFAUL
     //
     // Deliberately gated behind round 1 so the extra fan-out is paid only by
     // requests that genuinely need it, never by an ordinary play.
+    // Ordered most-discriminating first, because the cap below keeps the head of
+    // this list. Every field the caller actually knows is used — title, artist,
+    // the film (which is what `album` holds for a soundtrack) and the language —
+    // and the combinations that name more of them are tried before the ones that
+    // name fewer.
+    //
+    // Language earns its place at the top: a film released in several languages
+    // reuses its songs' titles, so "title artist" alone cannot separate the Tamil
+    // recording from the Malayalam one, and the provider decides which to return.
+    //
+    // "artist album" is last on purpose. It is the only variant with no title in
+    // it, so it asks for *any* song by that artist on that release — the loosest
+    // question here, and the one most able to return a different song.
+    //
+    // A variant whose fields are missing collapses to a shorter string, which is
+    // then dropped as a duplicate of an earlier query or of round 1, so nothing
+    // is wasted when metadata is thin.
     const wideQueries = dedupe([
-        [cleanTitle, cleanAlbum].filter(Boolean).join(' '),
+        [cleanTitle, primaryArtist, cleanLanguage].filter(Boolean).join(' '),
+        [cleanTitle, cleanAlbum, cleanLanguage].filter(Boolean).join(' '),
         [cleanTitle, primaryArtist, cleanAlbum].filter(Boolean).join(' '),
-        [primaryArtist, cleanAlbum].filter(Boolean).join(' '),
+        [cleanTitle, cleanAlbum].filter(Boolean).join(' '),
         [cleanTitle, cleanLanguage].filter(Boolean).join(' '),
+        [primaryArtist, cleanAlbum].filter(Boolean).join(' '),
     ]).filter(q => !primaryQueries.includes(q)).slice(0, WIDE_SEARCH_MAX_VARIANTS);
 
     if (wideQueries.length === 0 || _expired(deadlineAt)) return null;
