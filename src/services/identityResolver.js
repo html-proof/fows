@@ -206,6 +206,86 @@ function languagesConflict(a, b) {
     return x !== y;
 }
 
+/**
+ * How much two artist credits agree, 0..1.
+ *
+ * Bigram similarity alone is the wrong instrument for a credit list. "Harris
+ * Jayaraj" against "Harris Jayaraj, Paal Dabba" reads as a weak match on
+ * character overlap although one credit plainly contains the other, while two
+ * unrelated studio names can drift above the old 0.45 floor on nothing but
+ * shared letters. Shared whole names are the stronger signal, so the two
+ * measures are combined and the better one wins.
+ */
+function artistAgreement(a, b) {
+    const x = normText(a ?? '');
+    const y = normText(b ?? '');
+    if (!x || !y) return 0;
+    if (x === y) return 1;
+
+    const xs = new Set(x.split(' ').filter(w => w.length > 2));
+    const ys = new Set(y.split(' ').filter(w => w.length > 2));
+    let shared = 0;
+    for (const w of xs) if (ys.has(w)) shared += 1;
+    const overlap = (xs.size && ys.size) ? shared / Math.min(xs.size, ys.size) : 0;
+
+    return Math.max(bigramSimilarity(x, y), overlap);
+}
+
+/**
+ * Whether two release titles name plainly different releases.
+ *
+ * Tolerates the ways one release gets written down — "Vikram" against "Vikram
+ * (Original Motion Picture Soundtrack)" is the same album under a longer name —
+ * so only a real disagreement counts, and an unnamed release never does.
+ */
+function albumsDiffer(a, b) {
+    const x = normText(a ?? '');
+    const y = normText(b ?? '');
+    if (!x || !y) return false;
+    if (x === y || x.includes(y) || y.includes(x)) return false;
+    return bigramSimilarity(x, y) < 0.5;
+}
+
+/**
+ * The hard rules that decide whether a provider song and a catalog row can be
+ * the same recording at all. Violate one and no amount of title similarity
+ * matters.
+ *
+ * Shared by the matcher and by the trust check on an existing mapping, so a
+ * mapping written by an older, looser rule set is re-judged by today's rules
+ * and repaired rather than believed forever.
+ */
+function recordingConflicts(meta, row) {
+    if (!row) return false;
+
+    // "… (Male)" must never be "… Duet".
+    if (versionTag(row.title ?? row.norm_title ?? '') !== versionTag(meta.title ?? '')) return true;
+
+    // Nor the Tamil cut the Telugu one.
+    if (languagesConflict(meta.language, row.language)) return true;
+
+    const bothDurations = meta.durationMs > 0 && row.duration_ms > 0;
+    const durationDiffSec = bothDurations
+        ? Math.abs((meta.durationMs - row.duration_ms) / 1000)
+        : null;
+
+    // Runtime is the plainest evidence there is of what a recording is. Two
+    // tracks minutes apart are not the same performance whatever they are
+    // called, and the old scoring only docked such a pair 20 points — enough
+    // for an identical title to carry it over the line anyway. That is how four
+    // unrelated songs called "Midnight Drive", by three different artists,
+    // ended up sharing one canonical id: tap any of them and whichever won the
+    // mapping is what played.
+    if (bothDurations && durationDiffSec > 25) return true;
+
+    // A different release is still the same recording when it runs the same
+    // length — the compilation case, one performance reissued on many albums,
+    // which must keep merging. Anything else is a different cut.
+    if (albumsDiffer(meta.album, row.album_name) && (!bothDurations || durationDiffSec > 5)) return true;
+
+    return false;
+}
+
 // ─── Core: resolve or create ──────────────────────────────────────────────────
 
 /**
@@ -226,14 +306,14 @@ export function resolveOrCreate(meta, provider, providerTrackId, providerAlbumId
     const existing = stmts.getProviderMap.get(provider, providerTrackId);
     if (existing) {
         const mapped = stmts.getTrack.get(existing.track_id);
-        // A mapping is trusted only while it still points at the same version
-        // AND the same language. Mappings written before either check existed
-        // can point a Tamil provider track at the canonical Telugu row;
-        // re-resolving them repairs the catalog in place instead of serving
-        // the wrong recording forever.
-        const sameVersion  = !mapped || versionTag(mapped.title) === versionTag(meta.title ?? '');
-        const sameLanguage = !mapped || !languagesConflict(mapped.language, meta.language);
-        if (sameVersion && sameLanguage) {
+        // A mapping is trusted only while the row it points at could still be
+        // this recording. Catalogs are full of mappings written by looser rules
+        // — a Tamil provider track pointed at the canonical Telugu row, four
+        // unrelated "Midnight Drive"s sharing one id — and re-judging them here
+        // repairs the catalog in place instead of serving the wrong recording
+        // forever. Nothing is deleted: the mapping is rebuilt below against the
+        // right canonical track, creating one if there is none.
+        if (!recordingConflicts(meta, mapped)) {
             stmts.touchProviderMap.run(Date.now(), provider, providerTrackId);
             return { canonicalId: existing.track_id, confidence: existing.confidence, isNew: false };
         }
@@ -273,31 +353,28 @@ function _findExisting(meta) {
     // prefix+\uffff) is exactly the set LIKE 'prefix%' matched.
     const candidates = stmts.getCandidates.all(prefix, `${prefix}\uffff`);
 
-    const tag = versionTag(meta.title ?? '');
-
     let best = null, bestScore = -1;
     for (const c of candidates) {
-        // A different version word means a different recording, however close
-        // the rest of the title reads. "… (Male)" must never match "… Duet".
-        if (versionTag(c.norm_title) !== tag) continue;
-        // Nor does a different language, for the same reason — see
-        // languagesConflict above.
-        if (languagesConflict(meta.language, c.language)) continue;
+        if (recordingConflicts(meta, c)) continue;
+
         const ts = bigramSimilarity(nt, normText(c.norm_title));
-        const as = bigramSimilarity(na, normText(c.artist_name ?? ''));
+        const as = artistAgreement(na, c.artist_name);
         if (ts < 0.72 || as < 0.45) continue;
 
         let score = ts * 55 + as * 35;
-        if (meta.durationMs && c.duration_ms) {
+        if (meta.durationMs > 0 && c.duration_ms > 0) {
             const diff = Math.abs((meta.durationMs - c.duration_ms) / 1000);
             if (diff <= 5)       score += 15;
             else if (diff <= 20) score += 8;
-            else if (diff > 60)  score -= 20;
         }
         if (score > bestScore) { bestScore = score; best = { id: c.id, score }; }
     }
 
-    return (best && best.score >= 50) ? best : null;
+    // Raised from 50. At 50 an identical title carried a pair over the line on
+    // its own, however little else agreed; the floor now needs the title AND a
+    // real artist agreement behind it. Failing to merge costs a duplicate row;
+    // merging wrongly costs the tap, which is the worse of the two.
+    return (best && best.score >= 60) ? best : null;
 }
 
 function _create(meta) {
