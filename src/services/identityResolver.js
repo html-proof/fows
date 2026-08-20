@@ -112,7 +112,7 @@ const stmts = {
     // the service has ever answered. A half-open range on the same normalised
     // column is an index seek against idx_tracks_norm and returns exactly the
     // same rows (norm_title is already lower-cased by normText).
-    getCandidates:    db.prepare('SELECT id, norm_title, artist_name, album_name, duration_ms FROM tracks WHERE norm_title >= ? AND norm_title < ? LIMIT 20'),
+    getCandidates:    db.prepare('SELECT id, norm_title, artist_name, album_name, duration_ms, language FROM tracks WHERE norm_title >= ? AND norm_title < ? LIMIT 20'),
     insertArtist:     db.prepare('INSERT OR IGNORE INTO artists (id, name, norm_name, image_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)'),
     insertAlbum:      db.prepare('INSERT OR IGNORE INTO albums (id, artist_id, title, norm_title, artwork_url, release_year, genre, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'),
     insertTrack:      db.prepare('INSERT OR IGNORE INTO tracks (id, title, norm_title, artist_id, album_id, artist_name, album_name, artwork_url, duration_ms, isrc, release_year, language, genre, is_explicit, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'),
@@ -129,7 +129,18 @@ const stmts = {
         LIMIT 1
     `),
     getMappings:      db.prepare('SELECT * FROM provider_maps WHERE track_id = ?'),
-    getProviderTrackId: db.prepare('SELECT provider_track_id FROM provider_maps WHERE track_id = ? AND provider = ?'),
+    // Ordered, because a canonical track can legitimately carry more than one
+    // mapping for the same provider (the album cut and the single, say). The
+    // query used to be unordered and read with .get(), so which recording a tap
+    // resolved to was whatever SQLite happened to return first. Highest
+    // confidence wins, then the most recently verified, then insertion order —
+    // so the answer is stable across restarts and prefers the exact match over
+    // a fuzzy one.
+    getProviderTrackIds: db.prepare(`
+        SELECT provider_track_id FROM provider_maps
+        WHERE track_id = ? AND provider = ?
+        ORDER BY confidence DESC, last_verified_at DESC, id ASC
+    `),
     getProviderAlbumId: db.prepare('SELECT provider_album_id FROM provider_maps WHERE provider_album_id IS NOT NULL AND track_id IN (SELECT id FROM tracks WHERE album_id = ?) AND provider = ? LIMIT 1'),
     getStreamCache:   db.prepare('SELECT url, quality, expires_at FROM stream_cache WHERE track_id = ? AND provider = ?'),
     upsertStreamCache:db.prepare('INSERT OR REPLACE INTO stream_cache (track_id, provider, url, quality, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)'),
@@ -173,6 +184,28 @@ function versionTag(title) {
     return [...new Set(tags)].sort().join('+');
 }
 
+/**
+ * Whether two language labels are a stated disagreement.
+ *
+ * A film released in several languages reuses its songs' titles, its artists
+ * and even their durations across every version, so title + artist + duration
+ * — everything the matcher looks at — score identically for the Tamil and the
+ * Telugu recording. They are different recordings with different streams, and
+ * folding them onto one canonical track is what made a tap play the wrong
+ * language, or nothing at all when the version that won the mapping was not
+ * playable.
+ *
+ * Only a stated disagreement counts: an unlabelled row is not evidence of a
+ * different language, so this can never split a track that would otherwise
+ * have matched on the strength of its metadata.
+ */
+function languagesConflict(a, b) {
+    const x = normText(a ?? '');
+    const y = normText(b ?? '');
+    if (!x || !y || x === 'unknown' || y === 'unknown') return false;
+    return x !== y;
+}
+
 // ─── Core: resolve or create ──────────────────────────────────────────────────
 
 /**
@@ -193,7 +226,14 @@ export function resolveOrCreate(meta, provider, providerTrackId, providerAlbumId
     const existing = stmts.getProviderMap.get(provider, providerTrackId);
     if (existing) {
         const mapped = stmts.getTrack.get(existing.track_id);
-        if (!mapped || versionTag(mapped.title) === versionTag(meta.title ?? '')) {
+        // A mapping is trusted only while it still points at the same version
+        // AND the same language. Mappings written before either check existed
+        // can point a Tamil provider track at the canonical Telugu row;
+        // re-resolving them repairs the catalog in place instead of serving
+        // the wrong recording forever.
+        const sameVersion  = !mapped || versionTag(mapped.title) === versionTag(meta.title ?? '');
+        const sameLanguage = !mapped || !languagesConflict(mapped.language, meta.language);
+        if (sameVersion && sameLanguage) {
             stmts.touchProviderMap.run(Date.now(), provider, providerTrackId);
             return { canonicalId: existing.track_id, confidence: existing.confidence, isNew: false };
         }
@@ -240,6 +280,9 @@ function _findExisting(meta) {
         // A different version word means a different recording, however close
         // the rest of the title reads. "… (Male)" must never match "… Duet".
         if (versionTag(c.norm_title) !== tag) continue;
+        // Nor does a different language, for the same reason — see
+        // languagesConflict above.
+        if (languagesConflict(meta.language, c.language)) continue;
         const ts = bigramSimilarity(nt, normText(c.norm_title));
         const as = bigramSimilarity(na, normText(c.artist_name ?? ''));
         if (ts < 0.72 || as < 0.45) continue;
@@ -271,7 +314,13 @@ function _create(meta) {
             meta.artworkUrl ?? null, meta.releaseYear ?? null, meta.genre ?? null, now, now);
     }
 
-    const seed = meta.isrc || `${nt}|${normText(meta.artist ?? '')}|${meta.durationMs ?? 0}`;
+    // Language is part of the seed for the same reason it is part of matching:
+    // the Tamil and Telugu cuts of one film song share their title, artist and
+    // duration exactly, so without it both hash to one id and the INSERT OR
+    // IGNORE below silently drops the second — leaving its provider mapping
+    // pointing at the first one's row.
+    const seed = meta.isrc
+        || `${nt}|${normText(meta.artist ?? '')}|${meta.durationMs ?? 0}|${normText(meta.language ?? '')}`;
     const trackId = makeTrackId(seed);
 
     stmts.insertTrack.run(
@@ -321,7 +370,20 @@ export function getProviderMappings(canonicalId) {
 }
 
 export function getProviderTrackId(canonicalId, provider) {
-    return stmts.getProviderTrackId.get(canonicalId, provider)?.provider_track_id ?? null;
+    return stmts.getProviderTrackIds.get(canonicalId, provider)?.provider_track_id ?? null;
+}
+
+/**
+ * Every provider track id mapped to a canonical track, best first.
+ *
+ * A canonical track can carry several mappings for one provider — the album
+ * cut and the single release of the same recording — and callers that only
+ * ever read the first one give up the moment that one release is unplayable.
+ */
+export function getProviderTrackIds(canonicalId, provider) {
+    return stmts.getProviderTrackIds.all(canonicalId, provider)
+        .map(r => r.provider_track_id)
+        .filter(Boolean);
 }
 
 export function getProviderAlbumId(canonicalAlbumId, provider = 'jiosaavn') {

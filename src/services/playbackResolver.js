@@ -10,6 +10,7 @@
 import {
     getTrack,
     getProviderTrackId,
+    getProviderTrackIds,
 } from './identityResolver.js';
 import { getSongById, searchSongsOnly, requestJsonWithTimeoutExported } from './saavnApi.js';
 import { searchSongsDirect, getSongDirect } from './jiosaavnDirect.js';
@@ -506,6 +507,37 @@ function _languageConflicts(wanted, candidate) {
     return got !== want;
 }
 
+/**
+ * Whether a provider song is plainly NOT the song that was tapped.
+ *
+ * The direct-by-ID lane trusts the catalog's provider mapping completely, and
+ * that trust is only as good as the mapping. A canonical track that was built
+ * before the identity resolver separated languages can still carry a mapping
+ * to another film version's recording, and existing catalogs are full of them —
+ * fixing the matcher does not rewrite rows that are already there. When such a
+ * mapping wins the race, the tap plays the wrong recording, or nothing when
+ * that recording is not playable.
+ *
+ * So the lane now checks what it got back against what the caller asked for and
+ * declines a plain contradiction, which hands the race to the search lane —
+ * which scores candidates against the same metadata and is language-aware.
+ *
+ * Deliberately generous. Only a *stated* disagreement counts: missing metadata
+ * on either side is never a contradiction, and a title that contains the other
+ * ("… (From "Film")") is the same song under a longer name.
+ */
+function _songContradicts(expected, song) {
+    if (!expected || !song) return false;
+
+    if (_languageConflicts(expected.language, song)) return true;
+
+    const want = normText(expected.title || '');
+    const got  = normText(song.name || song.title || '');
+    if (!want || !got) return false;
+    if (want === got || want.includes(got) || got.includes(want)) return false;
+    return bigramSimilarity(want, got) < 0.5;
+}
+
 function _scoreCandidate(targetTitle, targetArtist, candidate) {
     const candTitle = normText(candidate.name || candidate.title || '');
     const candArtist = normText(_songArtist(candidate));
@@ -529,17 +561,24 @@ function _scoreCandidate(targetTitle, targetArtist, candidate) {
  *
  * First lane to return a usable stream wins.
  */
-async function _resolveDirectById(songId, quality = DEFAULT_QUALITY, deadlineAt = null, excludeUrls = null) {
+async function _resolveDirectById(songId, quality = DEFAULT_QUALITY, deadlineAt = null, excludeUrls = null, expected = null) {
     if (!songId) return null;
 
     let jioId = songId;
     let gaanaId = songId;
+    // A canonical track can carry more than one mapping per provider. The
+    // second one is tried too, on its own lane, so a canonical id whose first
+    // mapping is unplayable still resolves instead of falling all the way
+    // through to search.
+    let altJioId = null;
 
     // If songId is a canonical ID (trk_...), look up mapped provider IDs from SQLite
     if (songId.startsWith('trk_')) {
         try {
-            const mappedJio = getProviderTrackId(songId, 'jiosaavn');
+            const mappedJioIds = getProviderTrackIds(songId, 'jiosaavn');
+            const mappedJio = mappedJioIds[0] ?? null;
             if (mappedJio) jioId = mappedJio;
+            if (mappedJioIds[1]) altJioId = mappedJioIds[1];
             const mappedGaana = getProviderTrackId(songId, 'gaana');
             if (mappedGaana) gaanaId = mappedGaana;
             if (!mappedJio && !mappedGaana) return null;
@@ -551,7 +590,11 @@ async function _resolveDirectById(songId, quality = DEFAULT_QUALITY, deadlineAt 
     // Probe-verify the chosen CDN URL (walking bitrates best→worst) before a
     // lane is allowed to win. Without this, an unverified 320kbps URL that the
     // CDN never encoded 404s straight through the 302 fast-path to the player.
-    const makeResult = (song, provider) => _firstPlayableCandidate(song, provider, { quality, deadlineAt, excludeUrls });
+    const makeResult = (song, provider) => (
+        _songContradicts(expected, song)
+            ? null
+            : _firstPlayableCandidate(song, provider, { quality, deadlineAt, excludeUrls })
+    );
 
     // Detail lookups get roughly half the remaining budget: whatever they
     // return still has to be probe-verified before the lane can win.
@@ -583,6 +626,15 @@ async function _resolveDirectById(songId, quality = DEFAULT_QUALITY, deadlineAt 
             } catch (_) {
                 return null;
             }
+        })(),
+
+        // Lane B2: a second JioSaavn mapping for the same canonical track, if
+        // the catalog holds one. Only exists when there is genuinely another
+        // release to try, so an ordinary track's fan-out is unchanged.
+        (async () => {
+            if (!altJioId) return null;
+            const song = await getSongDirect(altJioId, { timeoutMs: detailTimeoutMs }).catch(() => null);
+            return makeResult(song, 'jiosaavn');
         })(),
 
         // Lane C: Gaana direct API
@@ -868,8 +920,32 @@ export async function resolvePlayableStream(params = {}) {
     const deadlineAt = startTime + (isRecovery ? RECOVERY_BUDGET_MS : RESOLVE_BUDGET_MS);
 
     const workPromise = (async () => {
+        // What the caller believes it tapped. When it sent only an id — a queue
+        // entry, a prefetch, a resume — the catalog row for that id is the best
+        // available statement of it. Read once here rather than inside the
+        // search step, because the direct lane needs it too: it is what lets
+        // that lane recognise a mapping pointing at the wrong recording, and
+        // what gives the search lane a query to fall back to when it does.
+        let searchTitle = songTitle;
+        let searchArtist = songArtist;
+        let searchAlbum = songAlbum;
+        let searchLanguage = songLanguage;
+        if (!searchTitle && songId) {
+            let dbTrack = null;
+            try { dbTrack = getTrack(songId); } catch (_) {}
+            if (dbTrack) {
+                searchTitle = dbTrack.title || dbTrack.name || '';
+                searchArtist = dbTrack.artist_name || dbTrack.artist || '';
+                searchAlbum = dbTrack.album_name || dbTrack.album || '';
+                searchLanguage = searchLanguage || dbTrack.language || '';
+            }
+        }
+
         // Step A: Direct lookup by ID if available.
-        const directPromise = _resolveDirectById(songId, quality, deadlineAt, excludeUrls).catch(() => null);
+        const directPromise = _resolveDirectById(
+            songId, quality, deadlineAt, excludeUrls,
+            { title: searchTitle, language: searchLanguage },
+        ).catch(() => null);
 
         // Give the accurate lane a short head start of its own — but not on a
         // recovery resolve. There, the direct lane has already produced a URL
@@ -889,24 +965,10 @@ export async function resolvePlayableStream(params = {}) {
         // meant a slow provider consumed the entire budget and the search never
         // ran at all, which is what turned a resolvable track into a timeout.
         if (!winner) {
-            let searchTitle = songTitle;
-            let searchArtist = songArtist;
-            let searchAlbum = songAlbum;
-
-            if (!searchTitle && songId) {
-                let dbTrack = null;
-                try { dbTrack = getTrack(songId); } catch (_) {}
-                if (dbTrack) {
-                    searchTitle = dbTrack.title || dbTrack.name || '';
-                    searchArtist = dbTrack.artist || '';
-                    searchAlbum = dbTrack.album || '';
-                }
-            }
-
             const racers = [directPromise];
             if (searchTitle.length > 0 || searchArtist.length > 0) {
                 racers.push(
-                    _resolveBySearch(searchTitle, searchArtist, searchAlbum, quality, deadlineAt, excludeUrls, songLanguage)
+                    _resolveBySearch(searchTitle, searchArtist, searchAlbum, quality, deadlineAt, excludeUrls, searchLanguage)
                         .catch(() => null),
                 );
             }
