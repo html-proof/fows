@@ -49,6 +49,19 @@ export function normalizeSongMetadata(rawSong, options = {}) {
     } else if (typeof rawSong.artist_name === 'string') {
         artistName = rawSong.artist_name.trim();
         artistsArray = [{ id: null, name: artistName, role: 'primary_artists' }];
+    } else if (typeof rawSong.artists === 'string') {
+        // `artists` as a plain comma-separated string, which is what the
+        // trending feed emits. Every other spelling was handled and this one
+        // was not, so once trending started returning rows again each of them
+        // rendered as "Unknown Artist". Checked after artists.primary above, so
+        // the object form still wins where both could apply.
+        artistName = rawSong.artists.trim();
+        artistsArray = artistName
+            ? artistName.split(',')
+                .map(name => name.trim())
+                .filter(Boolean)
+                .map(name => ({ id: null, name, role: 'primary_artists' }))
+            : [];
     }
 
     // 4. Standardize Album
