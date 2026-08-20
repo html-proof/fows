@@ -298,11 +298,15 @@ export function invalidateStreamCache(trackKey, quality) {
     memoryStreamCache.delete(_cacheKey(trackKey, quality));
 }
 
-export function generateTrackKey(id, title = '', artist = '', album = '') {
+export function generateTrackKey(id, title = '', artist = '', album = '', language = '') {
     if (id && String(id).trim().length > 0) {
         return String(id).trim();
     }
-    const clean = normText(`${title} ${artist} ${album}`);
+    // Language is part of the identity when there is no id to key on. A film
+    // released in several languages reuses its songs' titles, so title + artist
+    // + album alone let the Tamil and Malayalam recordings share one cache
+    // entry — and whichever resolved first was then served for both.
+    const clean = normText(`${title} ${artist} ${album} ${language}`);
     let hash = 0;
     for (let i = 0; i < clean.length; i++) {
         hash = (Math.imul(31, hash) + clean.charCodeAt(i)) | 0;
@@ -480,6 +484,28 @@ function _songAlbum(song) {
         : (song?.album?.name ?? song?.albumName ?? '');
 }
 
+/**
+ * Whether a search candidate is in a DIFFERENT language than the one asked for.
+ *
+ * A film released in several languages reuses its title and its songs' titles
+ * across all of them, so title and artist alone cannot separate the Tamil
+ * recording from the Malayalam one — they score identically, and whichever the
+ * providers happened to return first won. Tapping a Tamil track then played the
+ * Malayalam one under the right name.
+ *
+ * Only a stated disagreement counts. A candidate the provider left unlabelled
+ * is not evidence of the wrong language and is still allowed through, so this
+ * can never empty a result set that would otherwise have resolved.
+ */
+function _languageConflicts(wanted, candidate) {
+    const norm = v => String(v ?? '').trim().toLowerCase();
+    const want = norm(wanted);
+    if (!want) return false;
+    const got = norm(candidate?.language);
+    if (!got) return false;
+    return got !== want;
+}
+
 function _scoreCandidate(targetTitle, targetArtist, candidate) {
     const candTitle = normText(candidate.name || candidate.title || '');
     const candArtist = normText(_songArtist(candidate));
@@ -617,7 +643,7 @@ async function _resolveDirectById(songId, quality = DEFAULT_QUALITY, deadlineAt 
  * for. Only the stream URL is ever taken from the result; the caller keeps
  * its own metadata untouched.
  */
-async function _runSearchRound(query, title, artist, quality, deadlineAt, excludeUrls) {
+async function _runSearchRound(query, title, artist, quality, deadlineAt, excludeUrls, language = '') {
     if (_expired(deadlineAt)) return null;
     try {
             const [jioRes, gaanaRes, proxyRes] = await Promise.allSettled([
@@ -641,16 +667,22 @@ async function _runSearchRound(query, title, artist, quality, deadlineAt, exclud
             const proxyCandidates = (proxyRes.status === 'fulfilled' && Array.isArray(proxyRes.value)) ? proxyRes.value : [];
 
             const scoredCandidates = [];
+            // A candidate that states a different language than the track being
+            // resolved is a different recording, however well its title scores.
+            const accept = cand => !_languageConflicts(language, cand);
             for (const cand of jioCandidates) {
+                if (!accept(cand)) continue;
                 const score = _scoreCandidate(title, artist, cand);
                 if (score >= 0.45) scoredCandidates.push({ cand, score, provider: 'jiosaavn' });
             }
             for (const cand of gaanaCandidates) {
+                if (!accept(cand)) continue;
                 const score = _scoreCandidate(title, artist, cand);
                 if (score >= 0.45) scoredCandidates.push({ cand, score, provider: 'gaana' });
             }
             // Proxy results already have pre-decrypted URLs — give them a small boost
             for (const cand of proxyCandidates) {
+                if (!accept(cand)) continue;
                 const score = _scoreCandidate(title, artist, cand);
                 if (score >= 0.45) scoredCandidates.push({ cand, score: score + 0.05, provider: 'jiosaavn' });
             }
@@ -702,7 +734,7 @@ async function _resolveBySearch(title, artist = '', album = '', quality = DEFAUL
 
     for (const query of primaryQueries) {
         if (_expired(deadlineAt)) return null;
-        const winner = await _runSearchRound(query, title, artist, quality, deadlineAt, excludeUrls);
+        const winner = await _runSearchRound(query, title, artist, quality, deadlineAt, excludeUrls, cleanLanguage);
         if (winner) return winner;
     }
 
@@ -728,7 +760,7 @@ async function _resolveBySearch(title, artist = '', album = '', quality = DEFAUL
     if (wideQueries.length === 0 || _expired(deadlineAt)) return null;
 
     const rounds = wideQueries.map(q =>
-        _runSearchRound(q, title, artist, quality, deadlineAt, excludeUrls),
+        _runSearchRound(q, title, artist, quality, deadlineAt, excludeUrls, cleanLanguage),
     );
     return _firstTruthy(rounds, deadlineAt);
 }
@@ -767,7 +799,7 @@ export async function resolvePlayableStream(params = {}) {
         throw new PlaybackResolveError('Song ID or title is required for resolution', 'BAD_REQUEST');
     }
 
-    const trackKey = generateTrackKey(songId, songTitle, songArtist, songAlbum);
+    const trackKey = generateTrackKey(songId, songTitle, songArtist, songAlbum, songLanguage);
     const lockKey = _cacheKey(trackKey, quality);
 
     // 1. Fast Memory Cache Check (Instant 0ms) — per quality tier

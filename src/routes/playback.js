@@ -93,7 +93,7 @@ router.get('/prefetch/:songId', (req, res) => {
     }
 
     // Check if already cached — if so, nothing to do.
-    const trackKey = generateTrackKey(songId, songTitle, songArtist, songAlbum);
+    const trackKey = generateTrackKey(songId, songTitle, songArtist, songAlbum, language);
     const alreadyCached = getCachedStream(trackKey, quality) || getCachedStream(songId, quality);
     res.status(alreadyCached ? 200 : 202).json({ success: true, cached: !!alreadyCached });
 
@@ -135,7 +135,7 @@ async function handlePlayback(req, res) {
         .map(u => String(u || '').trim())
         .filter(Boolean);
 
-    const trackKey = generateTrackKey(songId, songTitle, songArtist, songAlbum);
+    const trackKey = generateTrackKey(songId, songTitle, songArtist, songAlbum, language);
 
     // ── 1. Resolve CDN URL (cache-first) ──────────────────────────────────────
     let streamData = isRetry

@@ -329,7 +329,8 @@ async function handleStreamProxy(req, res) {
     const songArtist = req.query.artist || '';
     const songAlbum  = req.query.album  || '';
     const quality    = req.query.quality || '';
-    const trackKey   = generateTrackKey(songId, songTitle, songArtist, songAlbum);
+    const songLanguage = req.query.language || '';
+    const trackKey   = generateTrackKey(songId, songTitle, songArtist, songAlbum, songLanguage);
 
     // ── Resolve CDN URL (cache-first) ─────────────────────────────────────────
     let streamData = getCachedStream(trackKey, quality) || getCachedStream(songId, quality);
