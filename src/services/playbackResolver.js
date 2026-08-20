@@ -40,10 +40,22 @@ export class PlaybackResolveError extends Error {
 //   normal     96kbps  ~2.5 MB                 Normal   (default)
 //   high      160kbps  ~4.2 MB                 High
 //   max       320kbps  ~8.4 MB                 Very High
+// The selected tier is a CEILING on data spent, so each ladder exhausts every
+// bitrate at or below it before considering a larger one.
+//
+// They used to climb: `normal` tried 96 then 160, and `low` tried 48 then 96 —
+// so a track missing the requested bitrate was served a BIGGER file than the
+// setting allowed. Choosing 96 kbps and receiving 160 or 320 is what made one
+// song cost several megabytes.
+//
+// Bitrates above the ceiling stay on the ladder as a last resort, after every
+// smaller one has been tried: some tracks are only published at one bitrate,
+// and silence is worse than an oversized stream. Order within that tail is
+// ascending, so the overshoot is as small as it can be.
 export const QUALITY_LADDERS = {
-    low:    ['48kbps', '96kbps', '12kbps', '160kbps', '320kbps'],
-    normal: ['96kbps', '160kbps', '48kbps', '320kbps', '12kbps'],
-    high:   ['160kbps', '320kbps', '96kbps', '48kbps', '12kbps'],
+    low:    ['48kbps', '12kbps', '96kbps', '160kbps', '320kbps'],
+    normal: ['96kbps', '48kbps', '12kbps', '160kbps', '320kbps'],
+    high:   ['160kbps', '96kbps', '48kbps', '12kbps', '320kbps'],
     max:    ['320kbps', '160kbps', '96kbps', '48kbps', '12kbps'],
 };
 
@@ -402,7 +414,21 @@ async function _firstPlayableCandidate(song, provider, { maxCandidates = 3, time
     // Fast path: a URL that recently played needs no probe at all. This is the
     // repeat-play case, and skipping the probe removes a full round-trip from
     // the time between the tap and the first audio byte.
-    const known = candidates.find(c => _urlOutcome(c.url) === 'ok');
+    // Only the PREFERRED candidate may take this path.
+    //
+    // This used to scan the whole ladder for anything remembered as good, which
+    // let a bitrate the track had been played at moments earlier be returned
+    // without the requested one ever being probed. It went wrong in both
+    // directions: a 96 kbps setting was handed a remembered 320 kbps URL, and a
+    // 160 kbps setting was handed a remembered 96. The ladder's own order is
+    // the decision; the memory is only there to skip a probe, never to change
+    // the answer.
+    //
+    // The repeat-play case this exists for is unaffected: playing the same
+    // track again at the same quality asks for the same bitrate, which is
+    // candidates[0] and is exactly the URL remembered as good.
+    const preferred = candidates[0];
+    const known = _urlOutcome(preferred.url) === 'ok' ? preferred : null;
     if (known) {
         return {
             streamUrl: known.url,
