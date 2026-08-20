@@ -44,6 +44,11 @@ const PRIVATE_PREFIXES = [
 // so an edge hit can never hand out a URL the CDN has already stopped honouring.
 const PLAYBACK_REDIRECT_TTL = 240;
 
+// An HLS segment is immutable — one fixed slice of one track — so it is held
+// far longer than the redirect. The wrapped CDN URL and its token are part of
+// the cache key, so an expired token simply misses rather than serving stale.
+const HLS_SEGMENT_TTL = 3600;
+
 const EDGE_CACHE_TTLS = {
     '/api/songs':                 86400, // 24 h — song metadata is stable
     '/api/albums':                21600, // 6 h
@@ -157,6 +162,32 @@ export default {
             }
 
             const originResponse = await forwardToBackend(request, url);
+
+            // An HLS track answers 200 with a flattened playlist instead of a
+            // redirect, and rebuilding it is the slowest thing on the path —
+            // measured at 3.3s against 0.3s for a progressive resolve. Caching
+            // it for the same short window turns the worst first-play in the
+            // catalogue into an edge read. Same TTL as the redirect, so it
+            // cannot outlive the segment URLs it names.
+            if (
+                originResponse.status === 200 &&
+                (originResponse.headers.get('Content-Type') ?? '').includes('mpegurl')
+            ) {
+                const playlist = await originResponse.clone().text();
+                const headers = new Headers(originResponse.headers);
+                headers.set('Cache-Control', `public, max-age=${PLAYBACK_REDIRECT_TTL}, s-maxage=${PLAYBACK_REDIRECT_TTL}`);
+                headers.set('Access-Control-Allow-Origin', '*');
+                headers.delete('Content-Encoding');
+                headers.delete('Content-Length');
+                ctx.waitUntil(redirectCache.put(
+                    redirectKey,
+                    new Response(playlist, { status: 200, headers }),
+                ));
+                const out = new Response(playlist, { status: 200, headers });
+                out.headers.set('X-Cache', 'MISS');
+                return out;
+            }
+
             if (originResponse.status === 302) {
                 const location = originResponse.headers.get('Location');
                 if (location) {
@@ -173,6 +204,47 @@ export default {
                 }
             }
             return originResponse;
+        }
+
+        // 1c. HLS segments, cached at the edge.
+        //
+        // A segment is immutable: the CDN URL it wraps names one fixed slice of
+        // one track. Uncached, every six seconds of audio travelled edge →
+        // origin → CDN and back, ~0.6s a segment over 42 segments, all of it
+        // repeated for every listener and every replay. That is the stall
+        // between "playing" and actually hearing anything on an HLS track.
+        //
+        // Keyed on the full URL, so the wrapped CDN URL and its token are part
+        // of the key and no two segments can collide. Range requests pass
+        // through untouched.
+        if (
+            request.method === 'GET' &&
+            !hasRangeHeader &&
+            pathname.startsWith('/api/stream/chunk')
+        ) {
+            const chunkKey = new Request(url.toString());
+            const chunkCache = caches.default;
+            const cachedChunk = await chunkCache.match(chunkKey);
+            if (cachedChunk) {
+                const hit = new Response(cachedChunk.body, cachedChunk);
+                hit.headers.set('X-Cache', 'HIT');
+                hit.headers.set('Access-Control-Allow-Origin', '*');
+                return hit;
+            }
+
+            const chunkResponse = await forwardToBackend(request, url);
+            if (chunkResponse.status === 200) {
+                const headers = new Headers(chunkResponse.headers);
+                headers.set('Cache-Control', `public, max-age=${HLS_SEGMENT_TTL}, s-maxage=${HLS_SEGMENT_TTL}`);
+                headers.set('Access-Control-Allow-Origin', '*');
+                headers.delete('Content-Encoding');
+                const [toCache, toReturn] = chunkResponse.body.tee();
+                ctx.waitUntil(chunkCache.put(chunkKey, new Response(toCache, { status: 200, headers })));
+                const out = new Response(toReturn, { status: 200, headers });
+                out.headers.set('X-Cache', 'MISS');
+                return out;
+            }
+            return chunkResponse;
         }
 
         // 2. Only cache GET requests without Range headers; pass everything else straight through
