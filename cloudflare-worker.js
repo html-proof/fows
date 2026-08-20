@@ -163,10 +163,21 @@ export default {
         // The entry is deleted rather than refreshed: the very next plain tap
         // repopulates it from the origin, which by then knows better.
         if (isPlaybackTrackRoute && (url.searchParams.has('retry') || url.searchParams.has('exclude'))) {
-            const staleUrl = new URL(url.toString());
-            staleUrl.searchParams.delete('retry');
-            staleUrl.searchParams.delete('exclude');
-            ctx.waitUntil(caches.default.delete(new Request(staleUrl.toString())));
+            // Built by trimming the raw query string, never by re-serialising
+            // URLSearchParams. A round trip through URLSearchParams rewrites
+            // the encoding it did not author — spaces become `+`, brackets and
+            // quotes get percent-escaped — and a title like
+            // `His Name is John (From "Dhruva Natchathiram")` comes back a
+            // different string. The cache key is that string, so the delete
+            // silently matched nothing and the stale redirect survived. The
+            // client's own bytes are what was stored, so they are what must be
+            // handed back.
+            const kept = url.search.slice(1).split('&').filter((pair) => {
+                const key = pair.split('=')[0];
+                return key !== 'retry' && key !== 'exclude';
+            });
+            const staleKey = url.origin + url.pathname + (kept.length ? `?${kept.join('&')}` : '');
+            ctx.waitUntil(caches.default.delete(new Request(staleKey)));
         }
 
         if (
