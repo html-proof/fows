@@ -39,6 +39,11 @@ const PRIVATE_PREFIXES = [
     '/api/v1/playback',   // new clean playback gateway — never cache audio proxy
 ];
 
+// How long a resolved playback redirect may be served from the edge. Kept well
+// under the origin's 15-minute stream-URL cache and the CDN's token lifetime,
+// so an edge hit can never hand out a URL the CDN has already stopped honouring.
+const PLAYBACK_REDIRECT_TTL = 240;
+
 const EDGE_CACHE_TTLS = {
     '/api/songs':                 86400, // 24 h — song metadata is stable
     '/api/albums':                21600, // 6 h
@@ -113,6 +118,61 @@ export default {
                     'Access-Control-Max-Age': '86400',
                 },
             });
+        }
+
+        // 1b. Playback redirects, cached at the edge.
+        //
+        // This route was excluded as an "audio proxy", and that was right when
+        // the gateway streamed the bytes itself. It no longer does: for a plain
+        // GET it resolves the track and answers with a 302 to the CDN. That
+        // redirect is a few hundred bytes, and it was costing a full round trip
+        // to the origin on every single tap — the origin being far from most
+        // listeners, while a Cloudflare PoP is not. It is the largest fixed cost
+        // between tapping a song and hearing it.
+        //
+        // Deliberately narrow:
+        //   * GET without Range only. Range requests and HEAD still pass
+        //     straight through, so byte serving is untouched.
+        //   * Only a 302 is stored. An HLS answer is a 200 with a playlist body
+        //     whose chunk URLs have their own lifetimes, and is left alone.
+        //   * The TTL is far shorter than both the origin's 15-minute URL cache
+        //     and the CDN's own token lifetime, so a cached redirect cannot
+        //     outlive the URL it points at.
+        //   * `quality` rides in the query string, so tiers never share a key.
+        if (
+            request.method === 'GET' &&
+            !hasRangeHeader &&
+            pathname.startsWith('/api/v1/playback/') &&
+            !pathname.startsWith('/api/v1/playback/prefetch/') &&
+            !pathname.startsWith('/api/v1/playback/diagnostics/')
+        ) {
+            const redirectKey = new Request(url.toString());
+            const redirectCache = caches.default;
+            const cachedRedirect = await redirectCache.match(redirectKey);
+            if (cachedRedirect) {
+                const hit = new Response(cachedRedirect.body, cachedRedirect);
+                hit.headers.set('X-Cache', 'HIT');
+                hit.headers.set('Access-Control-Allow-Origin', '*');
+                return hit;
+            }
+
+            const originResponse = await forwardToBackend(request, url);
+            if (originResponse.status === 302) {
+                const location = originResponse.headers.get('Location');
+                if (location) {
+                    const headers = new Headers(originResponse.headers);
+                    headers.set('Cache-Control', `public, max-age=${PLAYBACK_REDIRECT_TTL}, s-maxage=${PLAYBACK_REDIRECT_TTL}`);
+                    headers.set('Access-Control-Allow-Origin', '*');
+                    // Built fresh rather than cloned: a 302 carries no body, and
+                    // Response.redirect() would strip the headers set above.
+                    const toCache = new Response(null, { status: 302, headers });
+                    ctx.waitUntil(redirectCache.put(redirectKey, toCache.clone()));
+                    const out = new Response(null, { status: 302, headers });
+                    out.headers.set('X-Cache', 'MISS');
+                    return out;
+                }
+            }
+            return originResponse;
         }
 
         // 2. Only cache GET requests without Range headers; pass everything else straight through
