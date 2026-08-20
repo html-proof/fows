@@ -55,6 +55,79 @@ const TRAILING_QUERY_NOISE = new Set([
     'track',
 ]);
 
+// ─── Field-scoped search ──────────────────────────────────────────────────────
+//
+// A listener looking for one particular recording knows more than its title —
+// who sang it, which film it is from, what language it is in — and until now
+// there was no way to say so. Everything typed went into one string and the
+// providers guessed. These prefixes let the query carry the facets explicitly:
+//
+//   title:malare artist:"vijay yesudas" movie:premam language:malayalam
+//
+// Every facet is optional and free to appear in any order. Quotes group a
+// multi-word value; without them the value runs to the next facet or the end
+// of the query. Anything typed outside a facet stays the title, so an ordinary
+// search is parsed exactly as it always was.
+const QUERY_FACETS = new Map([
+    ['title', 'title'], ['song', 'title'], ['track', 'title'],
+    ['artist', 'artist'], ['singer', 'artist'], ['by', 'artist'],
+    ['composer', 'artist'], ['music', 'artist'],
+    ['movie', 'movie'], ['film', 'movie'], ['album', 'movie'], ['ost', 'movie'],
+    ['language', 'language'], ['lang', 'language'],
+    ['year', 'year'],
+]);
+
+const FACET_KEYS = [...QUERY_FACETS.keys()].join('|');
+// Value runs to the next facet or the end of the query, so a multi-word value
+// needs no quotes: `movie:dhruva natchathiram lang:tamil` parses as both.
+const FACET_PATTERN = new RegExp(
+    String.raw`\b(${FACET_KEYS})\s*:\s*("[^"]*"|'[^']*'|\S+(?:\s+(?!(?:${FACET_KEYS})\s*:)\S+)*)`,
+    'gi',
+);
+
+/**
+ * Pull `facet:value` pairs out of a query, returning them alongside whatever
+ * text was left over. Returns nulls and the untouched query when the user typed
+ * no facets at all, which is the overwhelmingly common case.
+ */
+export function extractQueryFacets(rawQuery) {
+    const query = String(rawQuery ?? '');
+    const found = { title: null, artist: null, movie: null, language: null, year: null };
+    if (!query.includes(':')) return { facets: found, rest: query.trim(), hasFacets: false };
+
+    let hasFacets = false;
+    const rest = query.replace(FACET_PATTERN, (_match, key, value) => {
+        const field = QUERY_FACETS.get(String(key).toLowerCase());
+        const cleaned = String(value).replace(/^["']|["']$/g, '').replace(/\s+/g, ' ').trim();
+        if (!field || !cleaned) return ' ';
+        hasFacets = true;
+        // First occurrence of a facet wins, so a repeated one cannot quietly
+        // overwrite what the user typed first.
+        if (!found[field]) found[field] = cleaned;
+        return ' ';
+    }).replace(/\s+/g, ' ').trim();
+
+    return { facets: found, rest, hasFacets };
+}
+
+/**
+ * The natural-language form of the artist facet: "malare by vijay yesudas".
+ *
+ * Deliberately cautious. It only splits when what follows "by" is at least two
+ * words, because performer credits practically always are and song titles that
+ * merely contain the word ("Stand By Me", "Drive By") do not survive that test.
+ * The original query is searched as a variant regardless, so even a wrong split
+ * cannot cost the user their result.
+ */
+function splitNaturalArtist(query) {
+    const m = String(query ?? '').match(/^(.{2,}?)\s+by\s+(.+)$/i);
+    if (!m) return null;
+    const title = m[1].trim();
+    const artist = m[2].trim();
+    if (!title || artist.split(/\s+/).filter(Boolean).length < 2) return null;
+    return { title, artist };
+}
+
 // ─── Query Analysis ───────────────────────────────────────────────────────────
 
 /**
@@ -68,6 +141,42 @@ const TRAILING_QUERY_NOISE = new Set([
  *   "blinding lights remix"    → { cleanTitle: "blinding lights", versionHints: ["remix"] }
  */
 export function analyzeQuery(rawQuery) {
+    // Facets the user stated outright are authority, not hints: they are what
+    // was typed, so nothing inferred below may overrule them. Everything left
+    // over is analysed exactly as an unfacetted query always was, which is why
+    // an ordinary search behaves identically to before.
+    const { facets, rest, hasFacets } = extractQueryFacets(rawQuery);
+    const plain = hasFacets
+        ? [facets.title, rest, facets.movie, facets.language].filter(Boolean).join(' ')
+        : String(rawQuery ?? '');
+
+    const analysis = _analyzePlainQuery(plain);
+
+    const statedLanguage = facets.language
+        ? (LANGUAGE_MAP.get(String(facets.language).toLowerCase()) ?? String(facets.language).toLowerCase())
+        : null;
+
+    // "malare by vijay yesudas" — only consulted when no artist was stated, and
+    // only when it splits cleanly. See splitNaturalArtist.
+    const natural = facets.artist ? null : splitNaturalArtist(analysis.cleanTitle);
+
+    return {
+        ...analysis,
+        cleanTitle: facets.title || natural?.title || analysis.cleanTitle,
+        artist: facets.artist || natural?.artist || null,
+        movie: facets.movie || analysis.movie,
+        language: statedLanguage || analysis.language,
+        year: facets.year || null,
+        hasFacets,
+        // Scoring and the widest search variant both read this, so it must be
+        // plain searchable text — never the `artist:`/`movie:` syntax itself.
+        originalQuery: hasFacets
+            ? [facets.title || rest, facets.artist, facets.movie, statedLanguage].filter(Boolean).join(' ')
+            : analysis.originalQuery,
+    };
+}
+
+function _analyzePlainQuery(rawQuery) {
     const query = String(rawQuery ?? '').replace(/\s+/g, ' ').trim();
     if (!query) {
         return { originalQuery: '', cleanTitle: '', language: null, movie: null, versionHints: [], isVersionSearch: false, isKnownItemSearch: false, intent: 'EMPTY', likelyArtist: false };
@@ -205,7 +314,7 @@ function stripTrailingQueryNoise(value) {
  * The caller searches all variants in parallel and merges results.
  */
 export function buildSearchVariants(analysis) {
-    const { cleanTitle, language, movie, originalQuery } = analysis;
+    const { cleanTitle, language, movie, originalQuery, artist } = analysis;
     const variants = [];
 
     const push = (q) => {
@@ -215,11 +324,21 @@ export function buildSearchVariants(analysis) {
         }
     };
 
-    // Most specific → least specific
+    // Most specific → least specific. Each facet the user actually stated
+    // narrows the query, so the combinations naming more of them are asked
+    // first — a provider given "malare premam malayalam" answers with the one
+    // recording meant, where "malare" alone answers with a dozen.
+    if (artist && movie && language) push(`${cleanTitle} ${artist} ${movie} ${language}`);
+    if (artist && movie) push(`${cleanTitle} ${artist} ${movie}`);
+    if (artist && language) push(`${cleanTitle} ${artist} ${language}`);
     if (movie && language) push(`${cleanTitle} ${movie} ${language}`);
+    if (artist) push(`${cleanTitle} ${artist}`);
     if (movie) push(`${cleanTitle} ${movie}`);
     if (language) push(`${cleanTitle} ${language}`);
     push(cleanTitle);
+    // The performer's own catalogue, for when the title is spelled differently
+    // in the provider's index than the listener spelled it.
+    if (artist && movie) push(`${artist} ${movie}`);
 
     // Also try original query (might differ from cleanTitle)
     if (originalQuery !== cleanTitle) push(originalQuery);
@@ -567,6 +686,29 @@ export function scoreSong(song, analysis) {
         score -= 45; // enough to push remixes/covers behind originals but not remove them
     } else if (songHasVersion && isVersionSearch) {
         score += 10; // bonus if user explicitly wants this version type
+    }
+
+    // ── Artist match ─────────────────────────────────────────────────────
+    // Only when the listener actually named a performer. An unstated artist
+    // leaves scoring exactly as it was, so ordinary searches do not shift.
+    const statedArtist = analysis?.artist ? normText(analysis.artist) : null;
+    if (statedArtist && songArtist) {
+        if (songArtist === statedArtist || songArtist.includes(statedArtist) || statedArtist.includes(songArtist)) {
+            score += 30;
+        } else {
+            const artistSim = bigramSimilarity(songArtist, statedArtist);
+            if (artistSim > 0.5) score += artistSim * 22;
+            // A stated performer the candidate plainly is not is evidence
+            // against it — enough to sort it below the real match, never enough
+            // to drop it, since credits are spelled many ways.
+            else score -= 20;
+        }
+    }
+
+    // ── Year match ───────────────────────────────────────────────────────
+    const statedYear = analysis?.year ? String(analysis.year).trim() : null;
+    if (statedYear && song?.year && String(song.year).trim() === statedYear) {
+        score += 12;
     }
 
     // ── Language match ───────────────────────────────────────────────────
