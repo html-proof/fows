@@ -134,6 +134,7 @@ const stmts = {
     getStreamCache:   db.prepare('SELECT url, quality, expires_at FROM stream_cache WHERE track_id = ? AND provider = ?'),
     upsertStreamCache:db.prepare('INSERT OR REPLACE INTO stream_cache (track_id, provider, url, quality, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)'),
     delStreamCache:   db.prepare('DELETE FROM stream_cache WHERE track_id = ? AND provider = ?'),
+    delProviderMap:   db.prepare('DELETE FROM provider_maps WHERE provider = ? AND provider_track_id = ?'),
 };
 
 // ─── ID helpers ───────────────────────────────────────────────────────────────
@@ -142,6 +143,35 @@ function sha1hex(s) { return createHash('sha1').update(s).digest('hex'); }
 function makeTrackId(seed)         { return 'trk_'  + sha1hex(seed).slice(0, 12); }
 function makeArtistId(normName)    { return 'art_'  + sha1hex(normName).slice(0, 12); }
 function makeAlbumId(artId, title) { return 'alb_'  + sha1hex(artId + ':' + normText(title)).slice(0, 12); }
+
+// ─── Version tags ─────────────────────────────────────────────────────────────
+
+/**
+ * Words that name a *distinct recording* of the same composition. A soundtrack
+ * routinely ships "Song (Male)", "Song (Female)" and "Song Duet" -- separate
+ * recordings, separate durations, separate streams. Their titles differ by one
+ * token, so title similarity alone rates them ~0.86 and the matcher used to
+ * fold them onto a single canonical track. Everything downstream keys off that
+ * id: the album screen highlighted both rows as playing, and tapping the second
+ * one resolved to the first one's stream.
+ */
+const VERSION_TAGS = new Set([
+    'male', 'female', 'duet', 'solo', 'chorus',
+    'remix', 'cover', 'live', 'unplugged', 'acoustic', 'instrumental',
+    'karaoke', 'reprise', 'redux', 'rework', 'mashup', 'tribute',
+    'remastered', 'extended', 'nightcore', 'lofi', 'slowed', 'reverb',
+    'sad', 'happy', 'theme',
+]);
+
+/**
+ * The set of version words in a title, as a stable comparable string.
+ * Two titles with different tags are never the same recording; two titles with
+ * the same tag (including none at all) fall through to normal similarity.
+ */
+function versionTag(title) {
+    const tags = normText(title).split(' ').filter(w => VERSION_TAGS.has(w));
+    return [...new Set(tags)].sort().join('+');
+}
 
 // ─── Core: resolve or create ──────────────────────────────────────────────────
 
@@ -156,11 +186,18 @@ function makeAlbumId(artId, title) { return 'alb_'  + sha1hex(artId + ':' + norm
  * @returns {{ canonicalId: string, confidence: number, isNew: boolean }}
  */
 export function resolveOrCreate(meta, provider, providerTrackId, providerAlbumId = null, providerArtistId = null) {
-    // Already mapped?
+    // Already mapped? Trust it only if the mapped track is the same version of
+    // the song. Mappings written before the version check existed can point a
+    // "(Male)" provider track at the canonical "Duet" row; re-resolving them
+    // repairs the catalog in place instead of serving the wrong id forever.
     const existing = stmts.getProviderMap.get(provider, providerTrackId);
     if (existing) {
-        stmts.touchProviderMap.run(Date.now(), provider, providerTrackId);
-        return { canonicalId: existing.track_id, confidence: existing.confidence, isNew: false };
+        const mapped = stmts.getTrack.get(existing.track_id);
+        if (!mapped || versionTag(mapped.title) === versionTag(meta.title ?? '')) {
+            stmts.touchProviderMap.run(Date.now(), provider, providerTrackId);
+            return { canonicalId: existing.track_id, confidence: existing.confidence, isNew: false };
+        }
+        stmts.delProviderMap.run(provider, providerTrackId);
     }
 
     const found = _findExisting(meta);
@@ -196,8 +233,13 @@ function _findExisting(meta) {
     // prefix+\uffff) is exactly the set LIKE 'prefix%' matched.
     const candidates = stmts.getCandidates.all(prefix, `${prefix}\uffff`);
 
+    const tag = versionTag(meta.title ?? '');
+
     let best = null, bestScore = -1;
     for (const c of candidates) {
+        // A different version word means a different recording, however close
+        // the rest of the title reads. "… (Male)" must never match "… Duet".
+        if (versionTag(c.norm_title) !== tag) continue;
         const ts = bigramSimilarity(nt, normText(c.norm_title));
         const as = bigramSimilarity(na, normText(c.artist_name ?? ''));
         if (ts < 0.72 || as < 0.45) continue;
@@ -314,6 +356,14 @@ export function invalidateStreamCache(canonicalId, provider = 'jiosaavn') {
  * @returns {object[]} - same songs with `canonicalId` string added
  */
 export function attachCanonicalIds(songs) {
+    // One payload must never hand two rows the same canonical id: downstream
+    // normalisation promotes canonicalId to the client-facing `id`, and two
+    // list rows sharing an id break selection, highlighting and playback (the
+    // player treats the second tap as "already playing" and does nothing).
+    // If the resolver still collapses a pair, the first row keeps the canonical
+    // id and the rest fall back to their provider id, which resolves fine.
+    const claimed = new Set();
+
     const attach = db.transaction((songs) => songs.map(song => {
         const provId = song.id ?? song.songId ?? '';
         if (!provId) return { ...song, canonicalId: null };
@@ -333,6 +383,9 @@ export function attachCanonicalIds(songs) {
                 'itunes', String(song.itunesMeta.id),
             );
         }
+
+        if (claimed.has(canonicalId)) return { ...song, canonicalId: null };
+        claimed.add(canonicalId);
 
         return { ...song, canonicalId };
     }));
