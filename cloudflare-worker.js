@@ -1,7 +1,7 @@
 /**
  * Cloudflare Worker — Edge proxy for fows.onrender.com
  *
- * Deploy pipeline test: 2026-08-18
+ * Deploy pipeline test: 2026-08-20
  *
  * What this does:
  *  - Routes all requests through Cloudflare's 300+ global edge nodes
@@ -20,7 +20,7 @@
  *  5. Update baseUrl in lib/services/api_service.dart to your workers.dev URL
  */
 
-const BACKEND_URL = 'https://fows.onrender.com';
+const BACKEND_URL = 'https://fows-dq4i.onrender.com';
 
 // Routes that must never be cached at the edge (user-specific, stream resolving, or proxy audio)
 const PRIVATE_PREFIXES = [
