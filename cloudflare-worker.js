@@ -144,12 +144,35 @@ export default {
         //     and the CDN's own token lifetime, so a cached redirect cannot
         //     outlive the URL it points at.
         //   * `quality` rides in the query string, so tiers never share a key.
+        const isPlaybackTrackRoute =
+            pathname.startsWith('/api/v1/playback/') &&
+            !pathname.startsWith('/api/v1/playback/prefetch/') &&
+            !pathname.startsWith('/api/v1/playback/diagnostics/');
+
+        // A client saying "that stream does not play" must also clear what the
+        // edge is holding for it.
+        //
+        // `retry=1` carries its own query string, so it misses the cache and
+        // reaches the origin, which bans the dead URL and resolves another —
+        // and the origin's own caches are dropped in the same breath. The edge
+        // was the one layer nobody told. It went on serving the cached redirect
+        // to the dead URL for the rest of its four minutes, to this listener
+        // and to every other one, so an ordinary tap kept failing after the
+        // failover had already found a working source.
+        //
+        // The entry is deleted rather than refreshed: the very next plain tap
+        // repopulates it from the origin, which by then knows better.
+        if (isPlaybackTrackRoute && (url.searchParams.has('retry') || url.searchParams.has('exclude'))) {
+            const staleUrl = new URL(url.toString());
+            staleUrl.searchParams.delete('retry');
+            staleUrl.searchParams.delete('exclude');
+            ctx.waitUntil(caches.default.delete(new Request(staleUrl.toString())));
+        }
+
         if (
             request.method === 'GET' &&
             !hasRangeHeader &&
-            pathname.startsWith('/api/v1/playback/') &&
-            !pathname.startsWith('/api/v1/playback/prefetch/') &&
-            !pathname.startsWith('/api/v1/playback/diagnostics/')
+            isPlaybackTrackRoute
         ) {
             const redirectKey = new Request(url.toString());
             const redirectCache = caches.default;
@@ -163,6 +186,12 @@ export default {
 
             const originResponse = await forwardToBackend(request, url);
 
+            // A retry's answer is deliberately narrower than the general one —
+            // it is the best source *excluding* what this client just saw fail
+            // — so it must never become the answer everyone else gets.
+            const isRecoveryRequest =
+                url.searchParams.has('retry') || url.searchParams.has('exclude');
+
             // An HLS track answers 200 with a flattened playlist instead of a
             // redirect, and rebuilding it is the slowest thing on the path —
             // measured at 3.3s against 0.3s for a progressive resolve. Caching
@@ -170,6 +199,7 @@ export default {
             // catalogue into an edge read. Same TTL as the redirect, so it
             // cannot outlive the segment URLs it names.
             if (
+                !isRecoveryRequest &&
                 originResponse.status === 200 &&
                 (originResponse.headers.get('Content-Type') ?? '').includes('mpegurl')
             ) {
@@ -199,7 +229,9 @@ export default {
                     // Built fresh rather than cloned: a 302 carries no body, and
                     // Response.redirect() would strip the headers set above.
                     const toCache = new Response(null, { status: 302, headers });
-                    ctx.waitUntil(redirectCache.put(redirectKey, toCache.clone()));
+                    if (!isRecoveryRequest) {
+                        ctx.waitUntil(redirectCache.put(redirectKey, toCache.clone()));
+                    }
                     const out = new Response(null, { status: 302, headers });
                     out.headers.set('X-Cache', 'MISS');
                     return out;
