@@ -222,7 +222,7 @@ const inFlightResolves = new Map();
 // The budget is a ceiling on failure, not a target: a cold resolve should land
 // in ~1-3s. Every stage below is either raced or hedged so the ceiling is the
 // slowest single upstream call, never the sum of them.
-const RESOLVE_BUDGET_MS = 5000;
+const RESOLVE_BUDGET_MS = 8000;
 
 // Direct-by-ID is the accurate lane, so it gets a head start — but only a short
 // one. Past this point the search lane is started alongside it and whichever
