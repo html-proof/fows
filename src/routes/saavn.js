@@ -581,11 +581,39 @@ router.get('/search', async (req, res) => {
             albumMatches.sort((left, right) => left.rank - right.rank);
             const injectLanguage = pickInjectLanguage(albumMatches, targetLanguage);
 
-            const albumsToFetch = albumMatches
-                .filter(entry => languageMatches(entry.album?.language, injectLanguage))
-                .map(entry => entry.album)
-                .filter(alb => alb && (alb.id || alb.url))
-                .slice(0, ALBUM_INJECT_LIMIT);
+            // One title can name a DIFFERENT FILM in each language: "Pattalam"
+            // is both a Tamil film and a Malayalam one, with entirely separate
+            // soundtracks. Settling on a single language fetched one of them and
+            // dropped the other outright — the Tamil film arrived complete at
+            // 6/6 tracks while the Malayalam film showed 4/6, and those four
+            // only because the ordinary search lane happened to find them.
+            //
+            // An EXACT title match is a film genuinely called this, so one is
+            // taken per language. Fuzzy matches stay restricted to the query's
+            // language, which is what keeps a merely similar name from dragging
+            // another language's album in — the case the language filter was
+            // added for. Each album's tracks are still filtered to that album's
+            // own language further down, so no album's tag ever mixes languages.
+            const seenLanguages = new Set();
+            const picked = [];
+            for (const entry of albumMatches) {
+                const album = entry.album;
+                if (!album || !(album.id || album.url)) continue;
+
+                const albumLanguage = normalizeLanguage(album.language);
+                if (entry.rank === 0) {
+                    // Exact title. One album per language, best-ranked first.
+                    const key = albumLanguage || '(unknown)';
+                    if (seenLanguages.has(key)) continue;
+                    seenLanguages.add(key);
+                } else if (!languageMatches(album.language, injectLanguage)) {
+                    continue;
+                }
+
+                picked.push(album);
+                if (picked.length >= ALBUM_INJECT_LIMIT) break;
+            }
+            const albumsToFetch = picked;
 
             if (albumsToFetch.length > 0) {
                 // Fetched together under one shared budget, so reading several
@@ -609,9 +637,17 @@ router.get('/search', async (req, res) => {
                     // the one this album (and the query) is in. Rows the
                     // provider left unlabelled are kept: an unknown language is
                     // not evidence of a wrong one.
-                    const detailLanguage = injectLanguage
-                        || normalizeLanguage(detail?.data?.language)
-                        || dominantSongLanguage(list);
+                    // Each album is filtered against ITS OWN language, not the
+                    // query's. Now that a title naming a film in several
+                    // languages fetches one album per language, a single shared
+                    // language here would have thrown away every track of every
+                    // album but one — the exact loss this injection exists to
+                    // prevent. The album's stated language comes first, its
+                    // tracks' dominant language second, and the query's only as
+                    // a last resort for an album that states neither.
+                    const detailLanguage = normalizeLanguage(detail?.data?.language)
+                        || dominantSongLanguage(list)
+                        || injectLanguage;
                     let kept = list.filter(song => languageMatches(song?.language, detailLanguage));
                     if (kept.length === 0) {
                         // The album row and its tracks disagree about language.
