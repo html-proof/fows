@@ -179,6 +179,7 @@ export default {
                 headers.set('Access-Control-Allow-Origin', '*');
                 headers.delete('Content-Encoding');
                 headers.delete('Content-Length');
+                headers.delete('Vary');
                 ctx.waitUntil(redirectCache.put(
                     redirectKey,
                     new Response(playlist, { status: 200, headers }),
@@ -194,6 +195,7 @@ export default {
                     const headers = new Headers(originResponse.headers);
                     headers.set('Cache-Control', `public, max-age=${PLAYBACK_REDIRECT_TTL}, s-maxage=${PLAYBACK_REDIRECT_TTL}`);
                     headers.set('Access-Control-Allow-Origin', '*');
+                    headers.delete('Vary');
                     // Built fresh rather than cloned: a 302 carries no body, and
                     // Response.redirect() would strip the headers set above.
                     const toCache = new Response(null, { status: 302, headers });
@@ -238,6 +240,7 @@ export default {
                 headers.set('Cache-Control', `public, max-age=${HLS_SEGMENT_TTL}, s-maxage=${HLS_SEGMENT_TTL}`);
                 headers.set('Access-Control-Allow-Origin', '*');
                 headers.delete('Content-Encoding');
+                headers.delete('Vary');
                 const [toCache, toReturn] = chunkResponse.body.tee();
                 ctx.waitUntil(chunkCache.put(chunkKey, new Response(toCache, { status: 200, headers })));
                 const out = new Response(toReturn, { status: 200, headers });
@@ -288,6 +291,14 @@ export default {
 
                     const cachedHeaders = new Headers(clone.headers);
                     cachedHeaders.delete('Content-Encoding');
+                    // The origin answers `Vary: Origin, Accept-Encoding`, and
+                    // keeping it made a stored entry match only requests whose
+                    // Origin and Accept-Encoding matched the one that filled it
+                    // — so repeat searches kept missing a cache that already
+                    // held them. The key here is URL-only by deliberate design
+                    // (see the comment where it is built), and the body is
+                    // stored decoded, so neither header can change the answer.
+                    cachedHeaders.delete('Vary');
                     cachedHeaders.set('Content-Type', 'application/json; charset=utf-8');
                     cachedHeaders.set(
                         'Cache-Control',
