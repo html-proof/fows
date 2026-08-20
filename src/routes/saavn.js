@@ -548,6 +548,13 @@ router.get('/search', async (req, res) => {
                 return matches;
             };
 
+            // The language the query is actually about. An explicit token in
+            // the query wins ("premam malayalam"); otherwise it is read off the
+            // search rows whose title or album already matches the query, which
+            // is the only evidence available before any album is fetched.
+            const targetLanguage = normalizeLanguage(analysis.language)
+                || inferQueryLanguage(finalRanked, titleNorm);
+
             let albumMatches = collectMatchingAlbums(albumSearchResults);
 
             // Nothing matched in the proxy result — run direct API and
@@ -565,8 +572,17 @@ router.get('/search', async (req, res) => {
                 }
             }
 
+            // Album titles are not unique across languages: a Malayalam film
+            // and an unrelated Hindi album can carry the same name, and both
+            // match the title test above. Fetching both mixes a second
+            // language's songs into the film's track list, which is exactly
+            // what "the album tag contains other-language songs" describes.
+            // Keep only the language the query is about.
+            albumMatches.sort((left, right) => left.rank - right.rank);
+            const injectLanguage = pickInjectLanguage(albumMatches, targetLanguage);
+
             const albumsToFetch = albumMatches
-                .sort((left, right) => left.rank - right.rank)
+                .filter(entry => languageMatches(entry.album?.language, injectLanguage))
                 .map(entry => entry.album)
                 .filter(alb => alb && (alb.id || alb.url))
                 .slice(0, ALBUM_INJECT_LIMIT);
@@ -585,7 +601,26 @@ router.get('/search', async (req, res) => {
                 const albumSongs = [];
                 for (const detail of (details ?? [])) {
                     const list = detail?.data?.songs ?? detail?.data?.list ?? [];
-                    if (Array.isArray(list)) albumSongs.push(...list);
+                    if (!Array.isArray(list)) continue;
+                    // A compilation row can hold tracks in several languages.
+                    // The album lane is exempt from relevance filtering, so
+                    // anything let through here reaches the page unchecked —
+                    // drop the rows that belong to a different language than
+                    // the one this album (and the query) is in. Rows the
+                    // provider left unlabelled are kept: an unknown language is
+                    // not evidence of a wrong one.
+                    const detailLanguage = injectLanguage
+                        || normalizeLanguage(detail?.data?.language)
+                        || dominantSongLanguage(list);
+                    let kept = list.filter(song => languageMatches(song?.language, detailLanguage));
+                    if (kept.length === 0) {
+                        // The album row and its tracks disagree about language.
+                        // Trust the tracks rather than dropping the album: an
+                        // empty lane is worse than a mislabelled row.
+                        kept = list.filter(song =>
+                            languageMatches(song?.language, dominantSongLanguage(list)));
+                    }
+                    albumSongs.push(...kept);
                 }
                 if (albumSongs.length > 0) {
                     // The album lane outweighs the search lane here, the reverse
@@ -1073,6 +1108,74 @@ function detectLanguageHints(query) {
     }
 
     return hints;
+}
+
+/**
+ * True when a row may be shown for `language`: either no language is being
+ * enforced, the row is unlabelled, or the two agree.
+ */
+function languageMatches(value, language) {
+    if (!language) return true;
+    const normalized = normalizeLanguage(value);
+    if (!normalized) return true;
+    return normalized === language;
+}
+
+/** The language most of `songs` are in, ignoring unlabelled rows. */
+function dominantSongLanguage(songs) {
+    const counts = new Map();
+    for (const song of songs ?? []) {
+        const language = normalizeLanguage(song?.language);
+        if (!language) continue;
+        counts.set(language, (counts.get(language) ?? 0) + 1);
+    }
+    let best = '';
+    let bestCount = 0;
+    for (const [language, count] of counts) {
+        if (count > bestCount) {
+            best = language;
+            bestCount = count;
+        }
+    }
+    return best;
+}
+
+/**
+ * The language of the query, read off the already-ranked search rows. Only
+ * rows whose title or album matches the query count — an unrelated row that
+ * merely ranked well must not decide the language for the whole page.
+ */
+function inferQueryLanguage(songs, titleNorm) {
+    if (!titleNorm) return '';
+    const evidence = [];
+    for (const song of (songs ?? []).slice(0, 20)) {
+        const name = normText(song?.name ?? '');
+        const albumName = normText(song?.album?.name ?? song?.album ?? '');
+        if (name === titleNorm || albumName === titleNorm
+            || areSearchTermsSimilar(albumName, titleNorm)) {
+            evidence.push(song);
+        }
+    }
+    return dominantSongLanguage(evidence);
+}
+
+/**
+ * Which language the album lane should inject. The query's own language wins
+ * when any matching album is in it (or is unlabelled); otherwise the best
+ * ranked album decides, so a query with no language evidence still yields one
+ * coherent soundtrack rather than a mix.
+ */
+function pickInjectLanguage(albumMatches, targetLanguage) {
+    if (targetLanguage) {
+        const supported = (albumMatches ?? []).some(entry =>
+            languageMatches(entry.album?.language, targetLanguage));
+        if (supported) return targetLanguage;
+    }
+    for (const entry of albumMatches ?? []) {
+        const language = normalizeLanguage(entry.album?.language);
+        if (language) return language;
+    }
+    return '';
 }
 
 function buildAlbumLanguageSections({
