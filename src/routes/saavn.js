@@ -212,6 +212,13 @@ const IDENTITY_RESOLVE_DEPTH = 4;
 // so it must never hold a search open.
 const ARTIST_CATALOGUE_BUDGET_MS = 2500;
 
+// How many matching albums a film query may pull tracks from, and the shared
+// budget for reading them. A film's songs are routinely split across a few
+// album rows; beyond a handful the extra rows are same-named singles rather
+// than more of the soundtrack.
+const ALBUM_INJECT_LIMIT = 4;
+const ALBUM_INJECT_BUDGET_MS = 2500;
+
 // The artist-catalogue lane is an ENHANCEMENT, and it is off unless switched
 // on. Artist queries were the only ones that stopped answering after it
 // shipped -- they are the only queries it runs for -- and while its own budget
@@ -519,57 +526,86 @@ router.get('/search', async (req, res) => {
         if (queryLooksLikeAlbum) {
             const titleNorm = normText(analysis.movie || analysis.cleanTitle);
 
-            // Helper: pick the best-matching album from a results list
-            const pickMatchingAlbum = (results) => {
+            // Every album whose title matches, best first -- not merely the
+            // first one the provider happened to list.
+            //
+            // A film's tracks are not confined to one album row. "Premam"
+            // matches fifteen albums and "Kaalapani" six, the latter across
+            // spelling variants (Kaalapani / Kalapani / Kaala Pani), and the
+            // soundtrack is spread over them; taking only the first returned a
+            // handful of the film's songs and left the rest of the page to
+            // compilations that merely mention the words. Order matters as much
+            // as the count: provider order is arbitrary, so an exact title match
+            // is preferred over a fuzzy one before anything is fetched.
+            const collectMatchingAlbums = (results) => {
+                const matches = [];
                 for (const alb of (results ?? [])) {
-                    if (areSearchTermsSimilar(normText(alb?.name ?? ''), titleNorm)) {
-                        return alb;
-                    }
+                    const name = normText(alb?.name ?? '');
+                    if (!name) continue;
+                    if (name === titleNorm) matches.push({ album: alb, rank: 0 });
+                    else if (areSearchTermsSimilar(name, titleNorm)) matches.push({ album: alb, rank: 1 });
                 }
-                return null;
+                return matches;
             };
 
-            // Try the proxy result first
-            const proxyAlbums = albumSearchResults;
-            let matchedAlbum = pickMatchingAlbum(proxyAlbums);
+            let albumMatches = collectMatchingAlbums(albumSearchResults);
 
-            // Proxy didn't return a matching album — run direct API and autocomplete
-            // in parallel to find a match without adding sequential round-trips.
-            if (!matchedAlbum) {
+            // Nothing matched in the proxy result — run direct API and
+            // autocomplete in parallel rather than as sequential round-trips.
+            if (albumMatches.length === 0) {
                 const [directRes, acRes] = await Promise.allSettled([
                     searchAlbumsDirect(albumSearchQuery, 5),
                     autocompleteAlbumSearch(albumSearchQuery),
                 ]);
                 if (directRes.status === 'fulfilled') {
-                    matchedAlbum = pickMatchingAlbum(directRes.value?.data?.results ?? []);
+                    albumMatches = collectMatchingAlbums(directRes.value?.data?.results ?? []);
                 }
-                if (!matchedAlbum && acRes.status === 'fulfilled' && acRes.value) {
-                    const acAlbum = acRes.value;
-                    if (areSearchTermsSimilar(normText(acAlbum.name), titleNorm)) {
-                        matchedAlbum = acAlbum;
-                    }
+                if (albumMatches.length === 0 && acRes.status === 'fulfilled' && acRes.value) {
+                    albumMatches = collectMatchingAlbums([acRes.value]);
                 }
             }
 
-            if (matchedAlbum && (matchedAlbum.id || matchedAlbum.url)) {
-                try {
-                    const albumDetail = await Promise.race([
-                        getAlbumById(matchedAlbum.id, matchedAlbum.url),
-                        new Promise((_, reject) => setTimeout(() => reject(new Error('album timeout')), 2000)),
-                    ]);
-                    const albumSongs = albumDetail?.data?.songs ?? albumDetail?.data?.list ?? [];
-                    if (albumSongs.length > 0) {
-                        const ranked = filterRelevantSongs(
-                            fuseSongCandidates([
-                                { source: 'album', weight: 0.85, songs: rankSongs(deduplicateSongs(albumSongs), analysis) },
-                                { source: 'search', weight: 1.1, songs: finalRanked },
-                            ], analysis),
-                            analysis,
-                            { minKeep: limit },
-                        );
-                        finalRanked = ranked;
-                    }
-                } catch (_) { /* album fetch is best-effort */ }
+            const albumsToFetch = albumMatches
+                .sort((left, right) => left.rank - right.rank)
+                .map(entry => entry.album)
+                .filter(alb => alb && (alb.id || alb.url))
+                .slice(0, ALBUM_INJECT_LIMIT);
+
+            if (albumsToFetch.length > 0) {
+                // Fetched together under one shared budget, so reading several
+                // albums costs about what reading one used to. Whatever arrives
+                // in time is used and the rest is dropped — the page must never
+                // wait on a slow album lookup.
+                const details = await withSearchBudget(
+                    Promise.all(albumsToFetch.map(alb =>
+                        getAlbumById(alb.id, alb.url).catch(() => null))),
+                    ALBUM_INJECT_BUDGET_MS,
+                    [],
+                );
+                const albumSongs = [];
+                for (const detail of (details ?? [])) {
+                    const list = detail?.data?.songs ?? detail?.data?.list ?? [];
+                    if (Array.isArray(list)) albumSongs.push(...list);
+                }
+                if (albumSongs.length > 0) {
+                    // The album lane outweighs the search lane here, the reverse
+                    // of a song-title search. This branch only runs once the
+                    // query has been identified as an album or film name, and for
+                    // that query the film's own track list IS the answer — it must
+                    // not be pushed off the page by compilation rows that merely
+                    // share a word with the title.
+                    finalRanked = filterRelevantSongs(
+                        fuseSongCandidates([
+                            { source: 'album', weight: 1.15, songs: rankSongs(deduplicateSongs(albumSongs), analysis) },
+                            { source: 'search', weight: 1.0, songs: finalRanked },
+                        ], analysis),
+                        analysis,
+                        // The film's own tracks are relevant because of where
+                        // they came from, not because their titles echo the
+                        // query, so they are exempt from relevance filtering.
+                        { minKeep: limit, alwaysKeepSources: ['album'] },
+                    );
+                }
             }
         }
 

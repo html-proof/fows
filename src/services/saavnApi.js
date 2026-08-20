@@ -17,6 +17,7 @@ import {
     searchAlbums as searchGaanaAlbums,
 } from './gaanaApi.js';
 import { getProviderAlbumId } from './identityResolver.js';
+import { normText, stripAlbumEditionSuffix } from './searchEngine.js';
 
 function describeProviderError(error) {
     const message = String(error?.message ?? '').trim();
@@ -665,12 +666,22 @@ export async function searchAlbums(query) {
 
     // JioSaavn first: it is the provider the rest of the app resolves against
     // most cheaply, so it stays the preferred match when both have the album.
-    const seen = new Set();
+    //
+    // Keyed on the *comparable* title, not the raw one. normalizeQuery only
+    // lowercases and collapses whitespace, so every way the two catalogues
+    // disagree about an album title survived it and the album was listed twice:
+    // the edition suffix ("Pattalam" against "Pattalam (Original Motion Picture
+    // Soundtrack)"), trailing punctuation, and the artist credit, which Gaana
+    // states more fully than JioSaavn ("Sachin-Jigar" against "Sachin Jigar,
+    // Amitabh Bhattacharya").
     const merged = [];
+    const kept = [];
     for (const album of [...jioResults, ...gaanaResults]) {
-        const key = `${normalizeQuery(album?.name ?? album?.title ?? '')}|${normalizeQuery(_albumArtistName(album))}`;
-        if (key === '|' || seen.has(key)) continue;
-        seen.add(key);
+        const title = stripAlbumEditionSuffix(normText(album?.name ?? album?.title ?? ''));
+        if (!title) continue;
+        const entry = { title, language: _albumLanguage(album), artists: _albumArtistSet(album) };
+        if (kept.some(prev => _isSameAlbum(prev, entry))) continue;
+        kept.push(entry);
         merged.push(album);
     }
 
@@ -697,6 +708,66 @@ function _albumArtistName(album) {
         return album.artists.primary.map(a => a?.name ?? '').filter(Boolean).join(', ');
     }
     return '';
+}
+
+// Values the catalogues put in the language field that are not languages.
+// Gaana labels an instrumental release "Instrumental" rather than naming its
+// language, and treating that as one would make the score look like a different
+// release from the album it belongs to.
+const _NON_LANGUAGE_MARKERS = new Set([
+    'instrumental', 'score', 'soundtrack', 'karaoke', 'unknown', 'various', 'other',
+]);
+
+/**
+ * The album language, or '' when the field holds something that is not a
+ * language -- in which case the credits decide instead.
+ */
+function _albumLanguage(album) {
+    const language = normText(album?.language ?? '');
+    return _NON_LANGUAGE_MARKERS.has(language) ? '' : language;
+}
+
+/**
+ * The album credits as a set of individual names, so two listings can be tested
+ * for overlap. Equality is the wrong test: one catalogue routinely names the
+ * composer alone where the other also credits the lyricist.
+ */
+function _albumArtistSet(album) {
+    return new Set(
+        String(_albumArtistName(album) ?? '')
+            .split(/[,&]|\bfeat\.?\b|\bft\.?\b/i)
+            .map(name => normText(name))
+            .filter(Boolean),
+    );
+}
+
+/**
+ * Whether two album listings are the same release, given titles that already
+ * match once edition wording is stripped.
+ *
+ * Language decides whenever both catalogues state it, because the credits
+ * cannot: the two providers describe different roles for the same release --
+ * JioSaavn names the composer, Gaana names the singers -- so one film's two
+ * listings have entirely disjoint credits. Requiring credit overlap therefore
+ * kept both, which is the duplicate album the user sees. Two genuinely
+ * different films sharing a title are reliably in different languages, and that
+ * is what actually separates them:
+ *
+ *   Pattalam | malayalam | Vidyasagar                      (JioSaavn)
+ *   Pattalam | malayalam | Vidhu Prathap, Sujatha Mohan…   (Gaana)   <- same
+ *   Pattalam | tamil     | Jassie Gift                     (JioSaavn)
+ *   Pattalam | tamil     | Nithin Raj, Sayanora…           (Gaana)   <- same
+ *
+ * Credit overlap remains the fallback for listings that state no language.
+ */
+function _isSameAlbum(a, b) {
+    if (a.title !== b.title) return false;
+    if (a.language && b.language) return a.language === b.language;
+    if (a.artists.size === 0 || b.artists.size === 0) return true;
+    for (const name of a.artists) {
+        if (b.artists.has(name)) return true;
+    }
+    return false;
 }
 
 async function _searchAlbumsJioSaavn(query) {

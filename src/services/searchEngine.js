@@ -329,7 +329,7 @@ export function getSongIdentityKey(song) {
  * Operates on normText output, which has already flattened punctuation to
  * spaces — so these patterns must match bare words, not bracketed groups.
  */
-function stripAlbumEditionSuffix(album) {
+export function stripAlbumEditionSuffix(album) {
     return String(album ?? '')
         .replace(/\b(original\s+)?(motion\s+picture\s+)?sound\s*track\b/gi, ' ')
         .replace(/\boriginal\s+motion\s+picture\b/gi, ' ')
@@ -447,11 +447,30 @@ export function filterRelevantSongs(songs, analysis, options = {}) {
             ? 44
             : 22;
 
+    // Retrieval lanes whose songs are relevant by PROVENANCE rather than by
+    // their title, and so must survive a filter that scores against the query
+    // text. A soundtrack is the case that needs this: once "bangalore days" is
+    // known to name a film, every track on that film's album belongs in the
+    // answer, but "Aethu Kari Raavilum" and "Maangalyam" share no word with the
+    // query and scored below the threshold, while compilation rows like "Diwali
+    // - 5 Divine Days" scored above it on the word "days" alone. The film lost
+    // three of its five songs to rows that merely rhymed with its name.
+    const alwaysKeep = new Set(
+        Array.isArray(options?.alwaysKeepSources) ? options.alwaysKeepSources : [],
+    );
+    const isExempt = (song) => {
+        if (alwaysKeep.size === 0) return false;
+        const ranks = song?._searchFeatures?.sourceRanks;
+        if (!Array.isArray(ranks)) return false;
+        return ranks.some(entry => alwaysKeep.has(entry?.source));
+    };
+
     const withScores = safeSongs.map(song => ({
         song,
         score: song?._searchFeatures?.relevanceScore ?? scoreSong(song, analysis),
+        exempt: isExempt(song),
     }));
-    const relevant = withScores.filter(entry => entry.score >= threshold);
+    const relevant = withScores.filter(entry => entry.exempt || entry.score >= threshold);
 
     if (relevant.length >= minKeep) {
         return relevant.map(entry => entry.song);
@@ -459,7 +478,10 @@ export function filterRelevantSongs(songs, analysis, options = {}) {
 
     const fallbackCount = Math.min(safeSongs.length, Math.max(minKeep, relevant.length));
     return withScores
-        .sort((a, b) => b.score - a.score)
+        // Exempt rows sort ahead of the rest so the slice cannot drop them
+        // either — otherwise the guarantee above would hold only on the path
+        // where enough rows cleared the threshold.
+        .sort((a, b) => (b.exempt - a.exempt) || (b.score - a.score))
         .slice(0, fallbackCount)
         .map(entry => entry.song);
 }
