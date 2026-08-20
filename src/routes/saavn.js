@@ -1592,10 +1592,11 @@ const ALBUM_RECOVERY_BUDGET_MS = 6000;
  * contains tracks is returned, so a recovery either opens the album the user
  * asked for or changes nothing.
  */
-async function _recoverAlbumAcrossProviders({ nameHint, failedProvider }) {
+async function _recoverAlbumAcrossProviders({ nameHint, failedProvider, language }) {
     if (!nameHint) return null;
     const target = normText(nameHint);
     if (!target) return null;
+    const wantedLanguage = normalizeLanguage(language);
 
     const [jioRes, gaanaRes] = await Promise.allSettled([
         searchAlbumsDirect(nameHint, 5),
@@ -1610,10 +1611,29 @@ async function _recoverAlbumAcrossProviders({ nameHint, failedProvider }) {
         ...jioAlbums.map(album => ({ album, provider: 'jiosaavn' })),
     ].filter(({ album }) => areSearchTermsSimilar(normText(album?.name ?? album?.title ?? ''), target));
 
+    // A film released in several languages carries ONE title across all of
+    // them, with a different track list in each. Matching on the title alone
+    // meant recovery could reopen a Tamil film's page with the Telugu release's
+    // songs -- every title looks right, the album name looks right, and only the
+    // language is wrong, which is exactly the reported symptom.
+    //
+    // Applied as a preference rather than a hard filter: an album whose language
+    // the provider left blank is not evidence of the wrong one, and returning
+    // the right film in the wrong language still beats an error screen when
+    // nothing else matches.
+    const languageRank = ({ album }) => {
+        if (!wantedLanguage) return 0;
+        const albumLanguage = normalizeLanguage(album?.language);
+        if (!albumLanguage) return 1;          // unlabelled — plausible
+        return albumLanguage === wantedLanguage ? 0 : 2;
+    };
+
     // The provider that just failed goes last: it is the least likely to
     // suddenly answer, but a different release id on the same catalogue is
     // still a better outcome than an error screen.
-    candidates.sort((a, b) => (a.provider === failedProvider ? 1 : 0) - (b.provider === failedProvider ? 1 : 0));
+    candidates.sort((a, b) =>
+        (languageRank(a) - languageRank(b))
+        || ((a.provider === failedProvider ? 1 : 0) - (b.provider === failedProvider ? 1 : 0)));
 
     // Keeps the best non-playable-but-populated payload seen, in case no
     // candidate turns out to have streams.
@@ -1628,7 +1648,22 @@ async function _recoverAlbumAcrossProviders({ nameHint, failedProvider }) {
             const detail = provider === 'gaana'
                 ? await getGaanaAlbum(key)
                 : await getAlbumById(album.id, album.url);
-            if (_payloadPlayableCount(detail) > 0) return detail;
+            if (_payloadPlayableCount(detail) > 0) {
+                // The album row often states no language while its tracks do,
+                // so the tracks get the final say. A payload in the wrong
+                // language is held as a fallback instead of returned, giving a
+                // later candidate the chance to be the right one.
+                if (wantedLanguage) {
+                    const songs = detail?.data?.songs ?? detail?.data?.list ?? [];
+                    const detailLanguage = normalizeLanguage(detail?.data?.language)
+                        || dominantSongLanguage(songs);
+                    if (detailLanguage && detailLanguage !== wantedLanguage) {
+                        if (!best) best = detail;
+                        continue;
+                    }
+                }
+                return detail;
+            }
             if (!best && _payloadHasSongs(detail)) best = detail;
         } catch (_) { /* try the next candidate */ }
     }
@@ -1636,7 +1671,7 @@ async function _recoverAlbumAcrossProviders({ nameHint, failedProvider }) {
     return best;
 }
 
-async function _loadAlbumPayload({ id, link, query, provider, name }) {
+async function _loadAlbumPayload({ id, link, query, provider, name, language }) {
     let data;
     // A Gaana album is identified by a seokey slug, never by the numeric id
     // JioSaavn uses, so an explicit ?provider=gaana -- or an id that is plainly
@@ -1669,6 +1704,9 @@ async function _loadAlbumPayload({ id, link, query, provider, name }) {
             _recoverAlbumAcrossProviders({
                 nameHint: _albumNameHint({ name, id, link }),
                 failedProvider: wantsGaana ? 'gaana' : 'jiosaavn',
+                // Without this, recovery matches on title alone and a film's
+                // other-language release is an equally good answer.
+                language,
             }).catch(() => null),
             ALBUM_RECOVERY_BUDGET_MS,
             null,
@@ -1731,12 +1769,21 @@ router.get('/albums', async (req, res) => {
         // result it opened. It is only ever a recovery hint -- the id still
         // decides which album is loaded.
         const name = String(req.query.name ?? req.query.title ?? '').trim();
+        // The language of the album the client is opening. Like `name`, only a
+        // recovery hint -- but a decisive one, because a film released in
+        // several languages carries one title and a different track list in
+        // each, so a title match alone cannot tell the releases apart.
+        const language = String(req.query.language ?? '').trim();
 
         if (!id && !query && !link) {
             return res.status(400).json({ error: 'Either "id", "query", or "link" parameter is required' });
         }
 
-        const cacheKey = `${provider ?? 'auto'}|` + (id ? `id:${id}`
+        // Language belongs in the key: two requests for the same title in
+        // different languages are different albums, and sharing one entry would
+        // serve the first caller's language to the second.
+        const languageKey = normalizeLanguage(language) || 'any';
+        const cacheKey = `${provider ?? 'auto'}|${languageKey}|` + (id ? `id:${id}`
             : link ? `link:${link}`
             : `query:${String(query).trim().toLowerCase()}`);
 
@@ -1745,7 +1792,7 @@ router.get('/albums', async (req, res) => {
         if (!data) {
             let pending = _albumInFlight.get(cacheKey);
             if (!pending) {
-                pending = _loadAlbumPayload({ id, link, query, provider, name })
+                pending = _loadAlbumPayload({ id, link, query, provider, name, language })
                     .finally(() => _albumInFlight.delete(cacheKey));
                 _albumInFlight.set(cacheKey, pending);
             }
